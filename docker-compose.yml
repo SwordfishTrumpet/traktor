@@ -1,0 +1,59 @@
+services:
+  traktor:
+    image: traktor:test
+    container_name: traktor
+    
+    # Environment variables - set these or use .env file
+    environment:
+      # Required: Plex configuration
+      - PLEX_URL=${PLEX_URL}
+      - PLEX_TOKEN=${PLEX_TOKEN}
+      
+      # Required: Trakt API credentials
+      - TRAKT_CLIENT_ID=${TRAKT_CLIENT_ID}
+      - TRAKT_CLIENT_SECRET=${TRAKT_CLIENT_SECRET}
+      
+      # Optional: Trakt tokens (will be auto-generated on first run)
+      - TRAKT_ACCESS_TOKEN=${TRAKT_ACCESS_TOKEN:-}
+      - TRAKT_REFRESH_TOKEN=${TRAKT_REFRESH_TOKEN:-}
+      
+      # Docker mode (do not change)
+      - DOCKER_MODE=true
+      
+      # Optional: Additional settings
+      - PYTHONUNBUFFERED=1
+    
+    # Volume mounts for persistent data
+    volumes:
+      # Mount your .env file (not read-only so tokens can be saved)
+      - ./.env:/app/.env
+      
+      # Mount for logs (optional, defaults to container storage)
+      - ./data/logs:/data/logs
+      
+      # Mount for config/token storage (optional, defaults to container storage)
+      - ./data/config:/data/config
+    
+    # Interactive mode for authentication prompts
+    stdin_open: true
+    tty: true
+    
+    # Restart policy
+    restart: "no"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "uv", "run", "traktor", "--diagnose"]
+      interval: 1m
+      timeout: 30s
+      retries: 3
+      start_period: 10s
+    
+    # Networks (use host network if Plex is on same host)
+    # network_mode: host
+    networks:
+      - traktor-network
+
+networks:
+  traktor-network:
+    driver: bridge
