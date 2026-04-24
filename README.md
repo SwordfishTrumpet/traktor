@@ -31,16 +31,17 @@ cp .env.example .env  # Then edit .env with your credentials
 uv run traktor
 ```
 
-By default, traktor syncs Trakt's official curated lists (trending, popular movies/shows) to Plex — **no OAuth required**, just your Trakt Client ID. 
+By default, traktor syncs Trakt's official curated lists (trending, popular movies/shows) to Plex — **no OAuth required**, just your Trakt Client ID.
 
-To sync your personal liked lists from Trakt, run with `--list-source=both` and complete the one-time OAuth prompt.
+To sync your personal liked lists from Trakt, either set `TRAKTOR_LIST_SOURCE=both` in your `.env` file, or run with `--list-source=both` and complete the one-time OAuth prompt.
 
 ### Common commands
 
 ```bash
-uv run traktor                       # Sync official curated lists (default, no auth)
+uv run traktor                       # Sync based on TRAKTOR_LIST_SOURCE in .env (default: official)
 uv run traktor --list-source=both    # Sync official + your liked lists (OAuth required)
 uv run traktor --sync-watched        # Bidirectional watch status sync (OAuth required)
+uv run traktor --sync-watched-only   # Sync only watch status (fast cron job)
 uv run traktor --diagnose            # Check your setup
 uv run traktor --refresh-cache       # After adding new media to Plex
 ```
@@ -110,12 +111,18 @@ See [DOCKER.md](DOCKER.md) for scheduling and volume mounts.
 | `PLEX_URL` | Yes | `http://your-plex-host:32400` |
 | `PLEX_TOKEN` | Yes | See [Plex guide](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/) |
 
-**Optional:** `TRAKTOR_WORKERS`, `WATCH_SYNC_ENABLED`, `TRAKTOR_OFFICIAL_LISTS_ENABLED`, `DOCKER_MODE`
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `TRAKTOR_LIST_SOURCE` | `official` | Which lists to sync: `official` (public lists only), `liked` (your liked lists), or `both` |
+| `TRAKTOR_WORKERS` | `8` | Parallel workers for processing |
+| `WATCH_SYNC_ENABLED` | `false` | Enable bidirectional watch status sync |
+| `TRAKTOR_OFFICIAL_LISTS_ENABLED` | `true` | Enable official Trakt lists (trending, popular) |
+| `DOCKER_MODE` | `false` | Use `/data/` paths instead of home directory |
 
 **CLI flags:**
-- `--list-source=official` (default) — Sync official Trakt lists only (no OAuth)
-- `--list-source=both` — Sync official + your liked lists (OAuth required)
-- `--sync-watched`, `--sync-progress` — Watch status sync (OAuth required)
+- `--list-source={official,liked,both}` — Override `TRAKTOR_LIST_SOURCE` env var
+- `--sync-watched`, `--sync-watched-only` — Watch status sync (OAuth required)
+- `--sync-progress` — Resume point sync Trakt → Plex (OAuth required)
 - `--sync-collection`, `--sync-watchlist` — Personal Trakt data (OAuth required)
 - `--refresh-cache`, `--diagnose`, `--dry-run`, `--workers N` — Utility flags
 
@@ -125,6 +132,7 @@ See `uv run traktor --help` for all options.
 - **No OAuth required for:** Official lists (trending, popular, box office), basic playlist sync
 - **OAuth required for:** Liked lists, collection, watchlist, watch status sync, progress sync
 - On first run with OAuth-required features, you'll get a one-time browser prompt to authorize
+- Set `TRAKTOR_LIST_SOURCE=both` in `.env` to always sync liked lists without adding the CLI flag
 
 **Note on Plex tokens:** Use your **server owner's token** for playlists visible to all users. Managed user tokens create private playlists only.
 

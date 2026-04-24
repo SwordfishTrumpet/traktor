@@ -47,7 +47,8 @@ CONNECTION_MAX_REUSE = 100  # Maximum times to reuse a connection before recycli
 # Playlist management constants
 MAX_PLAYLIST_SIZE_FOR_INCREMENTAL = 1000  # Playlists larger than this are deleted and recreated
 DEFAULT_PLAYLIST_BATCH_SIZE = 500  # Number of items to add per batch when updating playlists
-LIBRARY_CACHE_LOG_INTERVAL = 500  # Log progress every N items during cache building
+LIBRARY_CACHE_LOG_INTERVAL = 5000  # Log progress every N items during cache building
+CONTAINER_SIZE = 500  # Items per page when fetching all library items
 
 # API pagination and data fetching constants
 DEFAULT_API_PAGE_SIZE = 100  # Default items per page for API requests
@@ -272,7 +273,7 @@ class CacheManager:
         for section in self.plex_server.library.sections():
             if section.type in ("movie", "show"):
                 logger.info(f"Caching {section.type}s from '{section.title}'...")
-                items = section.all()
+                items = section.all(container_size=CONTAINER_SIZE)
             else:
                 continue
 

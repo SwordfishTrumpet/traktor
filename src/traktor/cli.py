@@ -187,8 +187,8 @@ def parse_args():
     parser.add_argument(
         "--list-source",
         choices=["liked", "official", "both"],
-        default="official",  # Default: official only for zero-auth onboarding
-        help="Which list sources to sync (default: official - no auth required)",
+        default=None,  # Will use TRAKTOR_LIST_SOURCE env var or fall back to "official"
+        help="Which list sources to sync (default: from TRAKTOR_LIST_SOURCE env var, or 'official')",
     )
 
     return parser.parse_args()

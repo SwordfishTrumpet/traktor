@@ -23,6 +23,7 @@ from .settings import (
     LOG_FILE,
     TRAKT_CLIENT_ID,
     TRAKT_CLIENT_SECRET,
+    TRAKTOR_LIST_SOURCE,
     TRAKTOR_OFFICIAL_ENDPOINTS,
     TRAKTOR_OFFICIAL_LISTS_ENABLED,
     TRAKTOR_OFFICIAL_PERIOD,
@@ -776,7 +777,11 @@ def sync_lists(args: Optional[Any] = None) -> int:
         logger.info("Deleted existing missing.txt at start of sync")
 
     # Determine if OAuth authentication is required
-    list_source = args.list_source if args else "official"
+    # Use CLI arg if provided, otherwise fall back to env var, then default to "official"
+    if args and hasattr(args, 'list_source') and args.list_source:
+        list_source = args.list_source
+    else:
+        list_source = TRAKTOR_LIST_SOURCE
     needs_auth = _needs_oauth_auth(args, list_source)
 
     logger.debug("Initializing TraktAuth...")
