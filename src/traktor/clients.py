@@ -234,6 +234,18 @@ class CacheManager:
 
         return ids
 
+    def _safe_get_attr(self, item, attr, default=None):
+        """Safely access a PlexAPI attribute without triggering a server reload.
+
+        PlexAPI's __getattribute__ triggers _reload() when an attribute value
+        is None (treating it as "not loaded"), which bypasses getattr's default.
+        This uses object.__getattribute__ to bypass PlexAPI's override.
+        """
+        try:
+            return object.__getattribute__(item, attr)
+        except AttributeError:
+            return default
+
     def _add_item_to_cache(self, item, media_type):
         """Add a Plex item to the in-memory cache and ID indexes."""
         item_data = {
@@ -241,8 +253,8 @@ class CacheManager:
             "year": item.year,
             "ratingKey": item.ratingKey,
             "guid": str(item.guid) if item.guid else None,
-            "isWatched": getattr(item, "isWatched", False),
-            "lastViewedAt": getattr(item, "lastViewedAt", None),
+            "isWatched": self._safe_get_attr(item, "isWatched", False),
+            "lastViewedAt": self._safe_get_attr(item, "lastViewedAt", None),
         }
         self.memory_cache[f"{media_type}s_list"].append(item_data)
 
@@ -281,7 +293,13 @@ class CacheManager:
             for idx, item in enumerate(items):
                 if idx % LIBRARY_CACHE_LOG_INTERVAL == 0:
                     logger.debug(f"  Cached {idx}/{total} {section.type}s...")
-                self._add_item_to_cache(item, section.type)
+                try:
+                    self._add_item_to_cache(item, section.type)
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to cache item '{getattr(item, 'title', 'unknown')}': {e}"
+                    )
+                    continue
 
         elapsed = time.time() - start_time
         logger.info(f"Cache built in {elapsed:.2f} seconds")
