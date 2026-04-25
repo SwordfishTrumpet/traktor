@@ -858,7 +858,7 @@ def sync_lists(args: Optional[Any] = None) -> int:
             return
 
     # Process liked lists (only if authenticated and list_source permits)
-    if trakt and liked_lists and (not args or args.list_source in ("liked", "both")):
+    if trakt and liked_lists and (not args or list_source in ("liked", "both")):
         # Skip liked lists when in watch-only mode
         if args and args.sync_watched_only:
             logger.info("Skipping liked lists (--sync-watched-only mode)")
@@ -1195,8 +1195,8 @@ def _needs_oauth_auth(args, list_source):
     if args.sync_watched_only:
         return True
 
-    # Check list source
-    if args.list_source in ("liked", "both"):
+    # Check list source (use resolved list_source, not raw CLI arg)
+    if list_source in ("liked", "both"):
         return True
 
     # Check watch-related features

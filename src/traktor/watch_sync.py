@@ -159,7 +159,7 @@ class WatchSyncEngine:
                 # First run - use default time window for faster initial sync
                 last_sync = datetime.now(timezone.utc) - timedelta(days=DEFAULT_FIRST_SYNC_WINDOW_DAYS)
                 logger.info(f"First sync: Processing items from last {DEFAULT_FIRST_SYNC_WINDOW_DAYS} days only (for speed)")
-                logger.info(f"Use --backfill-history for full history sync if needed")
+                logger.info("Use --backfill-history for full history sync if needed")
 
             # Stage 1: Pull from Plex
             progress.start_stage(
