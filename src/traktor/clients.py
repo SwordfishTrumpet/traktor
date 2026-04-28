@@ -52,7 +52,7 @@ CONTAINER_SIZE = 500  # Items per page when fetching all library items
 
 # API pagination and data fetching constants
 DEFAULT_API_PAGE_SIZE = 100  # Default items per page for API requests
-DEFAULT_RECENTLY_ADDED_MAXRESULTS = 200  # Max results for recentlyAdded API
+DEFAULT_RECENTLY_ADDED_MAXRESULTS = 1000  # Max results for recentlyAdded API
 
 # HTTP status codes
 HTTP_OK = 200
@@ -105,6 +105,7 @@ class CacheManager:
         self.cache_file = CACHE_DIR / "plex_library_cache.json.gz"
         self.cache_meta_file = CACHE_DIR / "cache_metadata.json"
         self.memory_cache: Dict[str, Any] = {}
+        self._plex_objects: Dict[str, Any] = {}
 
     def _get_library_hash(self) -> Optional[str]:
         """Get a hash of current library state for cache invalidation."""
@@ -112,7 +113,13 @@ class CacheManager:
             sections = self.plex_server.library.sections()
             hash_input = ""
             for section in sections:
-                hash_input += f"{section.title}:{section.type}:{len(section.all())}:"
+                total_size = getattr(section, "totalSize", 0)
+                if not total_size:
+                    try:
+                        total_size = len(section.all())
+                    except Exception:
+                        total_size = 0
+                hash_input += f"{section.title}:{section.type}:{total_size}:"
             return hashlib.md5(hash_input.encode()).hexdigest()
         except (AttributeError, TypeError, ValueError) as e:
             logger.error(f"Failed to get library hash due to data error: {e}")
@@ -248,6 +255,8 @@ class CacheManager:
 
     def _add_item_to_cache(self, item, media_type):
         """Add a Plex item to the in-memory cache and ID indexes."""
+        # Store Plex object reference to avoid re-fetching from API later
+        self._plex_objects[str(item.ratingKey)] = item
         item_data = {
             "title": item.title,
             "year": item.year,
@@ -270,6 +279,7 @@ class CacheManager:
 
     def _build_cache(self):
         """Build cache by scanning all library items."""
+        self._plex_objects.clear()
         self.memory_cache = {
             "movies_by_imdb": {},
             "movies_by_tmdb": {},
@@ -315,12 +325,14 @@ class CacheManager:
     def _save_cache(self):
         """Save cache to disk with gzip compression."""
         try:
-            # Use gzip compression for significant space savings (typically 70-90%)
-            with gzip.open(self.cache_file, "wt", encoding="utf-8", compresslevel=6) as f:
-                json.dump(self.memory_cache, f)
+            # Serialize once, reuse for both compression and stats
+            cache_json = json.dumps(self.memory_cache)
+            uncompressed_bytes = cache_json.encode("utf-8")
+            uncompressed_size = len(uncompressed_bytes)
 
-            # Calculate compression ratio for logging
-            uncompressed_size = len(json.dumps(self.memory_cache).encode("utf-8"))
+            with gzip.open(self.cache_file, "wt", encoding="utf-8", compresslevel=6) as f:
+                f.write(cache_json)
+
             compressed_size = self.cache_file.stat().st_size
             compression_ratio = (
                 (1 - compressed_size / uncompressed_size) * 100 if uncompressed_size > 0 else 0
@@ -1410,6 +1422,9 @@ class PlexClient:
         return None
 
     def _get_plex_item(self, rating_key):
+        rating_key_str = str(rating_key)
+        if rating_key_str in self.cache._plex_objects:
+            return self.cache._plex_objects[rating_key_str]
         try:
             return self.server.fetchItem(rating_key)
         except Exception as e:

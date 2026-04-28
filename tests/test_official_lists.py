@@ -194,6 +194,20 @@ class TestOfficialListsService:
         result = service._deduplicate_items(items_without_ids)
         assert len(result["movies"]) == 0  # Should skip items without IDs
 
+    def test_deduplicate_items_empty_input(self, service):
+        """Test deduplication with empty input."""
+        result = service._deduplicate_items([])
+        assert len(result["movies"]) == 0
+        assert len(result["shows"]) == 0
+
+    def test_deduplicate_items_single_item(self, service, sample_movie_items):
+        """Test deduplication with a single item."""
+        all_items = [("endpoint1", sample_movie_items[0])]
+        result = service._deduplicate_items(all_items)
+        assert len(result["movies"]) == 1
+        assert len(result["shows"]) == 0
+        assert result["movies"][0]["combined_score"] == 10
+
     @patch("traktor.official_lists.TraktOfficialClient.get_endpoint")
     def test_fetch_endpoint_success(self, mock_get_endpoint, service, sample_movie_items):
         """Test fetching endpoint with success."""
@@ -459,3 +473,109 @@ class TestOfficialListsServiceMultiplePeriods:
                 assert monthly["name"] == "Trakt Movies - Played (Monthly)"
                 assert len(monthly["items"]) == 1
                 assert monthly["items"][0]["movie"]["title"] == "Monthly Movie"
+
+
+class TestOfficialListsServiceEdgeCases:
+    """Edge case tests for OfficialListsService."""
+
+    def test_deduplicate_items_with_show_only(self, tmp_path):
+        """Test deduplication when only show items exist."""
+        show_items = [
+            (
+                "endpoint1",
+                {
+                    "type": "show",
+                    "show": {
+                        "title": "Show 1",
+                        "year": 2024,
+                        "ids": {"imdb": "tt1111111", "tmdb": 11111},
+                    },
+                    "score": 10,
+                    "watchers": 100,
+                },
+            )
+        ]
+        with patch("traktor.trakt_official.TRAKT_CLIENT_ID", "test_id"):
+            service = OfficialListsService(cache_dir=tmp_path)
+            result = service._deduplicate_items(show_items)
+            assert len(result["movies"]) == 0
+            assert len(result["shows"]) == 1
+
+    def test_fetch_endpoint_stale_cache_fallback_with_request_exception(self, tmp_path):
+        """Test stale cache fallback when RequestException occurs."""
+        import requests
+
+        movie_items = [
+            {
+                "type": "movie",
+                "movie": {
+                    "title": "Test Movie",
+                    "year": 2024,
+                    "ids": {"imdb": "tt1234567", "tmdb": 12345},
+                },
+                "score": 10,
+                "watchers": 100,
+            }
+        ]
+
+        with patch("traktor.trakt_official.TRAKT_CLIENT_ID", "test_id"):
+            service = OfficialListsService(cache_dir=tmp_path)
+
+            # Pre-populate cache
+            service._save_cache("movies.trending", movie_items)
+
+            # Make cache expired
+            cache_file = service._get_cache_file("movies.trending")
+            old_time = time.time() - 7200
+            import os as os_mod
+
+            os_mod.utime(cache_file, (old_time, old_time))
+
+            # API fails with RequestException
+            with patch.object(
+                service.client,
+                "get_endpoint",
+                side_effect=requests.exceptions.RequestException("Network error"),
+            ):
+                result = service.fetch_endpoint("movies.trending", use_cache=True)
+                assert len(result) == 1  # Should use stale cache
+
+    def test_fetch_endpoint_no_cache_no_fallback(self, tmp_path):
+        """Test that fetch returns empty when no cache and API fails."""
+        import requests
+
+        with patch("traktor.trakt_official.TRAKT_CLIENT_ID", "test_id"):
+            service = OfficialListsService(cache_dir=tmp_path)
+
+            with patch.object(
+                service.client,
+                "get_endpoint",
+                side_effect=requests.exceptions.RequestException("Network error"),
+            ):
+                result = service.fetch_endpoint("movies.trending", use_cache=True)
+                assert result == []
+
+    def test_parse_endpoint_list_with_whitespace(self):
+        """Test endpoint parsing handles whitespace."""
+        endpoints = OfficialListsService.parse_endpoint_list(
+            "movies.trending, shows.popular , movies.anticipated"
+        )
+        assert len(endpoints) == 3
+        assert "movies.trending" in endpoints
+        assert "shows.popular" in endpoints
+        assert "movies.anticipated" in endpoints
+
+    def test_parse_endpoint_list_with_all_valid(self):
+        """Test parsing with all valid endpoints."""
+        all_endpoints = ",".join(OfficialListsService.get_default_endpoints())
+        endpoints = OfficialListsService.parse_endpoint_list(all_endpoints)
+        assert len(endpoints) > 0
+        for ep in endpoints:
+            assert ep in OfficialListsService.get_default_endpoints()
+
+    def test_get_playlists_empty_endpoints(self, tmp_path):
+        """Test getting playlists with empty endpoint list."""
+        with patch("traktor.trakt_official.TRAKT_CLIENT_ID", "test_id"):
+            service = OfficialListsService(cache_dir=tmp_path)
+            playlists = service.get_playlists_from_endpoints([], separate_playlists=True)
+            assert len(playlists) == 0

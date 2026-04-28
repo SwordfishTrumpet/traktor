@@ -586,6 +586,131 @@ class TestPlexClient:
         assert sorted_items[0].TYPE == "movie"
         assert sorted_items[1].TYPE == "episode"
 
+    def test_create_or_update_playlist_recreates_large_playlist(self, plex_client):
+        """Test that large playlists (>1000 items) are deleted and recreated."""
+        mock_movie = MagicMock()
+        mock_movie.TYPE = "movie"
+        mock_movie.title = "Test Movie"
+        items = [mock_movie]
+
+        # Mock existing large playlist
+        mock_playlist = MagicMock()
+        # Return 1500 items (more than MAX_PLAYLIST_SIZE_FOR_INCREMENTAL)
+        mock_playlist.items.return_value = [MagicMock() for _ in range(1500)]
+        mock_playlist.delete.return_value = None
+        plex_client.server.playlist.return_value = mock_playlist
+        plex_client.server.createPlaylist.return_value = mock_playlist
+
+        plex_client.create_or_update_playlist("Large Playlist", items)
+
+        # Should have deleted old playlist and created new one
+        mock_playlist.delete.assert_called_once()
+        plex_client.server.createPlaylist.assert_called_once()
+
+    def test_create_or_update_playlist_batch_adding(self, plex_client):
+        """Test that items are added in batches when exceeding batch size."""
+        items = []
+        for i in range(600):  # More than DEFAULT_PLAYLIST_BATCH_SIZE (500)
+            mock_movie = MagicMock()
+            mock_movie.TYPE = "movie"
+            mock_movie.title = f"Movie {i}"
+            items.append(mock_movie)
+
+        # Mock existing small playlist
+        mock_playlist = MagicMock()
+        mock_playlist.items.return_value = []  # Empty playlist
+        mock_playlist.addItems.return_value = None
+        plex_client.server.playlist.return_value = mock_playlist
+
+        plex_client.create_or_update_playlist("Batch Playlist", items)
+
+        # Should have called addItems in batches
+        assert mock_playlist.addItems.call_count >= 2
+
+    def test_create_or_update_playlist_all_movies_no_sort_change(self, plex_client):
+        """Test that all-movie items don't change order beyond staying movies."""
+        mock_movie1 = MagicMock()
+        mock_movie1.TYPE = "movie"
+        mock_movie1.title = "Movie A"
+
+        mock_movie2 = MagicMock()
+        mock_movie2.TYPE = "movie"
+        mock_movie2.title = "Movie B"
+
+        items = [mock_movie1, mock_movie2]
+
+        plex_client.server.playlist.side_effect = clients.NotFound
+        mock_playlist = MagicMock()
+        mock_playlist.items.return_value = []
+        plex_client.server.createPlaylist.return_value = mock_playlist
+
+        plex_client.create_or_update_playlist("Movies Only", items)
+
+        call_args = plex_client.server.createPlaylist.call_args
+        sorted_items = call_args[1]["items"]
+        assert len(sorted_items) == 2
+        # All movies should remain in original order within the movie group
+        assert sorted_items[0].TYPE == "movie"
+        assert sorted_items[1].TYPE == "movie"
+
+    def test_create_or_update_playlist_all_episodes_no_sort_change(self, plex_client):
+        """Test that all-episode items stay as episodes."""
+        mock_ep1 = MagicMock()
+        mock_ep1.TYPE = "episode"
+        mock_ep1.title = "Episode 1"
+
+        mock_ep2 = MagicMock()
+        mock_ep2.TYPE = "episode"
+        mock_ep2.title = "Episode 2"
+
+        items = [mock_ep1, mock_ep2]
+
+        plex_client.server.playlist.side_effect = clients.NotFound
+        mock_playlist = MagicMock()
+        mock_playlist.items.return_value = []
+        plex_client.server.createPlaylist.return_value = mock_playlist
+
+        plex_client.create_or_update_playlist("Episodes Only", items)
+
+        call_args = plex_client.server.createPlaylist.call_args
+        sorted_items = call_args[1]["items"]
+        assert len(sorted_items) == 2
+        assert sorted_items[0].TYPE == "episode"
+        assert sorted_items[1].TYPE == "episode"
+
+    def test_create_or_update_playlist_add_to_existing(self, plex_client):
+        """Test adding items to an existing non-empty playlist."""
+        mock_movie = MagicMock()
+        mock_movie.TYPE = "movie"
+        mock_movie.title = "New Movie"
+        items = [mock_movie]
+
+        # Mock existing playlist with 5 items
+        mock_playlist = MagicMock()
+        mock_playlist.items.return_value = [MagicMock() for _ in range(5)]
+        mock_playlist.removeItems.return_value = None
+        mock_playlist.addItems.return_value = None
+        plex_client.server.playlist.return_value = mock_playlist
+
+        plex_client.create_or_update_playlist("Existing Playlist", items)
+
+        # Should remove old items and add new
+        mock_playlist.removeItems.assert_called_once()
+        mock_playlist.addItems.assert_called_once()
+
+    def test_create_or_update_playlist_error_handling(self, plex_client):
+        """Test that errors during playlist creation are raised."""
+        mock_movie = MagicMock()
+        mock_movie.TYPE = "movie"
+        mock_movie.title = "Test Movie"
+        items = [mock_movie]
+
+        # Simulate server error during playlist access
+        plex_client.server.playlist.side_effect = Exception("Server unavailable")
+
+        with pytest.raises(Exception, match="Server unavailable"):
+            plex_client.create_or_update_playlist("Error Playlist", items)
+
 
 class TestTraktClientRateLimiting:
     """Tests for TraktClient rate limiting and retry logic."""
@@ -729,6 +854,7 @@ class TestCacheManagerIncrementalUpdate:
             "shows_by_tmdb": {},
             "movies_list": [],
             "shows_list": [],
+            "by_rating_key": {},
         }
         return cm
 

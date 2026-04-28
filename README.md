@@ -120,11 +120,32 @@ See [DOCKER.md](DOCKER.md) for scheduling and volume mounts.
 | `DOCKER_MODE` | `false` | Use `/data/` paths instead of home directory |
 
 **CLI flags:**
+- `--verbose, -v` — Enable debug logging to console
+- `--plex-url URL, -u URL` — Override `PLEX_URL` env var
+- `--plex-token TOKEN, -t TOKEN` — Override `PLEX_TOKEN` env var
+- `--force-auth` — Force re-authentication with Trakt (skip stored tokens)
 - `--list-source={official,liked,both}` — Override `TRAKTOR_LIST_SOURCE` env var
 - `--sync-watched`, `--sync-watched-only` — Watch status sync (OAuth required)
+- `--watch-direction={both,plex-to-trakt,trakt-to-plex}` — Direction for watch sync (default: both)
+- `--watch-conflict={newest,plex,trakt}` — Conflict resolution strategy (default: newest)
 - `--sync-progress` — Resume point sync Trakt → Plex (OAuth required)
 - `--sync-collection`, `--sync-watchlist` — Personal Trakt data (OAuth required)
+- `--sync-movies-only`, `--sync-shows-only` — Filter watch sync by media type
+- `--backfill-history` — Full history sync (initial setup)
 - `--refresh-cache`, `--diagnose`, `--dry-run`, `--workers N` — Utility flags
+
+**Mission-critical commands:**
+- `--health-check` — Run health checks and report system status
+- `--integrity-check` — Verify integrity of config, tokens, and cache files
+- `--backup`, `--backup-list`, `--backup-restore PATH` — Backup management
+- `--circuit-status` — Show circuit breaker status for API clients
+
+**Official list options:**
+- `--official-lists`, `--no-official-lists` — Enable/disable official lists
+- `--official-endpoints` — Comma-separated endpoints (e.g., `movies.trending,shows.popular`)
+- `--official-period={daily,weekly,monthly,yearly}` — Time period for stats
+- `--official-periods` — Multiple periods (e.g., `weekly,monthly`)
+- `--official-playlist-mode={separate,merged}` — Per-endpoint or aggregated playlists
 
 See `uv run traktor --help` for all options.
 
@@ -143,10 +164,11 @@ Trakt.tv ──OAuth──► TraktAuth/Client ──API──┐
      │                                       │
      └──IMDb/TMDb IDs──┐                    │
                        ▼                    ▼
-              ┌──────────────────────────────────┐
-              │           traktor CLI            │
-              │  sync engine │ cache │ watch sync │
-              └─────────────┬──────────────────────┘
+              ┌──────────────────────────────────────┐
+              │             traktor CLI              │
+              │  sync engine │ cache │ watch sync    │
+              │  official lists │ resilience │ log   │
+              └─────────────┬────────────────────────────┘
                             │
                             ▼
                     Plex Media Server

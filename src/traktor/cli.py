@@ -394,7 +394,9 @@ def main():
     logger.debug(f"Arguments: {safe_args}")
 
     try:
-        sync_lists(args)
+        exit_code = sync_lists(args)
+        if exit_code:
+            sys.exit(exit_code)
     except KeyboardInterrupt:
         logger.warning("Operation cancelled by user (KeyboardInterrupt)")
         print("\n\nOperation cancelled by user.")

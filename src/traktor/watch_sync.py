@@ -472,31 +472,15 @@ class WatchSyncEngine:
 
             # Get watched history with delta filtering
             if not shows_only:
-                # Get movie history
-                movie_history = self.trakt.get_all_watched_history(media_type="movies")
                 if since:
-                    # Also get recent history for delta sync
-                    recent_movie_history = self.trakt.get_watched_history(
+                    # Delta mode: only fetch recent history since last sync
+                    movie_history = self.trakt.get_watched_history(
                         media_type="movies", start_at=start_at
                     )
-                    # Combine and deduplicate
-                    all_movies = {}
-                    for movie in movie_history + recent_movie_history:
-                        ids = movie.get("movie", {}).get("ids", {})
-                        key = (
-                            "movie",
-                            ids.get("imdb"),
-                            normalize_tmdb_id(ids.get("tmdb")),
-                        )
-                        # Keep the most recent entry
-                        if key not in all_movies or movie.get("last_watched_at", "") > all_movies[
-                            key
-                        ].get("last_watched_at", ""):
-                            all_movies[key] = movie
-
-                    watched_movies = list(all_movies.values())
                 else:
-                    watched_movies = movie_history
+                    # Full sync: fetch all history
+                    movie_history = self.trakt.get_all_watched_history(media_type="movies")
+                watched_movies = movie_history
 
                 for movie in watched_movies:
                     ids = movie.get("movie", {}).get("ids", {})

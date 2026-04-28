@@ -1,5 +1,6 @@
 """Progress tracking and visualization utilities."""
 
+import threading
 import time
 from datetime import timedelta
 from typing import Optional
@@ -25,6 +26,7 @@ class ProgressTracker:
         self.processed = 0
         self.last_update_time = self.start_time
         self.last_update_processed = 0
+        self._lock = threading.Lock()
 
     def update(self, n: int = 1):
         """Update progress by n items.
@@ -32,34 +34,35 @@ class ProgressTracker:
         Args:
             n: Number of items processed since last update
         """
-        self.processed += n
-        current_time = time.time()
+        with self._lock:
+            self.processed += n
+            current_time = time.time()
 
-        # Calculate speed (items per second)
-        time_since_last_update = current_time - self.last_update_time
-        items_since_last_update = self.processed - self.last_update_processed
+            # Calculate speed (items per second)
+            time_since_last_update = current_time - self.last_update_time
+            items_since_last_update = self.processed - self.last_update_processed
 
-        if time_since_last_update > 0:
-            current_speed = items_since_last_update / time_since_last_update
-        else:
-            current_speed = 0
+            if time_since_last_update > 0:
+                current_speed = items_since_last_update / time_since_last_update
+            else:
+                current_speed = 0
 
-        # Calculate ETA
-        if current_speed > 0:
-            remaining_items = self.total - self.processed
-            eta_seconds = remaining_items / current_speed
-            eta = timedelta(seconds=int(eta_seconds))
-        else:
-            eta = None
+            # Calculate ETA
+            if current_speed > 0:
+                remaining_items = self.total - self.processed
+                eta_seconds = remaining_items / current_speed
+                eta = timedelta(seconds=int(eta_seconds))
+            else:
+                eta = None
 
-        # Update tracking
-        self.last_update_time = current_time
-        self.last_update_processed = self.processed
+            # Update tracking
+            self.last_update_time = current_time
+            self.last_update_processed = self.processed
 
-        # Calculate percentage
-        percentage = (self.processed / self.total) * 100 if self.total > 0 else 0
+            # Calculate percentage
+            percentage = (self.processed / self.total) * 100 if self.total > 0 else 0
 
-        # Log progress
+        # Log progress outside lock to avoid I/O holding the lock
         self._log_progress(percentage, current_speed, eta)
 
     def _log_progress(self, percentage: float, speed: float, eta: Optional[timedelta]):

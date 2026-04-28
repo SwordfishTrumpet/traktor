@@ -377,6 +377,7 @@ def process_list_parallel(
             plex.create_or_update_playlist(list_name, [], description=filtered_description)
             return {"list_name": list_name, "success": True, "matched": 0, "not_found": 0}
 
+        items_not_found_before = stats.get("items_not_found", 0)
         plex_items = _collect_plex_items(items, plex, workers, list_name, stats, missing_items)
 
         # Always update the playlist, even if empty, to remove old items
@@ -384,7 +385,7 @@ def process_list_parallel(
         plex.create_or_update_playlist(list_name, plex_items, description=filtered_description)
 
         # Calculate items not found for this list
-        items_not_found = stats.get("items_not_found", 0)
+        items_not_found = stats.get("items_not_found", 0) - items_not_found_before
 
         if plex_items:
             stats["playlists_updated"] += 1
@@ -438,13 +439,14 @@ def process_official_list_parallel(
 
     stats["items_total"] += len(items)
 
+    items_not_found_before = stats.get("items_not_found", 0)
     plex_items = _collect_plex_items(items, plex, workers, list_name, stats, missing_items)
 
     updated_playlists.add(list_name)
     plex.create_or_update_playlist(list_name, plex_items, description=filtered_description)
 
     # Calculate items not found for this list
-    items_not_found = stats.get("items_not_found", 0)
+    items_not_found = stats.get("items_not_found", 0) - items_not_found_before
 
     if plex_items:
         stats["playlists_updated"] += 1
@@ -855,7 +857,7 @@ def sync_lists(args: Optional[Any] = None) -> int:
             _should_sync_official_lists(args) if args else TRAKTOR_OFFICIAL_LISTS_ENABLED
         )
         if not sync_official:
-            return
+            return 0
 
     # Process liked lists (only if authenticated and list_source permits)
     if trakt and liked_lists and (not args or list_source in ("liked", "both")):
@@ -1140,6 +1142,8 @@ def sync_lists(args: Optional[Any] = None) -> int:
     # Calculate total elapsed time for the sync operation
     elapsed = time.time() - sync_start_time
     _print_summary(stats, elapsed)
+
+    return 1 if stats["lists_failed"] > 0 else 0
 
 
 def _should_sync_official_lists(args):
