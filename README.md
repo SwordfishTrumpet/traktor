@@ -2,11 +2,6 @@
 
 **Sync your Trakt curation to Plex playlists — automatically.**
 
-[![Release](https://img.shields.io/github/v/release/SwordfishTrumpet/traktor?logo=github&color=blue)](https://github.com/SwordfishTrumpet/traktor/releases)
-[![CI](https://img.shields.io/github/actions/workflow/status/SwordfishTrumpet/traktor/ci.yml?branch=main&logo=github&label=CI)](https://github.com/SwordfishTrumpet/traktor/actions)
-[![License](https://img.shields.io/github/license/SwordfishTrumpet/traktor?color=green)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.8+-blue?logo=python)](https://pepy.tech/project/traktor)
-
 ---
 
 Turn your liked Trakt lists into Plex playlists. Sync your watched status between platforms. Resume movies on Plex exactly where you left off on Trakt. Run it once and forget it — traktor handles the rest with smart caching, parallel processing, and delta sync.
