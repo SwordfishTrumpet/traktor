@@ -387,7 +387,8 @@ def main():
                             )
                         )
                 except Exception:
-                    pass  # If parsing fails, return original
+                    logger.debug(f"URL parsing failed for {v}, using original")
+                    # If parsing fails, return original
         return v
 
     safe_args = {k: mask_value(k, v) for k, v in vars(args).items()}

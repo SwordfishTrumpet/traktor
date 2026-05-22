@@ -18,9 +18,10 @@ from .conflict_resolver import ConflictResolver
 from .history_manager import WatchHistoryManager
 from .log import logger
 from .official_lists import OfficialListsService
-from .resilience import backup_manager, integrity_checker
+from .resilience import SyncProgress, backup_manager, integrity_checker
 from .settings import (
     LOG_FILE,
+    SYNC_PROGRESS_FILE,
     TRAKT_CLIENT_ID,
     TRAKT_CLIENT_SECRET,
     TRAKTOR_LIST_SOURCE,
@@ -759,6 +760,11 @@ def sync_lists(args: Optional[Any] = None) -> int:
     # Track overall sync timing
     sync_start_time = time.time()
 
+    # Initialize sync progress tracker for resume capability
+    sync_progress = SyncProgress(SYNC_PROGRESS_FILE)
+    # Reset progress at start of new sync
+    sync_progress.reset()
+
     stats = {
         "lists_found": 0,
         "lists_processed": 0,
@@ -780,7 +786,7 @@ def sync_lists(args: Optional[Any] = None) -> int:
 
     # Determine if OAuth authentication is required
     # Use CLI arg if provided, otherwise fall back to env var, then default to "official"
-    if args and hasattr(args, 'list_source') and args.list_source:
+    if args and hasattr(args, "list_source") and args.list_source:
         list_source = args.list_source
     else:
         list_source = TRAKTOR_LIST_SOURCE
@@ -901,6 +907,7 @@ def sync_lists(args: Optional[Any] = None) -> int:
                     missing_items,
                 )
                 stats["lists_processed"] += 1
+                sync_progress.mark_completed(f"liked:{list_name}")
 
                 if result.get("success", False):
                     if result.get("warning", "") == "no_matches":
@@ -942,6 +949,7 @@ def sync_lists(args: Optional[Any] = None) -> int:
             if all_official_playlists:
                 print(f"\nProcessing {len(all_official_playlists)} official playlist(s)...")
                 for playlist in all_official_playlists:
+                    playlist_name = playlist.get("name", "Unknown")
                     result = process_official_list_parallel(
                         playlist,
                         plex,
@@ -950,6 +958,7 @@ def sync_lists(args: Optional[Any] = None) -> int:
                         updated_playlists,
                         missing_items,
                     )
+                    sync_progress.mark_completed(f"official:{playlist_name}")
 
                     if result.get("success", False):
                         if result.get("warning", "") == "no_matches":
@@ -1111,6 +1120,8 @@ def sync_lists(args: Optional[Any] = None) -> int:
                 updated_playlists,
                 missing_items,
             )
+            sync_progress.mark_completed("collection:movies")
+            sync_progress.mark_completed("collection:shows")
 
             for result in collection_results:
                 if not result.get("success", False):
@@ -1134,6 +1145,8 @@ def sync_lists(args: Optional[Any] = None) -> int:
                 updated_playlists,
                 missing_items,
             )
+            sync_progress.mark_completed("watchlist:movies")
+            sync_progress.mark_completed("watchlist:shows")
 
             for result in watchlist_results:
                 if not result.get("success", False):

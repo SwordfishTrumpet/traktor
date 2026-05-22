@@ -36,7 +36,7 @@ def load_config():
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse config JSON: {e}", exc_info=True)
             return {}
-        except (PermissionError, FileNotFoundError, IOError) as e:
+        except (PermissionError, FileNotFoundError, OSError) as e:
             logger.error(f"Failed to read config file: {e}", exc_info=True)
             return {}
 
@@ -53,7 +53,7 @@ def save_config(config):
             json.dump(config, f, indent=2)
         logger.info("Configuration saved successfully")
         logger.info(f"Saved config keys: {list(config.keys())}")
-    except (PermissionError, FileNotFoundError, IOError) as e:
+    except (PermissionError, FileNotFoundError, OSError) as e:
         logger.error(f"Failed to write config file: {e}", exc_info=True)
 
 

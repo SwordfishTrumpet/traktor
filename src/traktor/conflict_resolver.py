@@ -18,7 +18,7 @@ class ConflictResolver:
     - trakt_wins: Always prefer Trakt state
     """
 
-    VALID_STRATEGIES = ["newest_wins", "plex_wins", "trakt_wins"]
+    VALID_STRATEGIES = ("newest_wins", "plex_wins", "trakt_wins")
 
     def __init__(self, strategy="newest_wins"):
         """Initialize conflict resolver.
@@ -212,4 +212,4 @@ class ConflictResolver:
         Returns:
             List of valid strategy names
         """
-        return ConflictResolver.VALID_STRATEGIES.copy()
+        return list(ConflictResolver.VALID_STRATEGIES)

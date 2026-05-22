@@ -51,6 +51,8 @@ else:
     CACHE_DIR = DATA_DIR / ".traktor_cache"
     LOG_FILE = DATA_DIR / ".traktor" / "traktor.log"
 
+SYNC_PROGRESS_FILE = CACHE_DIR / "sync_progress.json"
+
 
 def ensure_dirs():
     """Create runtime directories (cache and log) if they don't exist."""

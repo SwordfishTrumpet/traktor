@@ -5,17 +5,17 @@ import hashlib
 import json
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlencode
 
 import requests
-from plexapi.exceptions import NotFound
+from plexapi.exceptions import BadRequest, NotFound
 
 from .config import save_config
 from .log import logger
-from .resilience import CircuitBreakerOpen, trakt_circuit_breaker
+from .resilience import CircuitBreakerOpen, retry_with_backoff, trakt_circuit_breaker
 from .settings import (
     CACHE_DIR,
     CACHE_MAX_AGE_HOURS,
@@ -120,7 +120,7 @@ class CacheManager:
                     except Exception:
                         total_size = 0
                 hash_input += f"{section.title}:{section.type}:{total_size}:"
-            return hashlib.md5(hash_input.encode()).hexdigest()
+            return hashlib.sha256(hash_input.encode()).hexdigest()
         except (AttributeError, TypeError, ValueError) as e:
             logger.error(f"Failed to get library hash due to data error: {e}")
             return None
@@ -145,8 +145,14 @@ class CacheManager:
                 logger.debug("Cache version mismatch")
                 return False
 
-            cached_time = datetime.fromisoformat(meta.get("created", "2000-01-01"))
-            if datetime.now() - cached_time > timedelta(hours=CACHE_MAX_AGE_HOURS):
+            cached_time = datetime.fromisoformat(
+                meta.get("created", "2000-01-01")
+            )
+            if cached_time.tzinfo is None:
+                cached_time = cached_time.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - cached_time > timedelta(
+                hours=CACHE_MAX_AGE_HOURS
+            ):
                 logger.debug("Cache expired")
                 return False
 
@@ -164,6 +170,36 @@ class CacheManager:
             logger.error(f"Cache validation error: {e}")
             return False
 
+    def _validate_cache_structure(self) -> bool:
+        """Validate that loaded cache has required structure.
+
+        Returns:
+            True if cache structure is valid, False if corrupt/incomplete
+        """
+        if not isinstance(self.memory_cache, dict):
+            logger.warning("Cache is not a dict, rebuilding...")
+            return False
+
+        required_keys = [
+            "movies_by_imdb",
+            "movies_by_tmdb",
+            "shows_by_imdb",
+            "shows_by_tmdb",
+            "movies_list",
+            "shows_list",
+            "by_rating_key",
+        ]
+
+        for key in required_keys:
+            if key not in self.memory_cache:
+                logger.warning(f"Cache missing required key '{key}', rebuilding...")
+                return False
+            if not isinstance(self.memory_cache[key], (dict, list)):
+                logger.warning(f"Cache key '{key}' has wrong type, rebuilding...")
+                return False
+
+        return True
+
     def load_cache(self, force_refresh: bool = False, incremental: bool = True) -> bool:
         """Load cache from disk or build new cache.
 
@@ -180,6 +216,14 @@ class CacheManager:
                 with gzip.open(self.cache_file, "rt", encoding="utf-8") as f:
                     self.memory_cache = json.load(f)
                 logger.info(f"Loaded cache with {len(self.memory_cache)} entries")
+
+                # Validate structure - if corrupt, rebuild
+                if not self._validate_cache_structure():
+                    logger.warning("Cache structure validation failed, rebuilding...")
+                    self.memory_cache = {}
+                    self._plex_objects.clear()
+                    self._build_cache()
+                    return False
 
                 # Try incremental update if enabled
                 if incremental:
@@ -257,13 +301,17 @@ class CacheManager:
         """Add a Plex item to the in-memory cache and ID indexes."""
         # Store Plex object reference to avoid re-fetching from API later
         self._plex_objects[str(item.ratingKey)] = item
+        last_viewed = self._safe_get_attr(item, "lastViewedAt", None)
+        if last_viewed is not None:
+            last_viewed = last_viewed.isoformat()
+
         item_data = {
             "title": item.title,
             "year": item.year,
             "ratingKey": item.ratingKey,
             "guid": str(item.guid) if item.guid else None,
             "isWatched": self._safe_get_attr(item, "isWatched", False),
-            "lastViewedAt": self._safe_get_attr(item, "lastViewedAt", None),
+            "lastViewedAt": last_viewed,
         }
         self.memory_cache[f"{media_type}s_list"].append(item_data)
 
@@ -340,9 +388,9 @@ class CacheManager:
 
             meta = {
                 "version": CACHE_VERSION,
-                "created": datetime.now().isoformat(),
+                "created": datetime.now(timezone.utc).isoformat(),
                 "library_hash": self._get_library_hash(),
-                "last_update": datetime.now().isoformat(),
+                "last_update": datetime.now(timezone.utc).isoformat(),
                 "compression": {
                     "uncompressed_bytes": uncompressed_size,
                     "compressed_bytes": compressed_size,
@@ -376,7 +424,10 @@ class CacheManager:
                 meta = json.load(f)
             last_update_str = meta.get("last_update") or meta.get("created")
             if last_update_str:
-                return datetime.fromisoformat(last_update_str)
+                dt = datetime.fromisoformat(last_update_str)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
             return None
         except Exception as e:
             logger.debug(f"Could not get last update timestamp: {e}")
@@ -399,7 +450,7 @@ class CacheManager:
 
         # Only do incremental update if last update was within last 24 hours
         # and cache hasn't expired
-        time_since_update = datetime.now() - last_update
+        time_since_update = datetime.now(timezone.utc) - last_update
         if time_since_update > timedelta(hours=CACHE_MAX_AGE_HOURS):
             logger.info(
                 f"Cache is {time_since_update.total_seconds() / 3600:.1f} hours old, doing full rebuild"
@@ -428,11 +479,11 @@ class CacheManager:
                     )
 
                     # Filter items by added date
-                    cutoff_time = datetime.now() - time_since_update
+                    cutoff_time = datetime.now(timezone.utc) - time_since_update
                     new_items = [
                         item
                         for item in recent_items
-                        if datetime.fromtimestamp(item.addedAt) > cutoff_time
+                        if datetime.fromtimestamp(item.addedAt, tz=timezone.utc) > cutoff_time
                     ]
 
                     if new_items:
@@ -1433,6 +1484,13 @@ class PlexClient:
             )
             return None
 
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=2.0,
+        retryable_exceptions=(BadRequest, ConnectionError, TimeoutError),
+        retryable_status_codes=(500, 502, 503, 504),
+        name="plex_create_playlist",
+    )
     def _create_playlist(self, name, items):
         if items:
             logger.debug(f"Creating playlist with {len(items)} items...")
@@ -1455,6 +1513,13 @@ class PlexClient:
         except Exception as e:
             logger.warning(f"Could not {action} playlist description: {e}")
 
+    @retry_with_backoff(
+        max_retries=3,
+        base_delay=2.0,
+        retryable_exceptions=(BadRequest, ConnectionError, TimeoutError),
+        retryable_status_codes=(500, 502, 503, 504),
+        name="plex_update_playlist",
+    )
     def create_or_update_playlist(
         self,
         name: str,
@@ -1696,6 +1761,13 @@ class PlexClient:
             logger.error(f"Unexpected error marking as unwatched {rating_key}: {e}")
             return False
 
+    @retry_with_backoff(
+        max_retries=2,
+        base_delay=1.0,
+        retryable_exceptions=(BadRequest, ConnectionError, TimeoutError),
+        retryable_status_codes=(500, 502, 503, 504),
+        name="plex_batch_watched",
+    )
     def batch_mark_as_watched(self, rating_keys: List[Union[str, int]]) -> Dict[str, Any]:
         """Mark multiple items as watched in Plex.
 
@@ -1725,6 +1797,13 @@ class PlexClient:
         )
         return results
 
+    @retry_with_backoff(
+        max_retries=2,
+        base_delay=1.0,
+        retryable_exceptions=(BadRequest, ConnectionError, TimeoutError),
+        retryable_status_codes=(500, 502, 503, 504),
+        name="plex_batch_unwatched",
+    )
     def batch_mark_as_unwatched(self, rating_keys: List[Union[str, int]]) -> Dict[str, Any]:
         """Mark multiple items as unwatched in Plex.
 

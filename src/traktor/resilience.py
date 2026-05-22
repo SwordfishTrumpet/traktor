@@ -10,10 +10,10 @@ import json
 import shutil
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .log import logger
 from .settings import CACHE_DIR, CONFIG_FILE, TOKEN_FILE
@@ -246,7 +246,7 @@ class HealthCheck:
             result = check["func"]()
             with self._lock:
                 check["last_result"] = result
-                check["last_check"] = datetime.utcnow().isoformat()
+                check["last_check"] = datetime.now(timezone.utc).isoformat()
                 if result:
                     check["consecutive_failures"] = 0
                     check["status"] = HealthStatus.HEALTHY
@@ -262,7 +262,7 @@ class HealthCheck:
             logger.error(f"Health check '{name}' failed: {e}")
             with self._lock:
                 check["last_result"] = False
-                check["last_check"] = datetime.utcnow().isoformat()
+                check["last_check"] = datetime.now(timezone.utc).isoformat()
                 check["consecutive_failures"] += 1
                 if check["consecutive_failures"] >= 5:
                     check["status"] = HealthStatus.UNHEALTHY
@@ -290,7 +290,7 @@ class HealthCheck:
 
         return {
             "status": worst_status.value,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "components": results,
         }
 
@@ -340,7 +340,7 @@ class BackupManager:
         Returns:
             Path to created backup
         """
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup_name = f"traktor_backup_{timestamp}_{reason}"
         backup_path = self.backup_dir / backup_name
 
@@ -351,7 +351,7 @@ class BackupManager:
 
         # Backup each item
         manifest = {
-            "created": datetime.utcnow().isoformat(),
+            "created": datetime.now(timezone.utc).isoformat(),
             "reason": reason,
             "version": "1.0.0",
             "items": {},
@@ -603,7 +603,7 @@ class IntegrityChecker:
 
         return {
             "overall_healthy": all_healthy,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "checks": results,
         }
 
@@ -685,6 +685,136 @@ class IntegrityChecker:
                 "file_count": len(cache_files),
                 "corrupt_files": corrupt_files if corrupt_files else None,
             },
+        }
+
+
+def retry_with_backoff(
+    max_retries: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 30.0,
+    retryable_exceptions: Tuple[type, ...] = (Exception,),
+    retryable_status_codes: Tuple[int, ...] = (500, 502, 503, 504),
+    name: str = "operation",
+):
+    """Decorator for retrying operations with exponential backoff.
+
+    Args:
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay between retries in seconds
+        max_delay: Maximum delay between retries in seconds
+        retryable_exceptions: Exception types that should trigger a retry
+        retryable_status_codes: HTTP status codes that should trigger a retry
+        name: Name for logging
+    """
+
+    def decorator(func: Callable) -> Callable:
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except retryable_exceptions as e:
+                    # Determine if this specific exception instance should be retried
+                    should_retry = False
+                    error_str = str(e)
+
+                    # Always retry connection/timeout errors
+                    if isinstance(e, (ConnectionError, TimeoutError)):
+                        should_retry = True
+                    else:
+                        # Check for retryable status codes in error message
+                        found_status_code = None
+                        for code in retryable_status_codes:
+                            if f"({code})" in error_str:
+                                found_status_code = code
+                                break
+
+                        if found_status_code:
+                            # Status code is in retry list → retry
+                            should_retry = True
+                        elif any(f"({c})" in error_str for c in (400, 401, 403, 404, 422)):
+                            # Status code is a known non-retryable client error → don't retry
+                            should_retry = False
+                        else:
+                            # No specific status code found - if the exception type
+                            # is in retryable_exceptions, retry by default
+                            # (e.g., generic RuntimeError without status code)
+                            should_retry = True
+
+                    if not should_retry or attempt >= max_retries:
+                        raise
+
+                    delay = min(base_delay * (2**attempt), max_delay)
+                    logger.warning(
+                        f"[{name}] Attempt {attempt + 1}/{max_retries + 1} failed: {e}. "
+                        f"Retrying in {delay:.1f}s..."
+                    )
+                    time.sleep(delay)
+
+            # Should never reach here, but just in case
+            raise RuntimeError(f"Unexpected exit from retry loop for {name}")
+
+        return wrapper
+
+    return decorator
+
+
+class SyncProgress:
+    """Tracks sync progress for resume capability.
+
+    Saves which lists/playlists have been successfully processed so that
+    an interrupted sync can resume without re-processing completed work.
+    """
+
+    def __init__(self, progress_file: Path):
+        self.progress_file = progress_file
+        self._completed: set = set()
+        self._load()
+
+    def _load(self) -> None:
+        """Load progress from disk."""
+        if not self.progress_file.exists():
+            return
+        try:
+            with open(self.progress_file, "r") as f:
+                data = json.load(f)
+            self._completed = set(data.get("completed", []))
+        except (json.JSONDecodeError, FileNotFoundError, PermissionError) as e:
+            logger.warning(f"Could not load sync progress: {e}")
+            self._completed = set()
+
+    def save(self) -> None:
+        """Save progress to disk."""
+        try:
+            with open(self.progress_file, "w") as f:
+                json.dump(
+                    {
+                        "completed": sorted(list(self._completed)),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    },
+                    f,
+                )
+        except (PermissionError, FileNotFoundError) as e:
+            logger.warning(f"Could not save sync progress: {e}")
+
+    def is_completed(self, name: str) -> bool:
+        """Check if a list/playlist has been completed."""
+        return name in self._completed
+
+    def mark_completed(self, name: str) -> None:
+        """Mark a list/playlist as completed."""
+        self._completed.add(name)
+        self.save()
+
+    def reset(self) -> None:
+        """Clear all progress (call at start of new sync)."""
+        self._completed.clear()
+        self.save()
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get progress statistics."""
+        return {
+            "completed_count": len(self._completed),
+            "completed": sorted(list(self._completed)),
         }
 
 
