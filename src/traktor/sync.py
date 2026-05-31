@@ -1,12 +1,14 @@
 """Sync orchestration and list processing helpers."""
 
+import difflib
 import os
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import requests
 from plexapi.exceptions import NotFound
@@ -16,8 +18,14 @@ from .clients import CacheManager, PlexClient, TraktAuth, TraktClient
 from .config import get_plex_credentials, load_config
 from .conflict_resolver import ConflictResolver
 from .history_manager import WatchHistoryManager
+from .interactive import (
+    preview_changes,
+    restore_undo_snapshot,
+    save_undo_snapshot,
+)
 from .log import logger
 from .official_lists import OfficialListsService
+from .performance import performance_monitor
 from .resilience import SyncProgress, backup_manager, integrity_checker
 from .settings import (
     LOG_FILE,
@@ -25,6 +33,7 @@ from .settings import (
     TRAKT_CLIENT_ID,
     TRAKT_CLIENT_SECRET,
     TRAKTOR_LIST_SOURCE,
+    TRAKTOR_MAX_MEMORY_MB,
     TRAKTOR_OFFICIAL_ENDPOINTS,
     TRAKTOR_OFFICIAL_LISTS_ENABLED,
     TRAKTOR_OFFICIAL_PERIOD,
@@ -37,35 +46,51 @@ from .watch_sync import WatchSyncEngine
 # Constants for batch processing
 DEFAULT_CHUNK_SIZE = 500  # Number of items to process per chunk for memory efficiency
 
+# Constants for missing item suggestion engine
+FUZZY_MATCH_THRESHOLD = 0.6  # Minimum similarity ratio for title matching
+MAX_SUGGESTIONS = 3  # Maximum suggestions per missing item
+YEAR_TOLERANCE = 1  # Year difference tolerance for matching
+
 
 def process_item_parallel(idx: int, item: Dict[str, Any], plex: Any) -> Dict[str, Any]:
     """Process a single item in parallel."""
 
-    def build_result(success, title, year="", media_type="Unknown", imdb_id=None, plex_item=None):
+    def build_result(
+        success,
+        title,
+        year="",
+        media_type="Unknown",
+        imdb_id=None,
+        tmdb_id=None,
+        plex_item=None,
+        reason="",
+    ):
         result = {"success": success, "title": title, "year": year, "idx": idx}
         if success:
             result["item"] = plex_item
         else:
             result["type"] = media_type
             result["imdb_id"] = imdb_id
+            result["tmdb_id"] = tmdb_id
+            result["reason"] = reason
         return result
 
     def find_media_item(media, media_type):
-        # Get original imdb_id from media dict for preservation in results
+        # Get original imdb_id and tmdb_id from media dict for preservation in results
         original_imdb_id = media.get("ids", {}).get("imdb", None)
+        original_tmdb_id = media.get("ids", {}).get("tmdb", None)
 
         if original_imdb_id:
             plex_item = plex.find_item_by_cache(imdb_id=original_imdb_id, media_type=media_type)
             if plex_item:
-                return plex_item, original_imdb_id
+                return plex_item, original_imdb_id, original_tmdb_id
 
-        tmdb_id = media.get("ids", {}).get("tmdb", None)
-        if tmdb_id:
-            plex_item = plex.find_item_by_cache(tmdb_id=tmdb_id, media_type=media_type)
+        if original_tmdb_id:
+            plex_item = plex.find_item_by_cache(tmdb_id=original_tmdb_id, media_type=media_type)
             if plex_item:
-                return plex_item, original_imdb_id
+                return plex_item, original_imdb_id, original_tmdb_id
 
-        return None, original_imdb_id
+        return None, original_imdb_id, original_tmdb_id
 
     try:
         media_type = item.get("type", None)
@@ -74,22 +99,31 @@ def process_item_parallel(idx: int, item: Dict[str, Any], plex: Any) -> Dict[str
             movie = item.get("movie", {})
             title = movie.get("title", "Unknown")
             year = movie.get("year", "")
-            plex_item, imdb_id = find_media_item(movie, "movie")
+            plex_item, imdb_id, tmdb_id = find_media_item(movie, "movie")
 
             if plex_item:
                 return build_result(True, title, year, plex_item=plex_item)
 
-            return build_result(False, title, year, media_type="Movie", imdb_id=imdb_id)
+            return build_result(
+                False,
+                title,
+                year,
+                media_type="Movie",
+                imdb_id=imdb_id,
+                tmdb_id=tmdb_id,
+                reason="Movie not found in Plex library",
+            )
 
         if media_type == "show":
             show = item.get("show", {})
             title = show.get("title", "Unknown")
             year = show.get("year", "")
-            show_item, imdb_id = find_media_item(show, "show")
+            show_item, imdb_id, tmdb_id = find_media_item(show, "show")
 
             if show_item:
                 try:
                     seasons = show_item.seasons()
+                    # Try to find S01E01 first
                     season1 = None
                     for season in seasons:
                         if season.seasonNumber == 1:
@@ -107,37 +141,99 @@ def process_item_parallel(idx: int, item: Dict[str, Any], plex: Any) -> Dict[str
                                 year,
                                 plex_item=first_episode,
                             )
-                        logger.warning(f"  No episodes found in season 1 for '{title}' - skipping")
-                    else:
-                        logger.warning(f"  Season 1 not found for '{title}' - skipping")
+                        logger.warning(
+                            f"  No episodes found in season 1 for '{title}' - trying other seasons"
+                        )
 
-                    return build_result(False, title, year, media_type="Show", imdb_id=imdb_id)
+                    # Fallback: find the first available episode from any season
+                    first_episode = None
+                    for season in sorted(seasons, key=lambda s: s.seasonNumber):
+                        episodes = season.episodes()
+                        if episodes:
+                            first_episode = episodes[0]
+                            logger.info(
+                                f"  Using S{season.seasonNumber:02d}E01 for '{title}'"
+                                f" (S01E01 not found): {first_episode.title}"
+                            )
+                            return build_result(
+                                True,
+                                f"{title} - S{season.seasonNumber:02d}E01",
+                                year,
+                                plex_item=first_episode,
+                            )
+
+                    if not seasons:
+                        logger.warning(f"  No seasons found for '{title}' - skipping")
+                        return build_result(
+                            False,
+                            title,
+                            year,
+                            media_type="Show",
+                            imdb_id=imdb_id,
+                            tmdb_id=tmdb_id,
+                            reason="No seasons found in Plex",
+                        )
+
+                    logger.warning(f"  No episodes found in any season for '{title}' - skipping")
+                    return build_result(
+                        False,
+                        title,
+                        year,
+                        media_type="Show",
+                        imdb_id=imdb_id,
+                        tmdb_id=tmdb_id,
+                        reason="No episodes found in any season",
+                    )
 
                 except NotFound:
-                    logger.warning(f"  S01E01 not found for '{title}' - skipping")
-                    return build_result(False, title, year, media_type="Show", imdb_id=imdb_id)
+                    logger.warning(f"  Show data not found for '{title}' - skipping")
+                    return build_result(
+                        False,
+                        title,
+                        year,
+                        media_type="Show",
+                        imdb_id=imdb_id,
+                        tmdb_id=tmdb_id,
+                        reason="Show data not accessible in Plex",
+                    )
                 except (AttributeError, IndexError) as e:
                     logger.error(
                         f"  Error accessing season/episode data for '{title}': {e} - skipping"
                     )
-                    return build_result(False, title, year, media_type="Show", imdb_id=imdb_id)
+                    return build_result(
+                        False,
+                        title,
+                        year,
+                        media_type="Show",
+                        imdb_id=imdb_id,
+                        tmdb_id=tmdb_id,
+                        reason=f"Error accessing show data: {e}",
+                    )
 
-            return build_result(False, title, year, media_type="Show", imdb_id=imdb_id)
+            return build_result(
+                False,
+                title,
+                year,
+                media_type="Show",
+                imdb_id=imdb_id,
+                tmdb_id=tmdb_id,
+                reason="Show not found in Plex library",
+            )
 
-        return build_result(False, "Unknown")
+        return build_result(False, "Unknown", reason="Unknown media type")
     except (AttributeError, IndexError, KeyError, TypeError) as e:
         logger.error(f"Data error processing item {idx}: {e}")
-        result = build_result(False, "Error")
+        result = build_result(False, "Error", reason=f"Data error: {e}")
         result["error"] = str(e)
         return result
     except Exception as e:
         logger.error(f"Error processing item {idx}: {e}")
-        result = build_result(False, "Error")
+        result = build_result(False, "Error", reason=f"Processing error: {e}")
         result["error"] = str(e)
         return result
 
 
-def filter_description(description: Optional[str]) -> str:
+def filter_description(description: Optional[str]) -> Optional[str]:
     """Filter description to keep only useful text."""
     if not description:
         return description
@@ -153,7 +249,7 @@ def filter_description(description: Optional[str]) -> str:
         "http://",
         "https://",
     ]
-    result = []
+    result: List[str] = []
 
     for line in description.split("\n"):
         if line.strip() == "":
@@ -173,8 +269,187 @@ def filter_description(description: Optional[str]) -> str:
     return "\n".join(result)
 
 
+class MissingItemSuggester:
+    """Suggests potential Plex matches for missing items using fuzzy matching and ID analysis."""
+
+    def __init__(self, cache_manager):
+        self.cache = cache_manager
+
+    def get_suggestions(
+        self,
+        title: str,
+        year: Union[str, int],
+        imdb_id: str,
+        tmdb_id: Union[str, int, None],
+        media_type: str,
+    ) -> List[Dict[str, Any]]:
+        """Return list of suggestion dicts for a missing item."""
+        suggestions = []
+        suggestions.extend(self._fuzzy_match_title(title, year, media_type))
+        suggestions.extend(self._check_id_mismatch(imdb_id, tmdb_id, media_type))
+        suggestions.extend(self._detect_naming_mismatch(title, year, media_type))
+        suggestions.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        return suggestions[:MAX_SUGGESTIONS]
+
+    def _fuzzy_match_title(
+        self, title: str, year: Union[str, int], media_type: str
+    ) -> List[Dict[str, Any]]:
+        """Find items with similar titles in cache."""
+        cache_key = f"{media_type.lower()}s_list"
+        if not self.cache or not self.cache.memory_cache.get(cache_key):
+            return []
+
+        results = []
+        search_title = title.lower()
+        for item in self.cache.memory_cache[cache_key]:
+            cache_title = item.get("title", "")
+            if not cache_title:
+                continue
+            ratio = difflib.SequenceMatcher(None, search_title, cache_title.lower()).ratio()
+            if ratio >= FUZZY_MATCH_THRESHOLD:
+                cache_year = item.get("year", "")
+                year_match = False
+                if year and cache_year:
+                    try:
+                        year_match = abs(int(year) - int(cache_year)) <= YEAR_TOLERANCE
+                    except (ValueError, TypeError):
+                        pass
+                else:
+                    year_match = True
+
+                confidence = ratio
+                if year_match:
+                    confidence += 0.1
+                confidence = min(confidence, 1.0)
+
+                results.append(
+                    {
+                        "type": "fuzzy_title",
+                        "message": (
+                            f"Found similar title: '{cache_title}' ({cache_year}) - "
+                            "check if this is a naming mismatch"
+                        ),
+                        "confidence": confidence,
+                        "matched_title": cache_title,
+                        "matched_year": cache_year,
+                    }
+                )
+        return results
+
+    def _check_id_mismatch(
+        self, imdb_id: str, tmdb_id: Union[str, int, None], media_type: str
+    ) -> List[Dict[str, Any]]:
+        """Check if item exists under different ID format."""
+        if not self.cache or not self.cache.memory_cache:
+            return []
+
+        cache_type = media_type.lower()
+        results = []
+
+        # Check if IMDb ID exists as a TMDb ID
+        if imdb_id:
+            tmdb_cache = self.cache.memory_cache.get(f"{cache_type}s_by_tmdb", {})
+            if imdb_id in tmdb_cache:
+                item = tmdb_cache[imdb_id]
+                results.append(
+                    {
+                        "type": "id_mismatch",
+                        "message": (
+                            f"IMDb ID found as TMDb ID: '{item.get('title')}' ({item.get('year')}) - "
+                            "ID format mismatch"
+                        ),
+                        "confidence": 0.95,
+                        "matched_title": item.get("title"),
+                        "matched_year": item.get("year"),
+                    }
+                )
+
+        # Check if TMDb ID exists as an IMDb ID
+        if tmdb_id:
+            imdb_cache = self.cache.memory_cache.get(f"{cache_type}s_by_imdb", {})
+            tmdb_str = str(tmdb_id)
+            if tmdb_str in imdb_cache:
+                item = imdb_cache[tmdb_str]
+                results.append(
+                    {
+                        "type": "id_mismatch",
+                        "message": (
+                            f"TMDb ID found as IMDb ID: '{item.get('title')}' ({item.get('year')}) - "
+                            "ID format mismatch"
+                        ),
+                        "confidence": 0.95,
+                        "matched_title": item.get("title"),
+                        "matched_year": item.get("year"),
+                    }
+                )
+        return results
+
+    def _detect_naming_mismatch(
+        self, title: str, year: Union[str, int], media_type: str
+    ) -> List[Dict[str, Any]]:
+        """Detect common naming patterns like region suffixes, 'The' prefix, year in title."""
+        if not self.cache or not self.cache.memory_cache:
+            return []
+
+        cache_type = media_type.lower()
+        cache_key = f"{cache_type}s_list"
+        if not self.cache.memory_cache.get(cache_key):
+            return []
+
+        results = []
+        variations = []
+
+        # Check for region suffix like (US), (UK)
+        region_pattern = r"\s*\([A-Z]{2}\)$"
+        if re.search(region_pattern, title):
+            base_title = re.sub(region_pattern, "", title).strip()
+            variations.append((base_title, "region_suffix"))
+
+        # Check for "The " prefix variations
+        if title.lower().startswith("the "):
+            variations.append((title[4:], "the_prefix"))
+        else:
+            variations.append((f"The {title}", "the_prefix"))
+
+        # Check for year in title
+        year_pattern = r"\s*\(\d{4}\)$"
+        if re.search(year_pattern, title):
+            base_title = re.sub(year_pattern, "", title).strip()
+            variations.append((base_title, "year_in_title"))
+
+        for variant_title, pattern_type in variations:
+            for item in self.cache.memory_cache[cache_key]:
+                cache_title = item.get("title", "")
+                if not cache_title:
+                    continue
+                ratio = difflib.SequenceMatcher(
+                    None, variant_title.lower(), cache_title.lower()
+                ).ratio()
+                if ratio >= FUZZY_MATCH_THRESHOLD:
+                    pattern_desc = {
+                        "region_suffix": "region suffix",
+                        "the_prefix": '"The" prefix',
+                        "year_in_title": "year in title",
+                    }.get(pattern_type, "naming variation")
+                    results.append(
+                        {
+                            "type": "naming_mismatch",
+                            "message": (
+                                f"Detected {pattern_desc} mismatch: '{cache_title}' "
+                                f"({item.get('year')}) - check if this matches"
+                            ),
+                            "confidence": ratio,
+                            "matched_title": cache_title,
+                            "matched_year": item.get("year"),
+                        }
+                    )
+        return results
+
+
 def write_missing_report(
-    missing_items: List[Dict[str, Any]], file_path: Optional[Union[str, Path]] = None
+    missing_items: List[Dict[str, Any]],
+    file_path: Optional[Union[str, Path]] = None,
+    cache_manager: Optional[Any] = None,
 ) -> None:
     """Write missing items for the current run to disk."""
     if file_path is None:
@@ -187,12 +462,27 @@ def write_missing_report(
         logger.info("No missing items found for this run")
         return
 
+    suggester = MissingItemSuggester(cache_manager) if cache_manager else None
+
     with open(path, "w", encoding="utf-8") as f:
-        f.write("List | Type | Title | Year | IMDb ID\n")
-        f.write("-" * 100 + "\n")
+        f.write("List | Type | Title | Year | IMDb ID | Reason | Suggestions\n")
+        f.write("-" * 150 + "\n")
         for item in missing_items:
+            reason = item.get("reason", "Not found in Plex library")
+            suggestions_str = ""
+            if suggester:
+                suggestions = suggester.get_suggestions(
+                    title=item.get("title", ""),
+                    year=item.get("year", ""),
+                    imdb_id=item.get("imdb_id", ""),
+                    tmdb_id=item.get("tmdb_id", None),
+                    media_type=item.get("type", ""),
+                )
+                if suggestions:
+                    suggestions_str = "; ".join(s["message"] for s in suggestions[:MAX_SUGGESTIONS])
             f.write(
-                f"{item['list_name']} | {item['type']} | {item['title']} | {item['year']} | {item['imdb_id']}\n"
+                f"{item['list_name']} | {item['type']} | {item['title']} | {item['year']} | "
+                f"{item['imdb_id']} | {reason} | {suggestions_str}\n"
             )
 
     logger.info(f"Wrote {len(missing_items)} missing items to {file_path}")
@@ -205,7 +495,7 @@ class MissingItemTracker:
         self.missing_items = []
         self.not_found = []
 
-    def build_item(self, list_name, media_type, title, year="", imdb_id=""):
+    def build_item(self, list_name, media_type, title, year="", imdb_id="", tmdb_id="", reason=""):
         """Build a missing item dictionary."""
         return {
             "list_name": list_name,
@@ -213,6 +503,8 @@ class MissingItemTracker:
             "title": title,
             "year": year,
             "imdb_id": imdb_id,
+            "tmdb_id": tmdb_id,
+            "reason": reason,
         }
 
     def extract_details(self, item):
@@ -226,6 +518,7 @@ class MissingItemTracker:
             title=media.get("title", "Unknown"),
             year=media.get("year", ""),
             imdb_id=media.get("ids", {}).get("imdb", ""),
+            tmdb_id=media.get("ids", {}).get("tmdb", ""),
         )
 
     def record_result(self, list_name, result, stats):
@@ -239,6 +532,8 @@ class MissingItemTracker:
                 result.get("title", "Unknown"),
                 result.get("year", ""),
                 result.get("imdb_id", ""),
+                result.get("tmdb_id", ""),
+                result.get("reason", "Not found in Plex library"),
             )
         )
 
@@ -247,6 +542,7 @@ class MissingItemTracker:
         logger.error(f"Worker thread exception: {error}")
         details = self.extract_details(item)
         details["list_name"] = list_name
+        details["reason"] = f"Processing error: {error}"
         self.not_found.append(f"{details['title']} (error)")
         stats["items_not_found"] += 1
         self.missing_items.append(details)
@@ -264,9 +560,9 @@ class MissingItemTracker:
 _default_tracker = MissingItemTracker()
 
 
-def _build_missing_item(list_name, media_type, title, year="", imdb_id=""):
+def _build_missing_item(list_name, media_type, title, year="", imdb_id="", tmdb_id=""):
     """Backward-compatible wrapper - build a missing item dictionary."""
-    return _default_tracker.build_item(list_name, media_type, title, year, imdb_id)
+    return _default_tracker.build_item(list_name, media_type, title, year, imdb_id, tmdb_id)
 
 
 def _extract_missing_item_details(item):
@@ -365,6 +661,7 @@ def process_list_parallel(
         logger.warning(f"Skipping list '{list_name}' - missing username or list_id")
         return {"list_name": list_name, "success": False, "error": "missing_info"}
 
+    list_start_time = time.time()
     try:
         items = trakt.get_list_items(username, list_id)
         stats["items_total"] += len(items)
@@ -413,6 +710,10 @@ def process_list_parallel(
         logger.error(f"Data processing failed for list '{list_name}': {e}")
         stats["lists_failed"] += 1
         return {"list_name": list_name, "success": False, "error": f"Data error: {e}"}
+    finally:
+        list_elapsed = time.time() - list_start_time
+        performance_monitor.record_api_call(f"list:{list_name}", list_elapsed)
+        logger.debug(f"List '{list_name}' processed in {list_elapsed:.3f}s")
 
 
 def process_official_list_parallel(
@@ -433,38 +734,44 @@ def process_official_list_parallel(
     # Build description with "Updated at" timestamp like liked lists
     filtered_description = _build_playlist_description(description)
 
-    if not items:
+    list_start_time = time.time()
+    try:
+        if not items:
+            updated_playlists.add(list_name)
+            plex.create_or_update_playlist(list_name, [], description=filtered_description)
+            return {"list_name": list_name, "success": True, "matched": 0, "not_found": 0}
+
+        stats["items_total"] += len(items)
+
+        items_not_found_before = stats.get("items_not_found", 0)
+        plex_items = _collect_plex_items(items, plex, workers, list_name, stats, missing_items)
+
         updated_playlists.add(list_name)
-        plex.create_or_update_playlist(list_name, [], description=filtered_description)
-        return {"list_name": list_name, "success": True, "matched": 0, "not_found": 0}
+        plex.create_or_update_playlist(list_name, plex_items, description=filtered_description)
 
-    stats["items_total"] += len(items)
+        # Calculate items not found for this list
+        items_not_found = stats.get("items_not_found", 0) - items_not_found_before
 
-    items_not_found_before = stats.get("items_not_found", 0)
-    plex_items = _collect_plex_items(items, plex, workers, list_name, stats, missing_items)
+        if plex_items:
+            stats["playlists_updated"] += 1
+            return {
+                "list_name": list_name,
+                "success": True,
+                "matched": len(plex_items),
+                "not_found": items_not_found,
+            }
 
-    updated_playlists.add(list_name)
-    plex.create_or_update_playlist(list_name, plex_items, description=filtered_description)
-
-    # Calculate items not found for this list
-    items_not_found = stats.get("items_not_found", 0) - items_not_found_before
-
-    if plex_items:
-        stats["playlists_updated"] += 1
         return {
             "list_name": list_name,
             "success": True,
-            "matched": len(plex_items),
+            "matched": 0,
             "not_found": items_not_found,
+            "warning": "no_matches",
         }
-
-    return {
-        "list_name": list_name,
-        "success": True,
-        "matched": 0,
-        "not_found": items_not_found,
-        "warning": "no_matches",
-    }
+    finally:
+        list_elapsed = time.time() - list_start_time
+        performance_monitor.record_api_call(f"official_list:{list_name}", list_elapsed)
+        logger.debug(f"Official list '{list_name}' processed in {list_elapsed:.3f}s")
 
 
 def process_collection_sync(
@@ -715,8 +1022,126 @@ def authenticate_trakt(auth, force=False):
         return False
 
 
-def sync_lists(args: Optional[Any] = None) -> int:
+def _save_playlist_snapshot(plex, config):
+    """Save current state of all managed playlists for undo.
+
+    Args:
+        plex: PlexClient instance.
+        config: Loaded config dict.
+
+    Returns:
+        Dict with playlist snapshot data.
+    """
+    managed_playlists = config.get("managed_playlists", [])
+    playlists = {}
+
+    for name in managed_playlists:
+        try:
+            playlist = plex.server.playlist(name)
+            items = playlist.items()
+            playlists[name] = {
+                "items": [
+                    getattr(item, "ratingKey", None)
+                    for item in items
+                    if getattr(item, "ratingKey", None) is not None
+                ],
+                "description": getattr(playlist, "summary", "") or "",
+            }
+        except Exception:
+            pass
+
+    return playlists
+
+
+def _restore_playlist_snapshot(plex, snapshot_data):
+    """Restore playlists from an undo snapshot.
+
+    Args:
+        plex: PlexClient instance.
+        snapshot_data: Snapshot data dict with playlist info.
+
+    Returns:
+        Number of playlists restored.
+    """
+    playlists = snapshot_data.get("playlists", {})
+    restored = 0
+
+    for name, info in playlists.items():
+        items = info.get("items", [])
+        description = info.get("description", "")
+
+        plex_items = []
+        for rating_key in items:
+            try:
+                item = plex._get_plex_item(rating_key)
+                if item:
+                    plex_items.append(item)
+            except Exception:
+                pass
+
+        try:
+            plex.create_or_update_playlist(name, plex_items, description=description)
+            restored += 1
+            logger.info(f"Restored playlist from snapshot: {name}")
+        except Exception as e:
+            logger.error(f"Failed to restore playlist '{name}': {e}")
+
+    return restored
+
+
+def restore_last_undo(plex_url, plex_token):
+    """Restore the most recent undo snapshot.
+
+    Args:
+        plex_url: Plex server URL.
+        plex_token: Plex token.
+
+    Returns:
+        Exit code (0 for success, 1 for failure).
+    """
+    snapshot = restore_undo_snapshot()
+    if not snapshot:
+        print("No undo snapshots found.")
+        return 1
+
+    operation_type = snapshot.get("operation_type", "unknown")
+    data = snapshot.get("data", {})
+
+    print(f"Restoring {operation_type} snapshot from {snapshot.get('timestamp', 'unknown')}")
+
+    try:
+        plex_server = PlexServer(plex_url, plex_token)
+        cache_manager = CacheManager(plex_server)
+        cache_manager.load_cache()
+        plex = PlexClient(plex_server, cache_manager)
+    except Exception as e:
+        logger.error(f"Failed to connect to Plex: {e}")
+        print(f"Failed to connect to Plex: {e}")
+        return 1
+
+    if operation_type == "playlist_sync":
+        restored = _restore_playlist_snapshot(plex, data)
+        print(f"Restored {restored} playlist(s)")
+        return 0 if restored > 0 else 1
+
+    elif operation_type == "watch_sync":
+        print("Watch sync undo: previous state has been logged.")
+        print("Please run a new sync to restore the previous watch state.")
+        return 0
+
+    print(f"Unknown operation type: {operation_type}")
+    return 1
+
+
+def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = None) -> int:
     """Main sync function with parallel processing."""
+    # Initialize resource manager if not provided but memory limits are configured
+    if resource_manager is None and TRAKTOR_MAX_MEMORY_MB > 0:
+        from .resource_manager import ResourceManager
+
+        resource_manager = ResourceManager(max_memory_mb=TRAKTOR_MAX_MEMORY_MB)
+        resource_manager.set_memory_limit(TRAKTOR_MAX_MEMORY_MB)
+
     if not TRAKT_CLIENT_ID or not TRAKT_CLIENT_SECRET:
         logger.error("TRAKT_CLIENT_ID and TRAKT_CLIENT_SECRET must be set in environment/.env file")
         print("Error: Trakt API credentials not configured.")
@@ -769,14 +1194,16 @@ def sync_lists(args: Optional[Any] = None) -> int:
         "lists_found": 0,
         "lists_processed": 0,
         "lists_failed": 0,
+        "official_playlists_found": 0,
+        "official_playlists_processed": 0,
         "items_total": 0,
         "items_matched": 0,
         "items_not_found": 0,
         "playlists_updated": 0,
         "playlists_deleted": 0,
     }
-    updated_playlists = set()
-    missing_items = []
+    updated_playlists: Set[str] = set()
+    missing_items: List[Dict[str, Any]] = []
     config = load_config()
 
     missing_path = LOG_FILE.parent / "missing.txt"
@@ -839,9 +1266,9 @@ def sync_lists(args: Optional[Any] = None) -> int:
         print(f"Failed to connect to Plex: {e}")
         sys.exit(1)
 
-    # Fetch liked lists only if authenticated
+    # Fetch liked lists only if authenticated and needed
     liked_lists = []
-    if needs_auth and trakt:
+    if needs_auth and trakt and list_source in ("liked", "both") and not (args and args.sync_watched_only):
         logger.info("Fetching liked lists from Trakt...")
         try:
             liked_lists = trakt.get_liked_lists()
@@ -916,8 +1343,10 @@ def sync_lists(args: Optional[Any] = None) -> int:
                         print(f"   Playlist updated with {result.get('matched', 0)} item(s)")
                     if result.get("not_found", 0) > 0:
                         print(f"   {result.get('not_found', 0)} item(s) not found")
-                else:
-                    print(f"   Failed to process list: {result.get('error', 'Unknown error')}")
+                    else:
+                        print(f"   Failed to process list: {result.get('error', 'Unknown error')}")
+
+        _check_memory(resource_manager)
 
     # Official lists sync (always enabled by default - no auth required)
     if args and _should_sync_official_lists(args):
@@ -947,6 +1376,7 @@ def sync_lists(args: Optional[Any] = None) -> int:
                 all_official_playlists.extend(period_playlists)
 
             if all_official_playlists:
+                stats["official_playlists_found"] = len(all_official_playlists)
                 print(f"\nProcessing {len(all_official_playlists)} official playlist(s)...")
                 for playlist in all_official_playlists:
                     playlist_name = playlist.get("name", "Unknown")
@@ -958,6 +1388,7 @@ def sync_lists(args: Optional[Any] = None) -> int:
                         updated_playlists,
                         missing_items,
                     )
+                    stats["official_playlists_processed"] += 1
                     sync_progress.mark_completed(f"official:{playlist_name}")
 
                     if result.get("success", False):
@@ -976,22 +1407,52 @@ def sync_lists(args: Optional[Any] = None) -> int:
             logger.error(f"Official lists sync failed: {e}", exc_info=True)
             print(f"\nOfficial lists sync failed: {e}")
 
-    write_missing_report(missing_items)
+    _check_memory(resource_manager)
+
+    write_missing_report(missing_items, cache_manager=cache_manager)
+
+    # Save undo snapshot before any destructive operations
+    if args and (args.interactive or args.undo):
+        playlist_snapshot = _save_playlist_snapshot(plex, config)
+        if playlist_snapshot:
+            save_undo_snapshot("playlist_sync", {"playlists": playlist_snapshot})
+            logger.info("Saved pre-sync playlist snapshot for undo")
 
     # Skip orphaned playlist cleanup when in watch-only mode (no playlists created)
     if args and args.sync_watched_only:
         logger.info("Skipping orphaned playlist cleanup (--sync-watched-only mode)")
     else:
         print("\nChecking for orphaned playlists...")
-        orphaned = plex.cleanup_orphaned_playlists(updated_playlists, config)
-        stats["playlists_deleted"] = len(orphaned)
 
-        if orphaned:
-            print(f"   Deleted {len(orphaned)} orphaned playlist(s):")
-            for name in orphaned:
-                print(f"     - {name}")
+        # In interactive mode, preview first then confirm before deleting
+        if args and args.interactive:
+            orphaned_preview = plex.cleanup_orphaned_playlists(
+                list(updated_playlists), config, dry_run=True
+            )
+            if orphaned_preview:
+                confirmed = preview_changes(
+                    {"playlists": orphaned_preview},
+                    change_type="playlist_cleanup",
+                )
+                if confirmed:
+                    orphaned = plex.cleanup_orphaned_playlists(
+                        list(updated_playlists), config, dry_run=False
+                    )
+                    stats["playlists_deleted"] = len(orphaned)
+                    print(f"   Deleted {len(orphaned)} orphaned playlist(s)")
+                else:
+                    print("Orphaned playlist cleanup cancelled by user.")
+                    logger.info("Orphaned playlist cleanup cancelled by user")
+                    stats["playlists_deleted"] = 0
+            else:
+                print("   No orphaned playlists found")
         else:
-            print("   No orphaned playlists found")
+            orphaned = plex.cleanup_orphaned_playlists(list(updated_playlists), config)
+            stats["playlists_deleted"] = len(orphaned)
+            if orphaned:
+                print(f"   Deleted {len(orphaned)} orphaned playlist(s)")
+            else:
+                print("   No orphaned playlists found")
 
     # Watch sync (if enabled and authenticated, or in watch-only mode)
     if args and (args.sync_watched or args.sync_watched_only):
@@ -1031,34 +1492,94 @@ def sync_lists(args: Optional[Any] = None) -> int:
                 if direction == "both" and WATCH_SYNC_DIRECTION != "both":
                     direction = WATCH_SYNC_DIRECTION
 
-                # Run sync
-                watch_stats = sync_engine.sync_watched_status(
-                    direction=direction,
-                    dry_run=args.dry_run,
-                    movies_only=args.sync_movies_only,
-                    shows_only=args.sync_shows_only,
-                    backfill_history=args.backfill_history,
-                )
+                # Interactive mode: preview first, then confirm, then apply
+                if args and args.interactive and not args.dry_run:
+                    print("\n[Interactive mode] Running dry-run preview first...")
+                    preview_stats = sync_engine.sync_watched_status(
+                        direction=direction,
+                        dry_run=True,
+                        movies_only=args.sync_movies_only,
+                        shows_only=args.sync_shows_only,
+                        backfill_history=args.backfill_history,
+                    )
 
-                # Print watch sync summary
-                if args.dry_run:
-                    print("\n[DRY RUN] Changes that would be made:")
+                    changes = preview_stats.get("changes")
+                    if changes:
+                        confirmed = preview_changes(
+                            changes,
+                            change_type="watch_sync",
+                        )
+                    else:
+                        confirmed = True
+
+                    if not confirmed:
+                        print("Watch sync cancelled by user.")
+                        logger.info("Watch sync cancelled by user")
+                    else:
+                        print("\nApplying watch sync changes...")
+                        # Save undo snapshot before applying watch sync changes
+                        if args and (args.interactive or args.undo):
+                            changes = preview_stats.get("changes")
+                            if changes:
+                                save_undo_snapshot("watch_sync", {"changes": changes})
+                                logger.info("Saved pre-sync watch sync snapshot for undo")
+                        watch_stats = sync_engine.sync_watched_status(
+                            direction=direction,
+                            dry_run=False,
+                            movies_only=args.sync_movies_only,
+                            shows_only=args.sync_shows_only,
+                            backfill_history=args.backfill_history,
+                        )
+
+                        print("\nWatch sync complete!")
+                        print(
+                            f"  Plex: {watch_stats['plex_watched']} marked watched, "
+                            f"{watch_stats['plex_unwatched']} marked unwatched"
+                        )
+                        print(
+                            f"  Trakt: {watch_stats['trakt_watched']} marked watched, "
+                            f"{watch_stats['trakt_unwatched']} marked unwatched"
+                        )
+                        if watch_stats["errors"] > 0:
+                            print(f"  Errors: {watch_stats['errors']}")
                 else:
-                    print("\nWatch sync complete!")
+                    # Run sync normally (non-interactive or dry-run)
+                    watch_stats = sync_engine.sync_watched_status(
+                        direction=direction,
+                        dry_run=args.dry_run,
+                        movies_only=args.sync_movies_only,
+                        shows_only=args.sync_shows_only,
+                        backfill_history=args.backfill_history,
+                    )
+                    # Save undo snapshot for non-interactive mode
+                    if not args.dry_run and args and (args.interactive or args.undo):
+                        changes = watch_stats.get("changes")
+                        if changes:
+                            save_undo_snapshot("watch_sync", {"changes": changes})
+                            logger.info("Saved post-sync watch sync snapshot for undo")
 
-                print(
-                    f"  Plex: {watch_stats['plex_watched']} marked watched, {watch_stats['plex_unwatched']} marked unwatched"
-                )
-                print(
-                    f"  Trakt: {watch_stats['trakt_watched']} marked watched, {watch_stats['trakt_unwatched']} marked unwatched"
-                )
+                    if args.dry_run:
+                        print("\n[DRY RUN] Changes that would be made:")
+                    else:
+                        print("\nWatch sync complete!")
 
-                if watch_stats["errors"] > 0:
-                    print(f"  Errors: {watch_stats['errors']}")
+                    print(
+                        f"  Plex: {watch_stats['plex_watched']} marked watched, "
+                        f"{watch_stats['plex_unwatched']} marked unwatched"
+                    )
+                    print(
+                        f"  Trakt: {watch_stats['trakt_watched']} marked watched, "
+                        f"{watch_stats['trakt_unwatched']} marked unwatched"
+                    )
+
+                    if watch_stats["errors"] > 0:
+                        print(f"  Errors: {watch_stats['errors']}")
 
             except Exception as e:
                 logger.error(f"Watch sync failed: {e}", exc_info=True)
                 print(f"\nWatch sync failed: {e}")
+
+        _check_memory(resource_manager)
 
     # Progress sync (if enabled and authenticated)
     if args and args.sync_progress:
@@ -1127,6 +1648,8 @@ def sync_lists(args: Optional[Any] = None) -> int:
                 if not result.get("success", False):
                     stats["lists_failed"] += 1
 
+        _check_memory(resource_manager)
+
     # Watchlist sync (if enabled and authenticated, and not in watch-only mode)
     if args and args.sync_watchlist and not args.sync_watched_only:
         if trakt is None:
@@ -1152,11 +1675,26 @@ def sync_lists(args: Optional[Any] = None) -> int:
                 if not result.get("success", False):
                     stats["lists_failed"] += 1
 
+        _check_memory(resource_manager)
+
     # Calculate total elapsed time for the sync operation
     elapsed = time.time() - sync_start_time
-    _print_summary(stats, elapsed)
+
+    # Record final memory sample and performance summary
+    performance_monitor.record_memory_usage()
+    _print_summary(
+        stats,
+        elapsed,
+        show_performance=args.performance_report if args else False,
+    )
 
     return 1 if stats["lists_failed"] > 0 else 0
+
+
+def _check_memory(resource_manager):
+    """Check memory usage if resource manager is configured."""
+    if resource_manager:
+        resource_manager.check_memory_usage()
 
 
 def _should_sync_official_lists(args):
@@ -1297,15 +1835,17 @@ def _get_official_periods(args):
     return [_get_official_period(args)]
 
 
-def _print_summary(stats, elapsed):
+def _print_summary(stats, elapsed, show_performance=False):
     """Log and print the sync summary."""
     logger.info("=" * 80)
     logger.info("SYNC SUMMARY")
     logger.info("=" * 80)
     lines = [
         f"Total time: {elapsed:.2f} seconds",
-        f"Lists found: {stats['lists_found']}",
-        f"Lists processed: {stats['lists_processed']}",
+        f"Liked lists found: {stats['lists_found']}",
+        f"Liked lists processed: {stats['lists_processed']}",
+        f"Official playlists found: {stats['official_playlists_found']}",
+        f"Official playlists processed: {stats['official_playlists_processed']}",
         f"Lists failed: {stats['lists_failed']}",
         f"Total items: {stats['items_total']}",
         f"Items matched: {stats['items_matched']}",
@@ -1315,6 +1855,43 @@ def _print_summary(stats, elapsed):
     ]
     for line in lines:
         logger.info(line)
+
+    if show_performance:
+        perf_summary = performance_monitor.get_summary()
+        bottlenecks = performance_monitor.detect_bottlenecks()
+
+        logger.info("-" * 80)
+        logger.info("PERFORMANCE SUMMARY")
+        logger.info("-" * 80)
+
+        for endpoint, call_stats in perf_summary["api_calls"].items():
+            avg_ms = (
+                (call_stats["total_time"] / call_stats["count"] * 1000)
+                if call_stats["count"] > 0
+                else 0
+            )
+            logger.info(
+                f"API {endpoint}: {call_stats['count']} calls, "
+                f"avg={avg_ms:.1f}ms, max={call_stats['max_time'] * 1000:.1f}ms"
+            )
+
+        cache = perf_summary["cache_stats"]
+        logger.info(
+            f"Cache: {cache['hits']} hits, {cache['misses']} misses, "
+            f"hit_rate={cache['hit_rate']:.1%}"
+        )
+
+        if perf_summary["memory_samples"]:
+            latest_mem = perf_summary["memory_samples"][-1]
+            logger.info(f"Memory: {latest_mem['rss_mb']:.1f} MB")
+
+        if bottlenecks:
+            logger.warning("Bottlenecks detected:")
+            for warning in bottlenecks:
+                logger.warning(f"  {warning}")
+
+        logger.info("-" * 80)
+
     logger.info("=" * 80)
 
     print("\n" + "=" * 60)
@@ -1324,3 +1901,27 @@ def _print_summary(stats, elapsed):
     print("\nSummary:")
     for line in lines[1:]:
         print(f"  {line}")
+
+    if show_performance:
+        print("\n" + "-" * 60)
+        print("Performance Report")
+        print("-" * 60)
+        perf_summary = performance_monitor.get_summary()
+        for endpoint, call_stats in perf_summary["api_calls"].items():
+            avg_ms = (
+                (call_stats["total_time"] / call_stats["count"] * 1000)
+                if call_stats["count"] > 0
+                else 0
+            )
+            print(f"  {endpoint}: {call_stats['count']} calls, avg={avg_ms:.1f}ms")
+        cache = perf_summary["cache_stats"]
+        print(f"  Cache hit rate: {cache['hit_rate']:.1%}")
+        if perf_summary["memory_samples"]:
+            latest_mem = perf_summary["memory_samples"][-1]
+            print(f"  Memory: {latest_mem['rss_mb']:.1f} MB")
+        bottlenecks = performance_monitor.detect_bottlenecks()
+        if bottlenecks:
+            print("  Bottlenecks:")
+            for b in bottlenecks:
+                print(f"    {b}")
+        print("-" * 60)

@@ -105,7 +105,7 @@ class TraktOfficialClient:
         return {
             "Content-Type": "application/json",
             "trakt-api-version": "2",
-            "trakt-api-key": self.client_id,
+            "trakt-api-key": self.client_id if self.client_id is not None else "",
         }
 
     def _request(self, endpoint: str, params: Optional[Dict] = None) -> List[Dict]:
@@ -444,9 +444,9 @@ class TraktOfficialClient:
             "shows.anticipated": self.get_shows_anticipated,
         }
 
-        method = method_map.get(endpoint_name)
-        if method:
-            return method(limit=limit)
+        method_fn = method_map.get(endpoint_name)
+        if method_fn:
+            return method_fn(**{"limit": limit})
 
         return []
 

@@ -54,6 +54,17 @@ See all options: `uv run traktor --help`
 | **📦 Official lists** | Sync Trakt's algorithmic lists (trending, popular, box office) without extra OAuth |
 | **🐳 Docker ready** | One `docker compose up` and you're scheduled |
 | **🧹 Self-cleaning** | Unlike a list? Un-like it on Trakt — the playlist disappears automatically |
+| **🎯 Smart fallback** | Shows without S01E01 automatically fall back to the first available episode |
+| **📊 Actionable reports** | `missing.txt` includes reasons (not just IDs) so you know why items weren't found |
+| **🔍 Smart suggestions** | Missing items include fuzzy title matches and naming mismatch detection |
+| **🖥️ Interactive mode** | Preview changes before applying, confirm deletions, undo recent operations |
+| **🧠 Advanced conflict resolution** | Per-media-type rules, timezone-aware timestamps, and confidence scoring |
+| **🔒 Auth failure detection** | Auto-detects stale Trakt tokens and prompts for re-authentication |
+| **📝 Structured logging** | Optional JSON logs with correlation IDs for machine parsing |
+| **📈 Performance monitoring** | Built-in API timing, cache hit rates, and bottleneck detection |
+| **🏥 Health endpoints** | HTTP `/health`, `/metrics`, and `/status` for container monitoring |
+| **🔄 Auto-update checks** | Check for new versions via GitHub API with safe rollback capability |
+| **⚙️ Resource management** | Configurable memory limits and CPU throttling for multi-tenant operation |
 
 ## Everything it does
 
@@ -74,10 +85,12 @@ See all options: `uv run traktor --help`
 
 **Performance & Reliability**
 - In-memory cache with 24-hour TTL and hash-based invalidation
+- Incremental cache updates — only scan new items since last sync
 - Batch API operations (100 items per call)
 - Delta sync skips unchanged items after first run
+- Smart playlist updates — only add/remove changed items instead of recreating entire playlists
 - Parallel workers (default 8, configurable)
-- Detailed `missing.txt` report for items not found in Plex
+- Detailed `missing.txt` report with reasons for missing items
 
 ## Documentation
 
@@ -113,6 +126,10 @@ See [DOCKER.md](DOCKER.md) for scheduling and volume mounts.
 | `WATCH_SYNC_ENABLED` | `false` | Enable bidirectional watch status sync |
 | `TRAKTOR_OFFICIAL_LISTS_ENABLED` | `true` | Enable official Trakt lists (trending, popular) |
 | `DOCKER_MODE` | `false` | Use `/data/` paths instead of home directory |
+| `TRAKTOR_HEALTH_PORT` | `8080` | Port for HTTP health endpoints |
+| `TRAKTOR_MAX_MEMORY_MB` | `512` | Maximum memory usage in MB |
+| `TRAKTOR_CPU_THROTTLE` | `false` | Enable CPU throttling |
+| `TRAKTOR_BANDWIDTH_LIMIT_KBPS` | `0` | Network bandwidth limit (0 = unlimited) |
 
 **CLI flags:**
 - `--verbose, -v` — Enable debug logging to console
@@ -127,13 +144,19 @@ See [DOCKER.md](DOCKER.md) for scheduling and volume mounts.
 - `--sync-collection`, `--sync-watchlist` — Personal Trakt data (OAuth required)
 - `--sync-movies-only`, `--sync-shows-only` — Filter watch sync by media type
 - `--backfill-history` — Full history sync (initial setup)
+- `--interactive` — Prompt for confirmation before significant changes
+- `--undo` — Restore the most recent operation
+- `--structured-logging` — Output JSON logs with correlation IDs
+- `--performance-report` — Print detailed performance metrics after sync
 - `--refresh-cache`, `--diagnose`, `--dry-run`, `--workers N` — Utility flags
 
 **Mission-critical commands:**
 - `--health-check` — Run health checks and report system status
+- `--serve-health` — Start HTTP health server for container monitoring
 - `--integrity-check` — Verify integrity of config, tokens, and cache files
 - `--backup`, `--backup-list`, `--backup-restore PATH` — Backup management
 - `--circuit-status` — Show circuit breaker status for API clients
+- `--check-update`, `--apply-update` — Check for and apply updates
 
 **Official list options:**
 - `--official-lists`, `--no-official-lists` — Enable/disable official lists

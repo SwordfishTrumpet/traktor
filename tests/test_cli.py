@@ -77,3 +77,105 @@ def test_parse_args_watch_sync(monkeypatch):
     assert args.dry_run is True
     assert args.sync_movies_only is True
     assert args.sync_shows_only is False
+
+
+def test_parse_args_structured_logging(monkeypatch):
+    """Test structured logging CLI argument."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["traktor", "--structured-logging"],
+    )
+    args = cli.parse_args()
+    assert args.structured_logging is True
+
+
+def test_parse_args_performance_report(monkeypatch):
+    """Test performance report CLI argument."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["traktor", "--performance-report"],
+    )
+    args = cli.parse_args()
+    assert args.performance_report is True
+
+
+def test_parse_args_structured_logging_default(monkeypatch):
+    """Test structured logging and performance report defaults."""
+    monkeypatch.setattr(sys, "argv", ["traktor"])
+    args = cli.parse_args()
+    assert args.structured_logging is False
+    assert args.performance_report is False
+
+
+def test_parse_args_interactive(monkeypatch):
+    """Test interactive mode CLI argument."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["traktor", "--interactive"],
+    )
+    args = cli.parse_args()
+    assert args.interactive is True
+
+
+def test_parse_args_interactive_default(monkeypatch):
+    """Test interactive mode default is False."""
+    monkeypatch.setattr(sys, "argv", ["traktor"])
+    args = cli.parse_args()
+    assert args.interactive is False
+
+
+def test_parse_args_undo(monkeypatch):
+    """Test undo CLI argument."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["traktor", "--undo"],
+    )
+    args = cli.parse_args()
+    assert args.undo is True
+
+
+def test_parse_args_undo_default(monkeypatch):
+    """Test undo default is False."""
+    monkeypatch.setattr(sys, "argv", ["traktor"])
+    args = cli.parse_args()
+    assert args.undo is False
+
+
+def test_parse_args_check_update(monkeypatch):
+    """Test check-update CLI argument."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["traktor", "--check-update"],
+    )
+    args = cli.parse_args()
+    assert args.check_update is True
+
+
+def test_parse_args_check_update_default(monkeypatch):
+    """Test check-update default is False."""
+    monkeypatch.setattr(sys, "argv", ["traktor"])
+    args = cli.parse_args()
+    assert args.check_update is False
+
+
+def test_parse_args_apply_update(monkeypatch):
+    """Test apply-update CLI argument."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["traktor", "--apply-update"],
+    )
+    args = cli.parse_args()
+    assert args.apply_update is True
+
+
+def test_parse_args_apply_update_default(monkeypatch):
+    """Test apply-update default is False."""
+    monkeypatch.setattr(sys, "argv", ["traktor"])
+    args = cli.parse_args()
+    assert args.apply_update is False

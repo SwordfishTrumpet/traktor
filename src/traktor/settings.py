@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 # 2. /app/.env (for Docker with volume mount)
 # 3. Parent of current file (for various runtime contexts)
 _env_loaded = False
-for env_path in [".env", "/app/.env", Path(__file__).parent.parent.parent / ".env"]:
+for env_path in [".env", "/app/.env", str(Path(__file__).parent.parent.parent / ".env")]:
     path = Path(env_path)
     if path.exists():
         load_dotenv(path)
@@ -33,7 +33,7 @@ TRAKT_CLIENT_ID = os.getenv("TRAKT_CLIENT_ID")
 TRAKT_CLIENT_SECRET = os.getenv("TRAKT_CLIENT_SECRET")
 TRAKT_ACCESS_TOKEN = os.getenv("TRAKT_ACCESS_TOKEN")
 TRAKT_REFRESH_TOKEN = os.getenv("TRAKT_REFRESH_TOKEN")
-TRAKT_REDIRECT_URI = "urn:ietf:wg:oauth:2.0:oob"
+TRAKT_REDIRECT_URI = os.getenv("TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")
 TRAKT_API_URL = "https://api.trakt.tv"
 
 # Runtime mode
@@ -80,6 +80,14 @@ TRAKTOR_OFFICIAL_PERIODS = os.getenv("TRAKTOR_OFFICIAL_PERIODS", "")
 # List source settings
 # Options: "liked", "official", or "both"
 TRAKTOR_LIST_SOURCE = os.getenv("TRAKTOR_LIST_SOURCE", "official")
+
+# Health server settings
+HEALTH_SERVER_PORT = int(os.getenv("TRAKTOR_HEALTH_PORT", "8080"))
+
+# Resource management settings
+TRAKTOR_MAX_MEMORY_MB = int(os.getenv("TRAKTOR_MAX_MEMORY_MB", "512"))
+TRAKTOR_CPU_THROTTLE = _parse_bool_env("TRAKTOR_CPU_THROTTLE", "false")
+TRAKTOR_BANDWIDTH_LIMIT_KBPS = int(os.getenv("TRAKTOR_BANDWIDTH_LIMIT_KBPS", "0"))  # 0 = unlimited
 
 # Official lists cache TTLs (in hours)
 TRAKTOR_OFFICIAL_CACHE_TTL_TRENDING = int(os.getenv("TRAKTOR_OFFICIAL_CACHE_TTL_TRENDING", "1"))

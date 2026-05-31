@@ -1,11 +1,20 @@
 """Tests for log module."""
 
+import json
 import logging
+import sys
+import threading
+import uuid
 from logging.handlers import RotatingFileHandler
 from unittest.mock import patch
 
 from traktor import log as log_module
-from traktor.log import setup_logging
+from traktor.log import (
+    JSONFormatter,
+    get_correlation_id,
+    set_correlation_id,
+    setup_logging,
+)
 
 
 class TestSetupLogging:
@@ -146,3 +155,195 @@ class TestSetupLogging:
         logger = log_module.logger
         file_handlers = [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]
         assert len(file_handlers) == 1
+
+
+class TestJSONFormatter:
+    """Tests for JSONFormatter."""
+
+    def test_json_formatter_basic(self):
+        formatter = JSONFormatter()
+        record = logging.LogRecord(
+            name="traktor",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=1,
+            msg="Test message",
+            args=(),
+            exc_info=None,
+        )
+        result = formatter.format(record)
+        data = json.loads(result)
+        assert data["level"] == "INFO"
+        assert data["message"] == "Test message"
+        assert data["logger"] == "traktor"
+        assert "timestamp" in data
+        assert "source" in data
+
+    def test_json_formatter_with_correlation_id(self):
+        formatter = JSONFormatter()
+        record = logging.LogRecord(
+            name="traktor",
+            level=logging.DEBUG,
+            pathname="test.py",
+            lineno=2,
+            msg="Debug msg",
+            args=(),
+            exc_info=None,
+        )
+        record.correlation_id = "test-cid-123"
+        result = formatter.format(record)
+        data = json.loads(result)
+        assert data["correlation_id"] == "test-cid-123"
+
+    def test_json_formatter_with_extra(self):
+        formatter = JSONFormatter()
+        record = logging.LogRecord(
+            name="traktor",
+            level=logging.WARNING,
+            pathname="test.py",
+            lineno=3,
+            msg="Warning msg",
+            args=(),
+            exc_info=None,
+        )
+        record.extra = {"endpoint": "/test", "duration": 0.5}
+        result = formatter.format(record)
+        data = json.loads(result)
+        assert data["extra"]["endpoint"] == "/test"
+        assert data["extra"]["duration"] == 0.5
+
+    def test_json_formatter_with_exception(self):
+        formatter = JSONFormatter()
+        try:
+            raise ValueError("test error")
+        except Exception:
+            exc_info = sys.exc_info()
+        record = logging.LogRecord(
+            name="traktor",
+            level=logging.ERROR,
+            pathname="test.py",
+            lineno=4,
+            msg="Error occurred",
+            args=(),
+            exc_info=exc_info,
+        )
+        result = formatter.format(record)
+        data = json.loads(result)
+        assert "exception" in data
+        assert "ValueError" in data["exception"]
+
+
+class TestCorrelationId:
+    """Tests for correlation ID helpers."""
+
+    def test_set_correlation_id_returns_uuid(self):
+        cid = set_correlation_id()
+        assert cid is not None
+        assert len(cid) > 0
+        uuid.UUID(cid)
+
+    def test_set_correlation_id_custom(self):
+        cid = set_correlation_id("custom-id")
+        assert cid == "custom-id"
+        assert get_correlation_id() == "custom-id"
+
+    def test_get_correlation_id_default(self):
+        set_correlation_id(None)
+        result = get_correlation_id()
+        assert result is None
+
+    def test_correlation_id_thread_local(self):
+        set_correlation_id("main-thread")
+        results = {}
+
+        def worker():
+            set_correlation_id("worker-thread")
+            results["worker"] = get_correlation_id()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        assert get_correlation_id() == "main-thread"
+        assert results["worker"] == "worker-thread"
+
+    def test_correlation_id_none(self):
+        set_correlation_id(None)
+        assert get_correlation_id() is None
+
+
+class TestSetupLoggingStructured:
+    """Tests for structured logging setup."""
+
+    def test_setup_logging_structured_uses_json_formatter(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        with patch("traktor.log.LOG_FILE", log_file):
+            with patch("traktor.log.DOCKER_MODE", False):
+                setup_logging(verbose=False, structured=True)
+
+        logger = log_module.logger
+        file_handlers = [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]
+        assert len(file_handlers) == 1
+        assert isinstance(file_handlers[0].formatter, JSONFormatter)
+
+    def test_setup_logging_structured_console_plain_text(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        with patch("traktor.log.LOG_FILE", log_file):
+            with patch("traktor.log.DOCKER_MODE", False):
+                setup_logging(verbose=False, structured=True)
+
+        logger = log_module.logger
+        console_handlers = [
+            h
+            for h in logger.handlers
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler)
+        ]
+        assert len(console_handlers) == 1
+        # Console should remain plain text
+        assert not isinstance(console_handlers[0].formatter, JSONFormatter)
+        assert isinstance(console_handlers[0].formatter, logging.Formatter)
+
+    def test_setup_logging_non_structured_default(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        with patch("traktor.log.LOG_FILE", log_file):
+            with patch("traktor.log.DOCKER_MODE", False):
+                setup_logging(verbose=False, structured=False)
+
+        logger = log_module.logger
+        file_handlers = [h for h in logger.handlers if isinstance(h, RotatingFileHandler)]
+        assert not isinstance(file_handlers[0].formatter, JSONFormatter)
+        assert isinstance(file_handlers[0].formatter, logging.Formatter)
+
+    def test_setup_logging_structured_logs_json(self, tmp_path):
+        log_file = tmp_path / "test.log"
+        with patch("traktor.log.LOG_FILE", log_file):
+            with patch("traktor.log.DOCKER_MODE", False):
+                setup_logging(verbose=False, structured=True)
+                log_module.logger.info("Test JSON log")
+
+        with open(log_file, "r") as f:
+            lines = f.readlines()
+
+        # Find the JSON log line
+        json_lines = [line for line in lines if "Test JSON log" in line]
+        assert len(json_lines) == 1
+        data = json.loads(json_lines[0])
+        assert data["message"] == "Test JSON log"
+        assert data["level"] == "INFO"
+
+    def test_json_formatter_correlation_id_from_getter(self):
+        formatter = JSONFormatter()
+        set_correlation_id("auto-cid")
+        record = logging.LogRecord(
+            name="traktor",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=1,
+            msg="Test",
+            args=(),
+            exc_info=None,
+        )
+        result = formatter.format(record)
+        data = json.loads(result)
+        assert data["correlation_id"] == "auto-cid"
+        set_correlation_id(None)

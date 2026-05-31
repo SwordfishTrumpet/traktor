@@ -72,6 +72,7 @@ def test_write_missing_report_writes_expected_content(tmp_path):
                 "title": "Heat",
                 "year": 1995,
                 "imdb_id": "tt0113277",
+                "reason": "Not found in Plex library",
             }
         ],
         file_path=report_path,
@@ -79,8 +80,8 @@ def test_write_missing_report_writes_expected_content(tmp_path):
 
     content = report_path.read_text(encoding="utf-8")
 
-    assert "List | Type | Title | Year | IMDb ID" in content
-    assert "Favorites | Movie | Heat | 1995 | tt0113277" in content
+    assert "List | Type | Title | Year | IMDb ID | Reason" in content
+    assert "Favorites | Movie | Heat | 1995 | tt0113277 | Not found in Plex library" in content
 
 
 def test_write_missing_report_deletes_empty_existing_report(tmp_path):
@@ -137,8 +138,10 @@ def test_process_item_parallel_returns_first_episode_for_show():
     }
 
 
-def test_process_item_parallel_reports_missing_when_show_has_no_season_one():
-    show = FakeShow([FakeSeason(2, [FakeEpisode("Later")])])
+def test_process_item_parallel_falls_back_to_first_available_episode():
+    """Test that shows without S01E01 fall back to first available episode."""
+    first_episode = FakeEpisode("Later")
+    show = FakeShow([FakeSeason(2, [first_episode])])
     plex = FakePlex({("show", "tt0903747", None): show})
 
     result = sync.process_item_parallel(
@@ -151,13 +154,32 @@ def test_process_item_parallel_reports_missing_when_show_has_no_season_one():
     )
 
     assert result == {
-        "success": False,
-        "title": "Breaking Bad",
+        "success": True,
+        "title": "Breaking Bad - S02E01",
         "year": 2008,
         "idx": 4,
-        "type": "Show",
-        "imdb_id": "tt0903747",
+        "item": first_episode,
     }
+
+
+def test_process_item_parallel_reports_missing_when_show_has_no_episodes():
+    """Test that shows with no episodes in any season are marked missing."""
+    show = FakeShow([FakeSeason(1, []), FakeSeason(2, [])])
+    plex = FakePlex({("show", "tt0903747", None): show})
+
+    result = sync.process_item_parallel(
+        4,
+        {
+            "type": "show",
+            "show": {"title": "Empty Show", "year": 2008, "ids": {"imdb": "tt0903747"}},
+        },
+        plex,
+    )
+
+    assert result["success"] is False
+    assert result["title"] == "Empty Show"
+    assert result["type"] == "Show"
+    assert result["reason"] == "No episodes found in any season"
 
 
 def test_process_item_parallel_preserves_imdb_id_on_tmdb_match():
@@ -232,6 +254,7 @@ def test_missing_item_tracker_build_item():
         title="Test Movie",
         year="2024",
         imdb_id="tt1234567",
+        reason="Not found in Plex library",
     )
 
     assert item["list_name"] == "Test List"
@@ -239,6 +262,7 @@ def test_missing_item_tracker_build_item():
     assert item["title"] == "Test Movie"
     assert item["year"] == "2024"
     assert item["imdb_id"] == "tt1234567"
+    assert item["reason"] == "Not found in Plex library"
 
 
 def test_missing_item_tracker_extract_details_movie():
@@ -302,6 +326,7 @@ def test_missing_item_tracker_record_result():
         "year": "2024",
         "type": "Movie",
         "imdb_id": "tt9999999",
+        "reason": "Not found in Plex library",
     }
 
     tracker.record_result("My List", result, stats)
@@ -311,6 +336,7 @@ def test_missing_item_tracker_record_result():
     assert tracker.not_found[0] == "Missing Movie (2024)"
     assert len(tracker.missing_items) == 1
     assert tracker.missing_items[0]["title"] == "Missing Movie"
+    assert tracker.missing_items[0]["reason"] == "Not found in Plex library"
 
 
 def test_missing_item_tracker_record_exception():
@@ -332,6 +358,7 @@ def test_missing_item_tracker_record_exception():
     assert len(tracker.not_found) == 1
     assert "Error Movie (error)" in tracker.not_found[0]
     assert tracker.missing_items[0]["list_name"] == "Test List"
+    assert "Processing error" in tracker.missing_items[0]["reason"]
 
 
 def test_missing_item_tracker_get_methods():
@@ -368,3 +395,376 @@ def test_backward_compatible_wrappers():
     assert len(not_found) == 1
     assert len(missing_items) == 1
     assert stats["items_not_found"] == 1
+
+
+# ---------------------------------------------------------------------------
+# MissingItemSuggester tests
+# ---------------------------------------------------------------------------
+
+
+class FakeCacheManager:
+    """Minimal fake cache manager for suggestion tests."""
+
+    def __init__(self, memory_cache=None):
+        self.memory_cache = memory_cache or {}
+
+
+def test_missing_item_suggester_fuzzy_match_title():
+    """Test fuzzy title matching finds similar titles."""
+    cache = FakeCacheManager(
+        {
+            "movies_list": [
+                {"title": "The Office", "year": 2005, "ratingKey": 1},
+            ],
+        }
+    )
+    suggester = sync.MissingItemSuggester(cache)
+    suggestions = suggester.get_suggestions(
+        title="The Offcie", year=2005, imdb_id="", tmdb_id=None, media_type="Movie"
+    )
+
+    assert len(suggestions) >= 1
+    assert suggestions[0]["type"] == "fuzzy_title"
+    assert "The Office" in suggestions[0]["message"]
+
+
+def test_missing_item_suggester_id_mismatch_imdb_as_tmdb():
+    """Test detection when an IMDb ID exists as a TMDb ID in cache."""
+    cache = FakeCacheManager(
+        {
+            "movies_by_tmdb": {
+                "tt1234567": {"title": "Test Movie", "year": 2020, "ratingKey": 1},
+            },
+        }
+    )
+    suggester = sync.MissingItemSuggester(cache)
+    suggestions = suggester.get_suggestions(
+        title="Unknown", year=2020, imdb_id="tt1234567", tmdb_id=None, media_type="Movie"
+    )
+
+    assert len(suggestions) == 1
+    assert suggestions[0]["type"] == "id_mismatch"
+    assert "IMDb ID found as TMDb ID" in suggestions[0]["message"]
+
+
+def test_missing_item_suggester_id_mismatch_tmdb_as_imdb():
+    """Test detection when a TMDb ID exists as an IMDb ID in cache."""
+    cache = FakeCacheManager(
+        {
+            "movies_by_imdb": {
+                "98765": {"title": "Another Movie", "year": 2019, "ratingKey": 2},
+            },
+        }
+    )
+    suggester = sync.MissingItemSuggester(cache)
+    suggestions = suggester.get_suggestions(
+        title="Unknown", year=2019, imdb_id="", tmdb_id=98765, media_type="Movie"
+    )
+
+    assert len(suggestions) == 1
+    assert suggestions[0]["type"] == "id_mismatch"
+    assert "TMDb ID found as IMDb ID" in suggestions[0]["message"]
+
+
+def test_missing_item_suggester_naming_mismatch_region_suffix():
+    """Test detection of region suffix mismatch like (US)."""
+    cache = FakeCacheManager(
+        {
+            "shows_list": [
+                {"title": "The Office", "year": 2005, "ratingKey": 3},
+            ],
+        }
+    )
+    suggester = sync.MissingItemSuggester(cache)
+    suggestions = suggester.get_suggestions(
+        title="The Office (US)", year=2005, imdb_id="", tmdb_id=None, media_type="Show"
+    )
+
+    assert len(suggestions) >= 1
+    naming = [s for s in suggestions if s["type"] == "naming_mismatch"]
+    assert len(naming) >= 1
+    assert "region suffix" in naming[0]["message"]
+
+
+def test_missing_item_suggester_naming_mismatch_the_prefix():
+    """Test detection of 'The' prefix mismatch."""
+    cache = FakeCacheManager(
+        {
+            "movies_list": [
+                {"title": "The Godfather", "year": 1972, "ratingKey": 4},
+            ],
+        }
+    )
+    suggester = sync.MissingItemSuggester(cache)
+    suggestions = suggester.get_suggestions(
+        title="Godfather", year=1972, imdb_id="", tmdb_id=None, media_type="Movie"
+    )
+
+    assert len(suggestions) >= 1
+    naming = [s for s in suggestions if s["type"] == "naming_mismatch"]
+    assert len(naming) >= 1
+    assert '"The" prefix' in naming[0]["message"]
+
+
+def test_missing_item_suggester_naming_mismatch_year_in_title():
+    """Test detection of year-in-title mismatch."""
+    cache = FakeCacheManager(
+        {
+            "movies_list": [
+                {"title": "Inception", "year": 2010, "ratingKey": 5},
+            ],
+        }
+    )
+    suggester = sync.MissingItemSuggester(cache)
+    suggestions = suggester.get_suggestions(
+        title="Inception (2010)", year=2010, imdb_id="", tmdb_id=None, media_type="Movie"
+    )
+
+    assert len(suggestions) >= 1
+    naming = [s for s in suggestions if s["type"] == "naming_mismatch"]
+    assert len(naming) >= 1
+    assert "year in title" in naming[0]["message"]
+
+
+def test_missing_item_suggester_max_suggestions():
+    """Test that at most MAX_SUGGESTIONS are returned."""
+    cache = FakeCacheManager(
+        {
+            "movies_list": [
+                {"title": "The Godfather", "year": 1972, "ratingKey": 4},
+                {"title": "Godfather Part II", "year": 1974, "ratingKey": 5},
+                {"title": "Godfather Part III", "year": 1990, "ratingKey": 6},
+                {"title": "Another Godfather", "year": 2020, "ratingKey": 7},
+            ],
+        }
+    )
+    suggester = sync.MissingItemSuggester(cache)
+    suggestions = suggester.get_suggestions(
+        title="Godfather", year=1972, imdb_id="", tmdb_id=None, media_type="Movie"
+    )
+
+    assert len(suggestions) <= sync.MAX_SUGGESTIONS
+
+
+def test_missing_item_suggester_no_cache():
+    """Test that empty cache returns no suggestions."""
+    suggester = sync.MissingItemSuggester(FakeCacheManager({}))
+    suggestions = suggester.get_suggestions(
+        title="Anything", year=2020, imdb_id="", tmdb_id=None, media_type="Movie"
+    )
+    assert suggestions == []
+
+
+def test_missing_item_suggester_none_cache():
+    """Test that None cache manager returns no suggestions."""
+    suggester = sync.MissingItemSuggester(None)
+    suggestions = suggester.get_suggestions(
+        title="Anything", year=2020, imdb_id="", tmdb_id=None, media_type="Movie"
+    )
+    assert suggestions == []
+
+
+def test_write_missing_report_with_suggestions(tmp_path):
+    """Test that report includes suggestions when cache manager is provided."""
+    report_path = tmp_path / "missing.txt"
+    cache = FakeCacheManager(
+        {
+            "movies_list": [
+                {"title": "The Office", "year": 2005, "ratingKey": 1},
+            ],
+        }
+    )
+
+    sync.write_missing_report(
+        [
+            {
+                "list_name": "Favorites",
+                "type": "Movie",
+                "title": "The Offcie",
+                "year": 2005,
+                "imdb_id": "tt0113277",
+                "reason": "Not found in Plex library",
+            }
+        ],
+        file_path=report_path,
+        cache_manager=cache,
+    )
+
+    content = report_path.read_text(encoding="utf-8")
+
+    assert "List | Type | Title | Year | IMDb ID | Reason | Suggestions" in content
+    assert "The Offcie" in content
+    assert "Found similar title" in content
+
+
+# ---------------------------------------------------------------------------
+# Interactive mode tests
+# ---------------------------------------------------------------------------
+
+
+class FakePlaylist:
+    """Minimal fake playlist for snapshot tests."""
+
+    def __init__(self, title, items=None, summary=""):
+        self.title = title
+        self._items = items or []
+        self.summary = summary
+
+    def items(self):
+        return self._items
+
+
+class FakePlexItem:
+    """Minimal fake Plex item for snapshot tests."""
+
+    def __init__(self, rating_key):
+        self.ratingKey = rating_key
+
+
+class FakePlexServer:
+    """Minimal fake Plex server for snapshot tests."""
+
+    def __init__(self, playlists=None):
+        self._playlists = playlists or []
+
+    def playlist(self, name):
+        for p in self._playlists:
+            if p.title == name:
+                return p
+        raise Exception("Not found")
+
+    def playlists(self):
+        return self._playlists
+
+
+class FakePlexClient:
+    """Minimal fake Plex client for snapshot tests."""
+
+    def __init__(self, playlists=None):
+        self.server = FakePlexServer(playlists)
+
+    def _get_plex_item(self, rating_key):
+        return FakePlexItem(rating_key)
+
+    def create_or_update_playlist(self, name, items, description=None):
+        pass
+
+
+def test_save_playlist_snapshot_empty_config():
+    """Test saving playlist snapshot with empty config."""
+    plex = FakePlexClient()
+    config = {}
+    result = sync._save_playlist_snapshot(plex, config)
+    assert result == {}
+
+
+def test_save_playlist_snapshot_with_playlists():
+    """Test saving playlist snapshot with managed playlists."""
+    item1 = FakePlexItem("123")
+    item2 = FakePlexItem("456")
+    playlist = FakePlaylist("Test Playlist", items=[item1, item2], summary="desc")
+    plex = FakePlexClient(playlists=[playlist])
+    config = {"managed_playlists": ["Test Playlist"]}
+
+    result = sync._save_playlist_snapshot(plex, config)
+
+    assert "Test Playlist" in result
+    assert result["Test Playlist"]["items"] == ["123", "456"]
+    assert result["Test Playlist"]["description"] == "desc"
+
+
+def test_save_playlist_snapshot_skips_not_found():
+    """Test saving playlist snapshot skips missing playlists."""
+    plex = FakePlexClient(playlists=[])
+    config = {"managed_playlists": ["Missing Playlist"]}
+
+    result = sync._save_playlist_snapshot(plex, config)
+
+    assert "Missing Playlist" not in result
+
+
+def test_restore_playlist_snapshot():
+    """Test restoring playlists from snapshot."""
+    plex = FakePlexClient()
+    snapshot_data = {
+        "playlists": {
+            "Test Playlist": {
+                "items": ["123", "456"],
+                "description": "Test description",
+            }
+        }
+    }
+
+    restored = sync._restore_playlist_snapshot(plex, snapshot_data)
+
+    assert restored == 1
+
+
+def test_restore_playlist_snapshot_empty():
+    """Test restoring empty playlist snapshot."""
+    plex = FakePlexClient()
+    snapshot_data = {"playlists": {}}
+
+    restored = sync._restore_playlist_snapshot(plex, snapshot_data)
+
+    assert restored == 0
+
+
+def test_restore_playlist_snapshot_missing_item():
+    """Test restoring playlist snapshot with missing items."""
+    plex = FakePlexClient()
+    snapshot_data = {
+        "playlists": {
+            "Test Playlist": {
+                "items": ["missing_key"],
+                "description": "",
+            }
+        }
+    }
+
+    # Should not crash even if item is missing
+    restored = sync._restore_playlist_snapshot(plex, snapshot_data)
+
+    assert restored == 1
+
+
+def test_preview_changes_integration_watch_sync():
+    """Test preview_changes integration with watch sync data."""
+    from unittest.mock import patch
+
+    from traktor.interactive import preview_changes
+
+    changes = {
+        "plex": {
+            "mark_watched": [
+                {"title": "Movie A"},
+                {"title": "Movie B"},
+            ],
+            "mark_unwatched": [],
+        },
+        "trakt": {
+            "mark_watched": [],
+            "mark_unwatched": [{"title": "Movie C"}],
+        },
+    }
+
+    with patch("traktor.interactive.is_interactive", return_value=True):
+        with patch("builtins.input", return_value="y"):
+            result = preview_changes(changes, change_type="watch_sync")
+
+    assert result is True
+
+
+def test_preview_changes_integration_playlist_cleanup():
+    """Test preview_changes integration with playlist cleanup data."""
+    from unittest.mock import patch
+
+    from traktor.interactive import preview_changes
+
+    changes = {"playlists": ["Old Playlist 1", "Old Playlist 2"]}
+
+    with patch("traktor.interactive.is_interactive", return_value=True):
+        with patch("builtins.input", return_value="n"):
+            result = preview_changes(changes, change_type="playlist_cleanup")
+
+    assert result is False

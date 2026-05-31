@@ -1,10 +1,15 @@
 """Tests for conflict_resolver module."""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from traktor import conflict_resolver
+from traktor.conflict_resolver import (
+    COMPLETION_HIGH_BONUS,
+    COMPLETION_LOW_PENALTY,
+    MANUAL_MARK_BONUS,
+)
 
 
 class TestConflictResolver:
@@ -452,3 +457,257 @@ class TestTimestampHelperMethods:
         assert resolver._should_update_timestamp(None, dt) is False
         assert resolver._should_update_timestamp(dt, None) is False
         assert resolver._should_update_timestamp(None, None) is False
+
+
+class TestResolveWithContext:
+    """Tests for resolve_with_context with media type, confidence, and timezone."""
+
+    @pytest.fixture
+    def resolver(self):
+        return conflict_resolver.ConflictResolver("newest_wins")
+
+    def test_resolve_with_context_movie(self, resolver):
+        """Test movie resolution with timestamps."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(hours=1),
+            media_type="movie",
+        )
+        assert action == "push_to_trakt"
+
+    def test_resolve_with_context_episode_completion_weighted(self, resolver):
+        """Test episode resolution weights completion heavily."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        # Plex has newer timestamp but Trakt has higher completion
+        action = resolver.resolve_with_context(
+            plex_watched=False,
+            trakt_watched=True,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(hours=1),
+            media_type="episode",
+            trakt_completion_pct=0.95,
+            plex_completion_pct=0.05,
+        )
+        # Trakt should win due to high completion
+        assert action == "push_to_plex"
+
+    def test_resolve_with_context_show_aggregate(self, resolver):
+        """Test show resolution with aggregate completion."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(hours=1),
+            media_type="show",
+            plex_completion_pct=0.8,
+            trakt_completion_pct=0.2,
+        )
+        assert action == "push_to_trakt"
+
+    def test_resolve_with_context_season_bulk(self, resolver):
+        """Test season resolution with bulk completion > 0.5."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        # Plex has 60% completion but marked unwatched - effective state is watched
+        action = resolver.resolve_with_context(
+            plex_watched=False,
+            trakt_watched=True,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(hours=1),
+            media_type="season",
+            plex_completion_pct=0.6,
+            trakt_completion_pct=0.3,
+        )
+        # Both effective watched=True, Plex is newer -> timestamp update pushes to Plex
+        assert action == "push_to_plex"
+
+    def test_resolve_with_context_confidence_play_count(self, resolver):
+        """Test confidence scoring with play count."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=now,
+            trakt_last_watched=now,
+            media_type="movie",
+            plex_play_count=5,
+            trakt_play_count=0,
+        )
+        # Plex has higher play count, should push to Trakt
+        assert action == "push_to_trakt"
+
+    def test_resolve_with_context_confidence_manual(self, resolver):
+        """Test confidence scoring with manual mark."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=False,
+            trakt_watched=True,
+            plex_last_watched=now,
+            trakt_last_watched=now,
+            media_type="movie",
+            trakt_manual=True,
+            plex_manual=False,
+        )
+        # Trakt has manual mark, should push to Plex
+        assert action == "push_to_plex"
+
+    def test_resolve_with_context_no_action_same_state(self, resolver):
+        """Test no action when states match."""
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=True,
+            media_type="movie",
+        )
+        assert action == "no_action"
+
+    def test_resolve_with_context_unknown_media_type(self, resolver):
+        """Test fallback to basic resolve for unknown media type."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(hours=1),
+            media_type="unknown",
+        )
+        assert action == "push_to_trakt"
+
+
+class TestTimezoneAwareComparison:
+    """Tests for timezone-aware timestamp comparison."""
+
+    @pytest.fixture
+    def resolver(self):
+        return conflict_resolver.ConflictResolver("newest_wins")
+
+    def test_normalize_timestamp_aware_to_utc(self, resolver):
+        """Test that aware timestamps are converted to UTC."""
+        est = timezone(timedelta(hours=-5))
+        dt_est = datetime(2024, 6, 15, 12, 0, 0, tzinfo=est)
+        dt_utc = resolver._normalize_timestamp(dt_est)
+        assert dt_utc.tzinfo == timezone.utc
+        assert dt_utc.hour == 17  # 12:00 EST -> 17:00 UTC
+
+    def test_normalize_timestamp_naive_assumes_utc(self, resolver):
+        """Test that naive timestamps are assumed UTC."""
+        dt_naive = datetime(2024, 6, 15, 12, 0, 0)
+        dt_utc = resolver._normalize_timestamp(dt_naive)
+        assert dt_utc.tzinfo == timezone.utc
+        assert dt_utc.hour == 12
+
+    def test_normalize_timestamp_with_zoneinfo(self, resolver):
+        """Test normalization with zoneinfo timezone name."""
+        dt_naive = datetime(2024, 6, 15, 12, 0, 0)
+        dt_utc = resolver._normalize_timestamp(dt_naive, tz_name="America/New_York")
+        assert dt_utc.tzinfo == timezone.utc
+        # 12:00 EDT -> 16:00 UTC (EDT is UTC-4 in June)
+        assert dt_utc.hour == 16
+
+    def test_normalize_timestamp_none(self, resolver):
+        """Test normalization with None."""
+        assert resolver._normalize_timestamp(None) is None
+
+    def test_normalize_timestamp_invalid_tz_falls_back(self, resolver):
+        """Test fallback to UTC when timezone name is invalid."""
+        dt_naive = datetime(2024, 6, 15, 12, 0, 0)
+        dt_utc = resolver._normalize_timestamp(dt_naive, tz_name="Invalid/Zone")
+        assert dt_utc.tzinfo == timezone.utc
+
+    def test_resolve_with_context_different_timezones(self, resolver):
+        """Test resolution with timestamps from different timezones."""
+        # Plex: 14:00 UTC, Trakt: 13:00 UTC (but reported as 15:00 Europe/Berlin = 13:00 UTC)
+        plex_ts = datetime(2024, 6, 15, 14, 0, 0, tzinfo=timezone.utc)
+        trakt_naive = datetime(2024, 6, 15, 15, 0, 0)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=plex_ts,
+            trakt_last_watched=trakt_naive,
+            media_type="movie",
+            trakt_tz="Europe/Berlin",
+        )
+        # After normalization: trakt is 13:00 UTC, plex is 14:00 UTC -> plex is newer
+        assert action == "push_to_trakt"
+
+
+class TestConfidenceScoring:
+    """Tests for confidence scoring system."""
+
+    @pytest.fixture
+    def resolver(self):
+        return conflict_resolver.ConflictResolver("newest_wins")
+
+    def test_calculate_confidence_score_play_count(self, resolver):
+        """Test play count bonus."""
+        score = resolver._calculate_confidence_score(play_count=3, completion_pct=None, manual=None)
+        assert score == 0.3  # 3 * 0.1, capped at 0.3
+
+    def test_calculate_confidence_score_play_count_max(self, resolver):
+        """Test play count bonus is capped."""
+        score = resolver._calculate_confidence_score(play_count=10, completion_pct=None, manual=None)
+        assert score == 0.3  # capped at MAX_PLAY_COUNT_BONUS
+
+    def test_calculate_confidence_score_completion_high(self, resolver):
+        """Test high completion bonus."""
+        score = resolver._calculate_confidence_score(
+            play_count=0, completion_pct=0.95, manual=None
+        )
+        assert score == COMPLETION_HIGH_BONUS
+
+    def test_calculate_confidence_score_completion_low(self, resolver):
+        """Test low completion penalty."""
+        score = resolver._calculate_confidence_score(
+            play_count=0, completion_pct=0.05, manual=None
+        )
+        assert score == COMPLETION_LOW_PENALTY
+
+    def test_calculate_confidence_score_manual(self, resolver):
+        """Test manual mark bonus."""
+        score = resolver._calculate_confidence_score(
+            play_count=0, completion_pct=None, manual=True
+        )
+        assert score == MANUAL_MARK_BONUS
+
+    def test_calculate_confidence_score_combined(self, resolver):
+        """Test combined confidence scoring."""
+        score = resolver._calculate_confidence_score(
+            play_count=2, completion_pct=0.95, manual=True
+        )
+        expected = 0.2 + COMPLETION_HIGH_BONUS + MANUAL_MARK_BONUS
+        assert score == expected
+
+    def test_calculate_confidence_score_none_values(self, resolver):
+        """Test confidence scoring with None values."""
+        score = resolver._calculate_confidence_score(
+            play_count=None, completion_pct=None, manual=None
+        )
+        assert score == 0.0
+
+    def test_calculate_confidence_score_zero_play_count(self, resolver):
+        """Test zero play count gives no bonus."""
+        score = resolver._calculate_confidence_score(
+            play_count=0, completion_pct=None, manual=None
+        )
+        assert score == 0.0
+
+    def test_backward_compatibility_basic_resolve(self, resolver):
+        """Test that basic resolve() still works without new parameters."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(hours=1),
+        )
+        assert action == "push_to_trakt"
+
+    def test_backward_compatibility_same_state(self, resolver):
+        """Test backward compatibility with same state."""
+        action = resolver.resolve(
+            plex_watched=True,
+            trakt_watched=True,
+        )
+        assert action == "no_action"

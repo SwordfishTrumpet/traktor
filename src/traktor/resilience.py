@@ -350,7 +350,7 @@ class BackupManager:
         backup_path.mkdir(parents=True, exist_ok=True)
 
         # Backup each item
-        manifest = {
+        manifest: Dict[str, Any] = {
             "created": datetime.now(timezone.utc).isoformat(),
             "reason": reason,
             "version": "1.0.0",

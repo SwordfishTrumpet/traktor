@@ -89,3 +89,54 @@ class TestSettings:
                     settings.ensure_dirs()
                     assert test_cache_dir.exists()
                     assert test_cache_dir.is_dir()
+
+    def test_traktor_max_memory_mb_default(self):
+        """Test TRAKTOR_MAX_MEMORY_MB default value."""
+        env_without = {k: v for k, v in os.environ.items() if k != "TRAKTOR_MAX_MEMORY_MB"}
+        with patch.dict(os.environ, env_without, clear=True):
+            import importlib
+
+            importlib.reload(settings)
+            assert settings.TRAKTOR_MAX_MEMORY_MB == 512
+
+    def test_traktor_max_memory_mb_custom(self):
+        """Test TRAKTOR_MAX_MEMORY_MB custom value."""
+        with patch.dict(os.environ, {"TRAKTOR_MAX_MEMORY_MB": "1024"}, clear=False):
+            import importlib
+
+            importlib.reload(settings)
+            assert settings.TRAKTOR_MAX_MEMORY_MB == 1024
+
+    def test_traktor_cpu_throttle_default(self):
+        """Test TRAKTOR_CPU_THROTTLE default value."""
+        env_without = {k: v for k, v in os.environ.items() if k != "TRAKTOR_CPU_THROTTLE"}
+        with patch.dict(os.environ, env_without, clear=True):
+            import importlib
+
+            importlib.reload(settings)
+            assert settings.TRAKTOR_CPU_THROTTLE is False
+
+    def test_traktor_cpu_throttle_enabled(self):
+        """Test TRAKTOR_CPU_THROTTLE enabled."""
+        with patch.dict(os.environ, {"TRAKTOR_CPU_THROTTLE": "true"}, clear=False):
+            import importlib
+
+            importlib.reload(settings)
+            assert settings.TRAKTOR_CPU_THROTTLE is True
+
+    def test_traktor_bandwidth_limit_kbps_default(self):
+        """Test TRAKTOR_BANDWIDTH_LIMIT_KBPS default value."""
+        env_without = {k: v for k, v in os.environ.items() if k != "TRAKTOR_BANDWIDTH_LIMIT_KBPS"}
+        with patch.dict(os.environ, env_without, clear=True):
+            import importlib
+
+            importlib.reload(settings)
+            assert settings.TRAKTOR_BANDWIDTH_LIMIT_KBPS == 0
+
+    def test_traktor_bandwidth_limit_kbps_custom(self):
+        """Test TRAKTOR_BANDWIDTH_LIMIT_KBPS custom value."""
+        with patch.dict(os.environ, {"TRAKTOR_BANDWIDTH_LIMIT_KBPS": "1000"}, clear=False):
+            import importlib
+
+            importlib.reload(settings)
+            assert settings.TRAKTOR_BANDWIDTH_LIMIT_KBPS == 1000

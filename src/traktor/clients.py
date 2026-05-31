@@ -14,7 +14,8 @@ import requests
 from plexapi.exceptions import BadRequest, NotFound
 
 from .config import save_config
-from .log import logger
+from .log import get_correlation_id, logger
+from .performance import performance_monitor
 from .resilience import CircuitBreakerOpen, retry_with_backoff, trakt_circuit_breaker
 from .settings import (
     CACHE_DIR,
@@ -145,14 +146,10 @@ class CacheManager:
                 logger.debug("Cache version mismatch")
                 return False
 
-            cached_time = datetime.fromisoformat(
-                meta.get("created", "2000-01-01")
-            )
+            cached_time = datetime.fromisoformat(meta.get("created", "2000-01-01"))
             if cached_time.tzinfo is None:
                 cached_time = cached_time.replace(tzinfo=timezone.utc)
-            if datetime.now(timezone.utc) - cached_time > timedelta(
-                hours=CACHE_MAX_AGE_HOURS
-            ):
+            if datetime.now(timezone.utc) - cached_time > timedelta(hours=CACHE_MAX_AGE_HOURS):
                 logger.debug("Cache expired")
                 return False
 
@@ -696,6 +693,17 @@ class TraktAuth:
                 self.save_tokens()
                 return True
 
+            # 400 Bad Request means the refresh token is invalid/expired
+            if response.status_code == 400:
+                logger.error("Token refresh failed with 400 - refresh token is invalid or expired")
+                logger.error(
+                    "Trakt authentication expired. Run with --force-auth to re-authenticate."
+                )
+                # Clear stored tokens to force re-authentication on next run
+                self.access_token = None
+                self.refresh_token = None
+                return False
+
             logger.error(f"Token refresh failed with status {response.status_code}")
             logger.debug(f"Response status: {response.status_code}")
             return False
@@ -710,11 +718,11 @@ class TraktAuth:
             session.close()
 
     def get_headers(self) -> Dict[str, str]:
-        headers = {
+        headers: Dict[str, str] = {
             "Content-Type": "application/json",
             "trakt-api-version": "2",
-            "trakt-api-key": TRAKT_CLIENT_ID,
-            "Authorization": f"Bearer {self.access_token}",
+            "trakt-api-key": TRAKT_CLIENT_ID if TRAKT_CLIENT_ID is not None else "",
+            "Authorization": f"Bearer {self.access_token}" if self.access_token is not None else "",
         }
         logger.debug("Request headers prepared")
         return headers
@@ -843,10 +851,28 @@ class TraktClient:
         logger.debug(f"Making request to: {url}")
         logger.debug(f"Params: {params}")
 
+        cid = get_correlation_id()
+        if cid:
+            logger.debug(f"Request correlation_id: {cid}")
+
+        start_time = time.time()
         try:
             response = self._execute_request("GET", url, headers=headers, params=params)
 
-            logger.debug(f"Response status: {response.status_code}")
+            elapsed = time.time() - start_time
+            performance_monitor.record_api_call(endpoint, elapsed)
+            logger.debug(f"Trakt API: {endpoint} -> {response.status_code} in {elapsed:.3f}s")
+            logger.debug(
+                f"Request completed: {endpoint}",
+                extra={
+                    "extra": {
+                        "endpoint": endpoint,
+                        "status_code": response.status_code,
+                        "duration_ms": round(elapsed * 1000, 1),
+                        "correlation_id": cid,
+                    }
+                },
+            )
 
             if response.status_code == HTTP_UNAUTHORIZED:
                 logger.warning("Received 401 - Token expired, attempting refresh...")
@@ -856,9 +882,10 @@ class TraktClient:
                     response = self._request_with_retry("GET", url, headers=headers, params=params)
                     logger.debug(f"Retry response status: {response.status_code}")
                 else:
-                    logger.error("Failed to refresh token")
-                    print(
-                        "Trakt token refresh failed. Try running with --force-auth to re-authenticate."
+                    logger.error("Failed to refresh token - authentication is invalid")
+                    print("Trakt token refresh failed. Run with --force-auth to re-authenticate.")
+                    raise requests.exceptions.RequestException(
+                        "Trakt authentication expired. Run with --force-auth to re-authenticate."
                     )
 
             response.raise_for_status()
@@ -867,6 +894,8 @@ class TraktClient:
             return response
 
         except requests.exceptions.RequestException as e:
+            elapsed = time.time() - start_time
+            performance_monitor.record_api_call(endpoint, elapsed)
             logger.error(f"API request failed: {e}", exc_info=True)
             logger.debug(f"Request URL: {url}")
             logger.debug(f"Request params: {params}")
@@ -1155,6 +1184,8 @@ class TraktClient:
             requests.exceptions.RequestException: If the request fails
         """
         headers = self.auth.get_headers()
+        endpoint = url.replace(f"{TRAKT_API_URL}/", "")
+        start_time = time.time()
 
         try:
             response = self._request_with_retry("POST", url, headers=headers, json_data=payload)
@@ -1171,7 +1202,10 @@ class TraktClient:
             else:
                 raise
 
+        elapsed = time.time() - start_time
+        performance_monitor.record_api_call(endpoint, elapsed)
         logger.debug(f"{action_description} response status: {response.status_code}")
+        logger.debug(f"POST to {endpoint} completed in {elapsed:.3f}s")
         response.raise_for_status()
         return response
 
@@ -1446,7 +1480,8 @@ class PlexClient:
         tmdb_id: Optional[Union[str, int]] = None,
         media_type: str = "movie",
     ) -> Optional[Any]:
-        logger.debug(f"Cache lookup: {media_type} IMDB={imdb_id} TMDB={tmdb_id}")
+        # Only log at debug level on cache miss to reduce log volume
+        # Cache hits are common and logging every one creates excessive noise
 
         finders = {
             "movie": (self.cache.find_movie_by_imdb, self.cache.find_movie_by_tmdb),
@@ -1462,14 +1497,17 @@ class PlexClient:
                 continue
 
             result = finder(external_id)
-            logger.debug(f"  {source_name} lookup result: {result is not None}")
             if result:
-                if source_name == "IMDB":
-                    logger.info(f"  Found in cache: {result.get('title')} ({external_id})")
-                else:
-                    logger.info(f"  Found in cache by {source_name}: {result.get('title')}")
+                logger.debug(
+                    f"Cache hit: {media_type} by {source_name}={external_id}"
+                    f" -> {result.get('title')}"
+                )
+                performance_monitor.record_cache_hit()
                 return self._get_plex_item(result["ratingKey"])
 
+        # Only log cache misses at debug level
+        logger.debug(f"Cache miss: {media_type} IMDB={imdb_id} TMDB={tmdb_id}")
+        performance_monitor.record_cache_miss()
         return None
 
     def _get_plex_item(self, rating_key):
@@ -1509,7 +1547,9 @@ class PlexClient:
 
         try:
             playlist.edit(summary=description)
-            logger.info(f"{action.capitalize()} playlist description: {description[:50]}...")
+            # Log a single-line preview of the description (replace newlines with spaces)
+            preview = description.replace("\n", " ").replace("\r", "")[:50]
+            logger.info(f"{action.capitalize()} playlist description: {preview}...")
         except Exception as e:
             logger.warning(f"Could not {action} playlist description: {e}")
 
@@ -1537,6 +1577,7 @@ class PlexClient:
         """
         logger.info(f"Creating/updating playlist: {name}")
         logger.debug(f"Items to add: {len(items)}")
+        start_time = time.time()
 
         # Sort items to ensure movies come before episodes
         # This helps Plex correctly categorize the playlist type
@@ -1566,22 +1607,42 @@ class PlexClient:
                     playlist = self._create_playlist(name, items)
                     self._update_playlist_description(playlist, description, action="set")
                 else:
-                    if current_items:
-                        logger.debug(f"Removing {current_count} old items...")
-                        playlist.removeItems(current_items)
-                        logger.info(f"Removed {current_count} old items")
+                    # Compute delta: only remove items that are no longer in the list
+                    # and add items that are new. This preserves playlist metadata and
+                    # is much faster than remove-all-add-all for small changes.
+                    current_keys = {getattr(item, "ratingKey", None) for item in current_items}
+                    new_keys = {getattr(item, "ratingKey", None) for item in items}
+                    keys_to_remove = current_keys - new_keys
+                    keys_to_add = new_keys - current_keys
 
-                    if items:
+                    if keys_to_remove and None not in keys_to_remove:
+                        items_to_remove = [
+                            item
+                            for item in current_items
+                            if getattr(item, "ratingKey", None) in keys_to_remove
+                        ]
+                        logger.debug(f"Removing {len(items_to_remove)} old items...")
+                        playlist.removeItems(items_to_remove)
+                        logger.info(f"Removed {len(items_to_remove)} old items")
+
+                    if keys_to_add and None not in keys_to_add:
+                        items_to_add = [
+                            item
+                            for item in items
+                            if getattr(item, "ratingKey", None) in keys_to_add
+                        ]
                         # Add items in batches for better performance with large playlists
-                        if len(items) > batch_size:
-                            logger.debug(f"Adding {len(items)} items in batches of {batch_size}...")
-                            for i in range(0, len(items), batch_size):
-                                batch = items[i : i + batch_size]
+                        if len(items_to_add) > batch_size:
+                            logger.debug(
+                                f"Adding {len(items_to_add)} items in batches of {batch_size}..."
+                            )
+                            for i in range(0, len(items_to_add), batch_size):
+                                batch = items_to_add[i : i + batch_size]
                                 playlist.addItems(batch)
                                 logger.debug(f"  Added batch {i // batch_size + 1}")
                         else:
-                            playlist.addItems(items)
-                        logger.info(f"Added {len(items)} items to playlist")
+                            playlist.addItems(items_to_add)
+                        logger.info(f"Added {len(items_to_add)} new items to playlist")
 
                     self._update_playlist_description(playlist, description, action="update")
 
@@ -1595,11 +1656,19 @@ class PlexClient:
         except Exception as e:
             logger.error(f"Failed to create/update playlist '{name}': {e}", exc_info=True)
             raise
+        finally:
+            elapsed = time.time() - start_time
+            performance_monitor.record_api_call("plex:create_or_update_playlist", elapsed)
+            logger.debug(f"Playlist operation completed in {elapsed:.3f}s")
 
     def cleanup_orphaned_playlists(
-        self, active_playlist_names: List[str], config: Dict[str, Any]
+        self,
+        active_playlist_names: List[str],
+        config: Dict[str, Any],
+        dry_run: bool = False,
     ) -> List[str]:
         deleted = []
+        to_delete = []
 
         managed_playlists = config.get("managed_playlists", [])
         blacklisted_lists = config.get("blacklisted_lists", [])
@@ -1609,9 +1678,13 @@ class PlexClient:
                 if playlist_name in managed_playlists:
                     try:
                         playlist = self.server.playlist(playlist_name)
-                        playlist.delete()
-                        logger.info(f"Deleted blacklisted playlist: {playlist_name}")
-                        deleted.append(playlist_name)
+                        if dry_run:
+                            to_delete.append(playlist_name)
+                            logger.info(f"[DRY RUN] Would delete blacklisted: {playlist_name}")
+                        else:
+                            playlist.delete()
+                            logger.info(f"Deleted blacklisted playlist: {playlist_name}")
+                            deleted.append(playlist_name)
                     except NotFound:
                         logger.debug(f"Blacklisted playlist not found in Plex: {playlist_name}")
                     except Exception as e:
@@ -1628,14 +1701,20 @@ class PlexClient:
                     playlist.title in managed_playlists
                     and playlist.title not in active_playlist_names
                 ):
-                    try:
-                        playlist.delete()
-                        logger.info(f"Deleted orphaned playlist: {playlist.title}")
-                        deleted.append(playlist.title)
-                    except Exception as e:
-                        logger.error(f"Failed to delete playlist '{playlist.title}': {e}")
+                    if dry_run:
+                        to_delete.append(playlist.title)
+                        logger.info(f"[DRY RUN] Would delete orphaned: {playlist.title}")
+                    else:
+                        try:
+                            playlist.delete()
+                            logger.info(f"Deleted orphaned playlist: {playlist.title}")
+                            deleted.append(playlist.title)
+                        except Exception as e:
+                            logger.error(f"Failed to delete playlist '{playlist.title}': {e}")
 
-            if deleted:
+            if dry_run and to_delete:
+                logger.info(f"[DRY RUN] Would clean up {len(to_delete)} playlist(s)")
+            elif deleted:
                 logger.info(f"Cleaned up {len(deleted)} orphaned playlist(s)")
             else:
                 logger.info("No orphaned playlists found")
@@ -1643,13 +1722,14 @@ class PlexClient:
         except Exception as e:
             logger.error(f"Error during playlist cleanup: {e}", exc_info=True)
 
-        config["managed_playlists"] = list(active_playlist_names)
-        logger.info(
-            f"About to save config with {len(config['managed_playlists'])} managed playlists"
-        )
-        save_config(config)
+        if not dry_run:
+            config["managed_playlists"] = list(active_playlist_names)
+            logger.info(
+                f"About to save config with {len(config['managed_playlists'])} managed playlists"
+            )
+            save_config(config)
 
-        return deleted
+        return to_delete if dry_run else deleted
 
     def get_watched_items(self, section_type: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get all watched items from Plex.
@@ -1779,7 +1859,7 @@ class PlexClient:
         """
         logger.info(f"Batch marking {len(rating_keys)} items as watched in Plex...")
 
-        results = {"success": 0, "failed": 0, "errors": []}
+        results: Dict[str, Any] = {"success": 0, "failed": 0, "errors": []}
 
         for rating_key in rating_keys:
             try:
@@ -1815,7 +1895,7 @@ class PlexClient:
         """
         logger.info(f"Batch marking {len(rating_keys)} items as unwatched in Plex...")
 
-        results = {"success": 0, "failed": 0, "errors": []}
+        results: Dict[str, Any] = {"success": 0, "failed": 0, "errors": []}
 
         for rating_key in rating_keys:
             try:

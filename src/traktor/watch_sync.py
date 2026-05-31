@@ -83,7 +83,7 @@ class WatchSyncEngine:
         self.history = history_manager
         self.resolver = conflict_resolver
         self.dry_run = False
-        self.stats = {
+        self.stats: Dict[str, Any] = {
             "plex_watched": 0,
             "plex_unwatched": 0,
             "trakt_watched": 0,
@@ -127,6 +127,7 @@ class WatchSyncEngine:
             "plex_progress_updated": 0,
             "trakt_progress_updated": 0,
             "progress_conflicts": 0,
+            "changes": [],
         }
 
         # Validate filter options
@@ -197,6 +198,7 @@ class WatchSyncEngine:
                 unit="items",
             )
             changes = self._calculate_changes(plex_state, trakt_state, direction)
+            self.stats["changes"] = changes
             progress.complete_stage()
 
             # Stage 4: Apply changes
@@ -488,7 +490,7 @@ class WatchSyncEngine:
 
                 for movie in watched_movies:
                     ids = movie.get("movie", {}).get("ids", {})
-                    key = (
+                    key: tuple = (
                         "movie",
                         ids.get("imdb"),
                         normalize_tmdb_id(ids.get("tmdb")),

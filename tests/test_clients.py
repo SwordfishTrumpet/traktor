@@ -911,3 +911,205 @@ class TestCacheManagerIncrementalUpdate:
 
         # Should return False (indicating fallback needed)
         assert result is False
+
+
+class TestRateLimiter:
+    """Tests for RateLimiter class."""
+
+    def test_rate_limiter_enforces_min_interval(self):
+        """Test that rate limiter enforces minimum interval between requests."""
+        import time
+
+        limiter = clients.RateLimiter(min_interval=0.1)
+
+        start = time.time()
+        limiter.wait()
+        limiter.wait()
+        elapsed = time.time() - start
+
+        # Should have waited at least 0.1 seconds between the two calls
+        assert elapsed >= 0.1
+
+    def test_rate_limiter_allows_first_request_immediately(self):
+        """Test that first request is not delayed."""
+        import time
+
+        limiter = clients.RateLimiter(min_interval=10.0)
+
+        start = time.time()
+        limiter.wait()
+        elapsed = time.time() - start
+
+        # First request should be immediate (no delay)
+        assert elapsed < 0.1
+
+    def test_rate_limiter_thread_safety(self):
+        """Test that rate limiter is thread-safe."""
+        import threading
+        import time
+
+        limiter = clients.RateLimiter(min_interval=0.05)
+        call_times = []
+        lock = threading.Lock()
+
+        def worker():
+            limiter.wait()
+            with lock:
+                call_times.append(time.time())
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        start = time.time()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        total_time = time.time() - start
+        # 4 threads with 0.05s interval should take at least 0.15s
+        # (first is immediate, then 3 more at 0.05s each)
+        assert total_time >= 0.15
+
+        # Verify intervals between calls
+        with lock:
+            sorted_times = sorted(call_times)
+            for i in range(1, len(sorted_times)):
+                gap = sorted_times[i] - sorted_times[i - 1]
+                # Allow some tolerance for threading overhead
+                assert gap >= 0.03
+
+
+class TestTraktClientRetryLogic:
+    """Tests for TraktClient retry and rate limiting logic."""
+
+    @pytest.fixture
+    def trakt_client(self, monkeypatch):
+        """Create a TraktClient with mocked auth."""
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_ID", "test-client-id")
+        monkeypatch.setattr(clients, "TRAKT_API_URL", "https://api.trakt.tv")
+        auth = MagicMock()
+        auth.get_headers.return_value = {"Authorization": "Bearer test-token"}
+        return clients.TraktClient(auth)
+
+    def test_request_with_retry_handles_rate_limit_429(self, trakt_client):
+        """Test that 429 responses trigger retry with backoff."""
+        mock_response_429 = MagicMock()
+        mock_response_429.status_code = 429
+        mock_response_429.headers = {"Retry-After": "1"}
+        mock_response_429.raise_for_status = MagicMock()
+
+        mock_response_200 = MagicMock()
+        mock_response_200.status_code = 200
+        mock_response_200.raise_for_status = MagicMock()
+
+        with patch.object(
+            trakt_client._session,
+            "get",
+            side_effect=[mock_response_429, mock_response_200],
+        ):
+            response = trakt_client._request_with_retry(
+                "GET", "https://api.trakt.tv/test", headers={}
+            )
+
+            assert response.status_code == 200
+            assert trakt_client._session.get.call_count == 2
+
+    def test_request_with_retry_handles_server_error_500(self, trakt_client):
+        """Test that 5xx responses trigger exponential backoff retry."""
+        mock_response_500 = MagicMock()
+        mock_response_500.status_code = 500
+        mock_response_500.raise_for_status = MagicMock()
+
+        mock_response_200 = MagicMock()
+        mock_response_200.status_code = 200
+        mock_response_200.raise_for_status = MagicMock()
+
+        with patch.object(
+            trakt_client._session,
+            "get",
+            side_effect=[mock_response_500, mock_response_200],
+        ):
+            response = trakt_client._request_with_retry(
+                "GET", "https://api.trakt.tv/test", headers={}
+            )
+
+            assert response.status_code == 200
+            assert trakt_client._session.get.call_count == 2
+
+    def test_request_with_retry_handles_timeout(self, trakt_client):
+        """Test that timeout exceptions trigger retry."""
+        from requests.exceptions import Timeout
+
+        mock_response_200 = MagicMock()
+        mock_response_200.status_code = 200
+        mock_response_200.raise_for_status = MagicMock()
+
+        with patch.object(
+            trakt_client._session,
+            "get",
+            side_effect=[Timeout("Request timed out"), mock_response_200],
+        ):
+            response = trakt_client._request_with_retry(
+                "GET", "https://api.trakt.tv/test", headers={}
+            )
+
+            assert response.status_code == 200
+            assert trakt_client._session.get.call_count == 2
+
+    def test_request_with_retry_exhausts_retries(self, trakt_client):
+        """Test that max retries are exhausted before raising."""
+        from requests.exceptions import ConnectionError
+
+        with patch.object(
+            trakt_client._session,
+            "get",
+            side_effect=ConnectionError("Persistent error"),
+        ):
+            with pytest.raises(ConnectionError):
+                trakt_client._request_with_retry(
+                    "GET", "https://api.trakt.tv/test", headers={}
+                )
+
+            # Should have attempted MAX_RETRIES times
+            assert trakt_client._session.get.call_count == clients.MAX_RETRIES
+
+    def test_rate_limiter_applied_to_requests(self, trakt_client):
+        """Test that rate limiter is applied before each request."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = MagicMock()
+
+        with patch.object(
+            trakt_client._session, "get", return_value=mock_response
+        ):
+            with patch.object(trakt_client._rate_limiter, "wait") as mock_wait:
+                trakt_client._request_with_retry(
+                    "GET", "https://api.trakt.tv/test", headers={}
+                )
+
+                mock_wait.assert_called_once()
+
+
+class TestTraktAuthRefresh:
+    """Tests for TraktAuth token refresh behavior."""
+
+    def test_refresh_access_token_clears_tokens_on_400(self, monkeypatch):
+        """Test that refresh failure with 400 clears stored tokens."""
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_ID", "test-client-id")
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_SECRET", "test-client-secret")
+        monkeypatch.setattr(clients, "TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")
+        monkeypatch.setattr(clients, "TRAKT_API_URL", "https://api.trakt.tv")
+
+        auth = clients.TraktAuth()
+        auth.access_token = "old-access"
+        auth.refresh_token = "old-refresh"
+
+        # Mock a 400 response
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+
+        with patch("requests.Session.post", return_value=mock_response):
+            result = auth.refresh_access_token()
+
+        assert result is False
+        assert auth.access_token is None
+        assert auth.refresh_token is None

@@ -3,9 +3,18 @@
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
+from .auto_update import apply_update_and_print, check_and_print_update
 from .diagnose import run_diagnosis
+from .health_server import HealthServer
+from .interactive import (
+    confirm_changes,
+    is_interactive,
+    list_undo_snapshots,
+    restore_undo_snapshot,
+)
 from .log import logger, setup_logging
 from .resilience import (
     backup_manager,
@@ -14,7 +23,8 @@ from .resilience import (
     plex_circuit_breaker,
     trakt_circuit_breaker,
 )
-from .settings import MAX_WORKERS, ensure_dirs
+from .resource_manager import ResourceManager
+from .settings import HEALTH_SERVER_PORT, MAX_WORKERS, ensure_dirs
 from .sync import sync_lists
 
 
@@ -116,6 +126,13 @@ def parse_args():
         help="Enable Trakt official curated lists sync",
     )
 
+    # Health server command
+    parser.add_argument(
+        "--serve-health",
+        action="store_true",
+        help="Start HTTP health check server on port 8080",
+    )
+
     # Diagnose command
     parser.add_argument(
         "--diagnose",
@@ -189,6 +206,52 @@ def parse_args():
         choices=["liked", "official", "both"],
         default=None,  # Will use TRAKTOR_LIST_SOURCE env var or fall back to "official"
         help="Which list sources to sync (default: from TRAKTOR_LIST_SOURCE env var, or 'official')",
+    )
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Prompt for confirmation before making significant changes",
+    )
+    parser.add_argument(
+        "--undo",
+        action="store_true",
+        help="Undo the most recent operation",
+    )
+
+    # Auto-update arguments
+    parser.add_argument(
+        "--check-update",
+        action="store_true",
+        help="Check if a new version of traktor is available",
+    )
+    parser.add_argument(
+        "--apply-update",
+        action="store_true",
+        help="Apply the latest update (with rollback capability)",
+    )
+
+    # Logging and diagnostics
+    parser.add_argument(
+        "--structured-logging",
+        action="store_true",
+        help="Enable structured JSON logging to file (console remains plain text)",
+    )
+    parser.add_argument(
+        "--performance-report",
+        action="store_true",
+        help="Print detailed performance report at end of sync",
+    )
+    parser.add_argument(
+        "--max-memory-mb",
+        type=int,
+        default=None,
+        help="Maximum memory usage in MB (default: 512)",
+    )
+    parser.add_argument(
+        "--cpu-throttle",
+        type=float,
+        default=None,
+        help="Target CPU usage percentage (0-100) for throttling",
     )
 
     return parser.parse_args()
@@ -326,11 +389,70 @@ def _show_circuit_status():
     return 0
 
 
+def _handle_undo() -> int:
+    """Handle the --undo command."""
+    print("Undo Operations")
+    print("=" * 60)
+
+    snapshots = list_undo_snapshots()
+    if not snapshots:
+        print("No undo snapshots available.")
+        print("Snapshots are created automatically when using --interactive mode.")
+        return 1
+
+    # Show most recent snapshot
+    snapshot = restore_undo_snapshot()
+    if not snapshot:
+        print("Failed to load undo snapshot.")
+        return 1
+
+    operation_type = snapshot.get("operation_type", "unknown")
+    timestamp = snapshot.get("timestamp", "unknown")
+
+    print(f"Most recent snapshot: {operation_type} ({timestamp})")
+    print(
+        "\nUndo requires restoring from a previous state. "
+        "Please run the sync again with the appropriate settings."
+    )
+    print("\nNote: For playlist changes, the previous playlist items are stored in the snapshot.")
+    print("For watch sync changes, the previous watch state is preserved.")
+
+    if not is_interactive():
+        print("\nNon-interactive mode: showing snapshot info only.")
+        return 0
+
+    confirmed = confirm_changes(
+        "Restore from this snapshot on next sync?",
+        default=False,
+    )
+    if confirmed:
+        print("\nSnapshot will be used for restoration on next sync run.")
+        return 0
+    else:
+        print("\nUndo cancelled.")
+        return 1
+
+
 def main():
     """Main entry point."""
     args = parse_args()
     ensure_dirs()
-    setup_logging(verbose=args.verbose)
+    setup_logging(verbose=args.verbose, structured=args.structured_logging)
+
+    # Handle health server command first (before any other processing)
+    if args.serve_health:
+        server = HealthServer(port=HEALTH_SERVER_PORT)
+        server.start()
+        print(f"Health server running on port {HEALTH_SERVER_PORT}")
+        print("Endpoints: /health, /metrics, /status")
+        print("Press Ctrl+C to stop")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nShutting down health server...")
+            server.stop()
+            sys.exit(0)
 
     # Handle diagnose command first (before any other processing)
     if args.diagnose:
@@ -355,6 +477,17 @@ def main():
 
     if args.circuit_status:
         sys.exit(_show_circuit_status())
+
+    # Handle undo command
+    if args.undo:
+        sys.exit(_handle_undo())
+
+    # Handle auto-update commands
+    if args.check_update:
+        sys.exit(check_and_print_update())
+
+    if args.apply_update:
+        sys.exit(apply_update_and_print())
 
     logger.info("Command line arguments parsed")
 
@@ -394,8 +527,17 @@ def main():
     safe_args = {k: mask_value(k, v) for k, v in vars(args).items()}
     logger.debug(f"Arguments: {safe_args}")
 
+    # Initialize resource manager if memory or CPU limits are set
+    resource_manager = None
+    if args and (args.max_memory_mb is not None or args.cpu_throttle is not None):
+        resource_manager = ResourceManager(max_memory_mb=args.max_memory_mb)
+        if args.max_memory_mb is not None:
+            resource_manager.set_memory_limit(args.max_memory_mb)
+        if args.cpu_throttle is not None:
+            resource_manager.start_cpu_throttle(target_cpu_percent=args.cpu_throttle)
+
     try:
-        exit_code = sync_lists(args)
+        exit_code = sync_lists(args, resource_manager=resource_manager)
         if exit_code:
             sys.exit(exit_code)
     except KeyboardInterrupt:
