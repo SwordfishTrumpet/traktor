@@ -5,6 +5,7 @@ Supports memory limits, CPU throttling, and network bandwidth control.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 import threading
@@ -12,17 +13,12 @@ import time
 
 from .log import logger
 
-# Optional dependency for memory tracking
-try:
-    import psutil
-except ImportError:
-    psutil = None  # type: ignore[assignment]
+# Optional dependency for memory tracking; find_spec guard avoids try/except
+# import redefinition issues flagged by mypy.
+psutil = __import__("psutil") if importlib.util.find_spec("psutil") else None
 
 # Unix-only module for resource limits
-try:
-    import resource
-except ImportError:
-    resource = None  # type: ignore[assignment]
+resource = __import__("resource") if importlib.util.find_spec("resource") else None
 
 # Constants
 BYTES_PER_KB = 1024

@@ -912,6 +912,73 @@ class TestCacheManagerIncrementalUpdate:
         # Should return False (indicating fallback needed)
         assert result is False
 
+    @staticmethod
+    def _write_recent_meta(cache_manager):
+        """Write a cache meta file with a 1-hour-old timestamp."""
+        from datetime import datetime, timedelta
+
+        cache_manager.cache_meta_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_manager.cache_meta_file, "w") as f:
+            json.dump(
+                {
+                    "version": clients.CACHE_VERSION,
+                    "created": (datetime.now() - timedelta(hours=1)).isoformat(),
+                    "last_update": (datetime.now() - timedelta(hours=1)).isoformat(),
+                },
+                f,
+            )
+
+    def test_incremental_update_handles_datetime_added_at(self, cache_manager, mock_plex_server):
+        """Regression: plexapi >= 4.17 returns addedAt as datetime, not epoch int.
+
+        Production log proof (2026-07-22):
+            Could not get recentlyAdded for section 'Films':
+            'datetime.datetime' object cannot be interpreted as an integer
+        """
+        from datetime import datetime
+
+        movie_section = mock_plex_server.library.sections.return_value[0]
+        movie = movie_section.recentlyAdded.return_value[0]
+        # plexapi's utils.toDatetime returns a naive local datetime
+        movie.addedAt = datetime.now()
+
+        self._write_recent_meta(cache_manager)
+        result = cache_manager._incremental_cache_update()
+
+        assert result is True
+        assert len(cache_manager.memory_cache["movies_list"]) == 1
+        assert "tt1234567" in cache_manager.memory_cache["movies_by_imdb"]
+
+    def test_incremental_update_handles_aware_datetime_added_at(
+        self, cache_manager, mock_plex_server
+    ):
+        """Timezone-aware datetime addedAt must also be accepted."""
+        from datetime import datetime, timezone
+
+        movie_section = mock_plex_server.library.sections.return_value[0]
+        movie = movie_section.recentlyAdded.return_value[0]
+        movie.addedAt = datetime.now(timezone.utc)
+
+        self._write_recent_meta(cache_manager)
+        result = cache_manager._incremental_cache_update()
+
+        assert result is True
+        assert len(cache_manager.memory_cache["movies_list"]) == 1
+
+    def test_incremental_update_skips_old_datetime_added_at(self, cache_manager, mock_plex_server):
+        """Items with datetime addedAt older than the cutoff must be skipped."""
+        from datetime import datetime, timedelta
+
+        movie_section = mock_plex_server.library.sections.return_value[0]
+        movie = movie_section.recentlyAdded.return_value[0]
+        movie.addedAt = datetime.now() - timedelta(hours=5)
+
+        self._write_recent_meta(cache_manager)
+        result = cache_manager._incremental_cache_update()
+
+        assert result is True
+        assert len(cache_manager.memory_cache["movies_list"]) == 0
+
 
 class TestRateLimiter:
     """Tests for RateLimiter class."""
@@ -1065,9 +1132,7 @@ class TestTraktClientRetryLogic:
             side_effect=ConnectionError("Persistent error"),
         ):
             with pytest.raises(ConnectionError):
-                trakt_client._request_with_retry(
-                    "GET", "https://api.trakt.tv/test", headers={}
-                )
+                trakt_client._request_with_retry("GET", "https://api.trakt.tv/test", headers={})
 
             # Should have attempted MAX_RETRIES times
             assert trakt_client._session.get.call_count == clients.MAX_RETRIES
@@ -1078,13 +1143,9 @@ class TestTraktClientRetryLogic:
         mock_response.status_code = 200
         mock_response.raise_for_status = MagicMock()
 
-        with patch.object(
-            trakt_client._session, "get", return_value=mock_response
-        ):
+        with patch.object(trakt_client._session, "get", return_value=mock_response):
             with patch.object(trakt_client._rate_limiter, "wait") as mock_wait:
-                trakt_client._request_with_retry(
-                    "GET", "https://api.trakt.tv/test", headers={}
-                )
+                trakt_client._request_with_retry("GET", "https://api.trakt.tv/test", headers={})
 
                 mock_wait.assert_called_once()
 

@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
+import importlib.util
 import resource
 import sys
 import time
 from typing import Any
 
-# Optional dependency for memory tracking
-try:
-    import psutil
-except ImportError:
-    psutil = None  # type: ignore[assignment]
+# Optional dependency for memory tracking; find_spec guard avoids try/except
+# import redefinition issues flagged by mypy.
+psutil = __import__("psutil") if importlib.util.find_spec("psutil") else None
 
 BOTTLENECK_THRESHOLD_MS = 1000  # API calls slower than 1s are flagged
 MEMORY_SAMPLE_INTERVAL = 60  # Seconds between memory samples (for automated sampling)
@@ -87,10 +86,12 @@ class PerformanceMonitor:
                 # Final fallback: approximate using sys.getsizeof on globals
                 rss_mb = 0.0
 
-        self.memory_samples.append({
-            "timestamp": time.time(),
-            "rss_mb": round(rss_mb, 2),
-        })
+        self.memory_samples.append(
+            {
+                "timestamp": time.time(),
+                "rss_mb": round(rss_mb, 2),
+            }
+        )
 
     def get_summary(self) -> dict[str, Any]:
         """Return summary dict with all metrics.
@@ -100,9 +101,7 @@ class PerformanceMonitor:
             and uptime_seconds.
         """
         total_cache = self.cache_stats["hits"] + self.cache_stats["misses"]
-        hit_rate = (
-            self.cache_stats["hits"] / total_cache if total_cache > 0 else 0.0
-        )
+        hit_rate = self.cache_stats["hits"] / total_cache if total_cache > 0 else 0.0
 
         return {
             "api_calls": dict(self.api_calls),

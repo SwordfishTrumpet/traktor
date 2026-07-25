@@ -647,35 +647,29 @@ class TestConfidenceScoring:
 
     def test_calculate_confidence_score_play_count_max(self, resolver):
         """Test play count bonus is capped."""
-        score = resolver._calculate_confidence_score(play_count=10, completion_pct=None, manual=None)
+        score = resolver._calculate_confidence_score(
+            play_count=10, completion_pct=None, manual=None
+        )
         assert score == 0.3  # capped at MAX_PLAY_COUNT_BONUS
 
     def test_calculate_confidence_score_completion_high(self, resolver):
         """Test high completion bonus."""
-        score = resolver._calculate_confidence_score(
-            play_count=0, completion_pct=0.95, manual=None
-        )
+        score = resolver._calculate_confidence_score(play_count=0, completion_pct=0.95, manual=None)
         assert score == COMPLETION_HIGH_BONUS
 
     def test_calculate_confidence_score_completion_low(self, resolver):
         """Test low completion penalty."""
-        score = resolver._calculate_confidence_score(
-            play_count=0, completion_pct=0.05, manual=None
-        )
+        score = resolver._calculate_confidence_score(play_count=0, completion_pct=0.05, manual=None)
         assert score == COMPLETION_LOW_PENALTY
 
     def test_calculate_confidence_score_manual(self, resolver):
         """Test manual mark bonus."""
-        score = resolver._calculate_confidence_score(
-            play_count=0, completion_pct=None, manual=True
-        )
+        score = resolver._calculate_confidence_score(play_count=0, completion_pct=None, manual=True)
         assert score == MANUAL_MARK_BONUS
 
     def test_calculate_confidence_score_combined(self, resolver):
         """Test combined confidence scoring."""
-        score = resolver._calculate_confidence_score(
-            play_count=2, completion_pct=0.95, manual=True
-        )
+        score = resolver._calculate_confidence_score(play_count=2, completion_pct=0.95, manual=True)
         expected = 0.2 + COMPLETION_HIGH_BONUS + MANUAL_MARK_BONUS
         assert score == expected
 
@@ -688,9 +682,7 @@ class TestConfidenceScoring:
 
     def test_calculate_confidence_score_zero_play_count(self, resolver):
         """Test zero play count gives no bonus."""
-        score = resolver._calculate_confidence_score(
-            play_count=0, completion_pct=None, manual=None
-        )
+        score = resolver._calculate_confidence_score(play_count=0, completion_pct=None, manual=None)
         assert score == 0.0
 
     def test_backward_compatibility_basic_resolve(self, resolver):

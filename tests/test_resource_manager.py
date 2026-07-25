@@ -191,12 +191,8 @@ class TestCpuThrottle:
         """Test CPU throttle thread calls sleep."""
         manager = ResourceManager()
         with patch("time.sleep") as mock_sleep:
-            with patch.object(
-                manager._stop_throttle, "is_set", side_effect=[False, False, True]
-            ):
-                with patch.object(
-                    manager._stop_throttle, "wait", return_value=False
-                ):
+            with patch.object(manager._stop_throttle, "is_set", side_effect=[False, False, True]):
+                with patch.object(manager._stop_throttle, "wait", return_value=False):
                     manager.start_cpu_throttle(target_cpu_percent=50.0)
                     # Wait briefly for thread to start
                     time.sleep(0.05)

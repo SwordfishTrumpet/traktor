@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
+import importlib.util
 from datetime import datetime, timezone
 
 from .log import logger
 
-# zoneinfo is available in Python 3.9+; provide a fallback for older versions
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    ZoneInfo = None  # type: ignore[misc,assignment]
+# zoneinfo is available in Python 3.9+; find_spec guard provides a fallback
+# without try/except import redefinition issues flagged by mypy.
+ZoneInfo = __import__("zoneinfo").ZoneInfo if importlib.util.find_spec("zoneinfo") else None
 
 # Default threshold in seconds for considering timestamps significantly different
 DEFAULT_TIMESTAMP_THRESHOLD_SECONDS = 60
@@ -100,7 +99,10 @@ class ConflictResolver:
         # Apply resolution strategy
         if self.strategy == "newest_wins":
             return self._resolve_newest_wins(
-                plex_watched, trakt_watched, plex_last_watched, trakt_last_watched,
+                plex_watched,
+                trakt_watched,
+                plex_last_watched,
+                trakt_last_watched,
             )
         if self.strategy == "plex_wins":
             return self._resolve_plex_wins(plex_watched, trakt_watched)
@@ -222,7 +224,10 @@ class ConflictResolver:
 
         # Fallback to basic resolve for unknown media types
         return self.resolve(
-            plex_watched, trakt_watched, plex_last_watched, trakt_last_watched,
+            plex_watched,
+            trakt_watched,
+            plex_last_watched,
+            trakt_last_watched,
         )
 
     def _resolve_newest_wins(
@@ -313,10 +318,14 @@ class ConflictResolver:
         # If timestamps are available, use confidence scoring
         if plex_ts is not None or trakt_ts is not None:
             plex_score = self._calculate_confidence_score(
-                plex_play_count, plex_completion_pct, plex_manual,
+                plex_play_count,
+                plex_completion_pct,
+                plex_manual,
             )
             trakt_score = self._calculate_confidence_score(
-                trakt_play_count, trakt_completion_pct, trakt_manual,
+                trakt_play_count,
+                trakt_completion_pct,
+                trakt_manual,
             )
 
             # Add timestamp component to score
@@ -346,7 +355,10 @@ class ConflictResolver:
 
         # Fallback to basic newest_wins
         return self._resolve_newest_wins(
-            plex_watched, trakt_watched, plex_ts, trakt_ts,
+            plex_watched,
+            trakt_watched,
+            plex_ts,
+            trakt_ts,
         )
 
     def _resolve_episode(
@@ -370,10 +382,14 @@ class ConflictResolver:
 
         # For episodes, completion percentage is more important than timestamp
         plex_score = self._calculate_confidence_score(
-            plex_play_count, plex_completion_pct, plex_manual,
+            plex_play_count,
+            plex_completion_pct,
+            plex_manual,
         )
         trakt_score = self._calculate_confidence_score(
-            trakt_play_count, trakt_completion_pct, trakt_manual,
+            trakt_play_count,
+            trakt_completion_pct,
+            trakt_manual,
         )
 
         # Weight completion more heavily for episodes
@@ -430,10 +446,14 @@ class ConflictResolver:
 
         # For shows, use aggregate completion across all episodes
         plex_score = self._calculate_confidence_score(
-            plex_play_count, plex_completion_pct, plex_manual,
+            plex_play_count,
+            plex_completion_pct,
+            plex_manual,
         )
         trakt_score = self._calculate_confidence_score(
-            trakt_play_count, trakt_completion_pct, trakt_manual,
+            trakt_play_count,
+            trakt_completion_pct,
+            trakt_manual,
         )
 
         # Weight completion percentage (aggregate across episodes)
@@ -511,10 +531,14 @@ class ConflictResolver:
 
         # Use confidence scoring for the effective states
         plex_score = self._calculate_confidence_score(
-            plex_play_count, plex_completion_pct, plex_manual,
+            plex_play_count,
+            plex_completion_pct,
+            plex_manual,
         )
         trakt_score = self._calculate_confidence_score(
-            trakt_play_count, trakt_completion_pct, trakt_manual,
+            trakt_play_count,
+            trakt_completion_pct,
+            trakt_manual,
         )
 
         # Add timestamp component
@@ -580,7 +604,9 @@ class ConflictResolver:
         return score
 
     def _normalize_timestamp(
-        self, dt: datetime | None, tz_name: str | None = None,
+        self,
+        dt: datetime | None,
+        tz_name: str | None = None,
     ) -> datetime | None:
         """Normalize timestamp to UTC for comparison.
 

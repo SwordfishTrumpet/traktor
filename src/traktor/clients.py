@@ -430,6 +430,26 @@ class CacheManager:
             logger.debug(f"Could not get last update timestamp: {e}")
             return None
 
+    @staticmethod
+    def _normalize_added_at(added_at) -> Optional[datetime]:
+        """Normalize a Plex ``addedAt`` value to a timezone-aware UTC datetime.
+
+        plexapi >= 4.17 converts ``addedAt`` to a naive local ``datetime`` via
+        ``utils.toDatetime()``; older versions exposed a raw epoch integer.
+
+        Returns:
+            Timezone-aware datetime, or None if the value is missing/unparseable.
+        """
+        if added_at is None:
+            return None
+        if isinstance(added_at, datetime):
+            # Naive datetimes from plexapi are in system local time;
+            # astimezone() on a naive datetime interprets it as local.
+            return added_at.astimezone(timezone.utc)
+        if isinstance(added_at, (int, float)):
+            return datetime.fromtimestamp(added_at, tz=timezone.utc)
+        return None
+
     def _incremental_cache_update(self) -> bool:
         """Update cache incrementally using recentlyAdded API.
 
@@ -477,11 +497,13 @@ class CacheManager:
 
                     # Filter items by added date
                     cutoff_time = datetime.now(timezone.utc) - time_since_update
-                    new_items = [
-                        item
-                        for item in recent_items
-                        if datetime.fromtimestamp(item.addedAt, tz=timezone.utc) > cutoff_time
-                    ]
+                    new_items = []
+                    for item in recent_items:
+                        added_at = self._normalize_added_at(
+                            self._safe_get_attr(item, "addedAt", None)
+                        )
+                        if added_at is not None and added_at > cutoff_time:
+                            new_items.append(item)
 
                     if new_items:
                         logger.info(f"  Found {len(new_items)} new {section.type}(s)")
@@ -919,7 +941,8 @@ class TraktClient:
             return data
 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to fetch liked lists: API request failed - {e}", exc_info=True)
+            # Traceback already logged by _request(); log context only here.
+            logger.error(f"Failed to fetch liked lists: API request failed - {e}")
             raise
         except (KeyError, ValueError, TypeError) as e:
             logger.error(f"Failed to fetch liked lists: Data parsing error - {e}", exc_info=True)

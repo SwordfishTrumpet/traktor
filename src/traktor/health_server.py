@@ -101,7 +101,13 @@ class HealthServer:
         logger.info(f"Health server started on port {self.port}")
 
     def stop(self) -> None:
-        """Stop the health server."""
+        """Stop the health server and release its socket."""
         if self.server:
             self.server.shutdown()
-            logger.info("Health server stopped")
+            # shutdown() only stops serve_forever(); the listening socket
+            # stays open until server_close() is called.
+            self.server.server_close()
+            self.server = None
+        if self.thread:
+            self.thread.join(timeout=5)
+        logger.info("Health server stopped")

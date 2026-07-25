@@ -57,8 +57,7 @@ class JSONFormatter(logging.Formatter):
             "logger": record.name,
             "message": record.getMessage(),
             "source": f"{record.funcName}:{record.lineno}",
-            "correlation_id": getattr(record, "correlation_id", None)
-            or get_correlation_id(),
+            "correlation_id": getattr(record, "correlation_id", None) or get_correlation_id(),
             "extra": getattr(record, "extra", {}),
         }
         if record.exc_info:
@@ -74,7 +73,11 @@ def setup_logging(verbose=False, structured=False):
         structured: If True, use JSONFormatter for the file handler
     """
     logger.setLevel(logging.DEBUG)
-    logger.handlers = []
+    # Close existing handlers before detaching them; dropping references
+    # without close() leaks file descriptors (RotatingFileHandler streams).
+    for existing_handler in logger.handlers[:]:
+        logger.removeHandler(existing_handler)
+        existing_handler.close()
 
     # File handler uses JSON if structured, otherwise plain text
     if structured:

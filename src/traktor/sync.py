@@ -1268,7 +1268,12 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
 
     # Fetch liked lists only if authenticated and needed
     liked_lists = []
-    if needs_auth and trakt and list_source in ("liked", "both") and not (args and args.sync_watched_only):
+    if (
+        needs_auth
+        and trakt
+        and list_source in ("liked", "both")
+        and not (args and args.sync_watched_only)
+    ):
         logger.info("Fetching liked lists from Trakt...")
         try:
             liked_lists = trakt.get_liked_lists()
@@ -1276,7 +1281,8 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
             logger.info(f"Found {len(liked_lists)} liked list(s)")
             print(f"Found {len(liked_lists)} liked list(s)")
         except Exception as e:
-            logger.error(f"Failed to fetch liked lists: {e}", exc_info=True)
+            # Traceback already logged by the Trakt client layer; avoid triple-logging.
+            logger.error(f"Failed to fetch liked lists: {e}")
             print(f"Failed to fetch liked lists: {e}")
             # Don't exit - we can still sync official lists
             print("Continuing with official lists only...")
