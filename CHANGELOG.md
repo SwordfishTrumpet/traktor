@@ -8,10 +8,55 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **Incremental cache update broken by plexapi datetime change (CRITICAL)**
+  - `plexapi >= 4.17` returns `addedAt` as a naive local `datetime` (via `utils.toDatetime()`), but `_incremental_cache_update()` called `datetime.fromtimestamp(item.addedAt)`, raising `TypeError` on every run
+  - Symptom in production logs: "Could not get recentlyAdded for section 'Films': 'datetime.datetime' object cannot be interpreted as an integer" → silent fallback to full cache rebuild (~30-60s wasted per run)
+  - Added `CacheManager._normalize_added_at()` handling naive/aware datetimes, legacy epoch ints, and unparseable values (item skipped)
+  - 3 regression tests added (naive datetime, aware datetime, old-item cutoff)
+  - Location: `src/traktor/clients.py`
+
+- **Resource leak: unclosed log handlers**
+  - `setup_logging()` detached existing handlers via `logger.handlers = []` without `close()`, leaking a file descriptor per re-initialization
+  - Now iterates handlers, calls `removeHandler()` + `close()`
+  - Location: `src/traktor/log.py`
+
+- **Resource leak: health server socket never closed**
+  - `HealthServer.stop()` called `shutdown()` but not `server_close()`, leaving the listening socket open
+  - Now calls `server_close()` and joins the server thread (timeout 5s)
+  - Location: `src/traktor/health_server.py`
+
+- **Removed all remaining `# type: ignore` suppressions (zero-suppression compliance)**
+  - 4 leftover suppressions in conditional imports (`resource_manager.py`, `performance.py`, `conflict_resolver.py`) replaced with `importlib.util.find_spec()` guards + `__import__()` fallback per the documented pattern
+  - Codebase now contains zero suppression directives (`type: ignore`, `noqa`, `filterwarnings`)
+
+- **Duplicate auth-failure logging**
+  - Trakt auth failures were logged with tracebacks at three layers (`_request`, `get_liked_lists`, `sync_lists`)
+  - Single authoritative traceback now kept at `_request`; upper layers log context only
+  - Location: `src/traktor/clients.py`, `src/traktor/sync.py`
+
 - **Import ordering in clients.py** - Fixed ruff I001 linting error
   - Reordered import to follow standard pattern (stdlib, third-party, local)
   - `CircuitBreakerOpen` now correctly imported before `trakt_circuit_breaker` (alphabetical)
   - Location: `src/traktor/clients.py`
+
+### Changed
+
+- **BREAKING: Python >= 3.10 now required** (was >=3.8)
+  - `plexapi 4.18.2` and `requests 2.34.2` no longer support Python 3.8/3.9
+  - `requires-python` bumped to `>=3.10`; black `target-version` bumped to `py310`
+
+- **Dependency upgrades to newest stable**
+  - plexapi 4.18.0 → 4.18.2, requests 2.32.5 → 2.34.2, certifi 2026.2.25 → 2026.7.22, urllib3 2.6.3 → 2.7.0, types-requests → 2.33.0.20260712
+
+- **Dev toolchain now pinned in project venv**
+  - Consolidated dev tools into `[dependency-groups] dev` (PEP 735): pytest >=9.0, black >=26.0, ruff >=0.16.0, mypy >=2.1 + type stubs
+  - Removed duplicated `[project.optional-dependencies] dev`
+  - `uv sync` now installs the full toolchain; verification no longer falls back to global installs
+  - Result: `uv run mypy src/` reports **0 errors** (previously 8 stub-discovery errors from a global mypy that could not see project stubs)
+
+### Improved
+
+- **Codebase reformatted with black 26** (7 files adjusted to current style rules)
 
 ### Improved
 
