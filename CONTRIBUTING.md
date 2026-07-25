@@ -18,7 +18,7 @@ Thank you for your interest in contributing to traktor! This document provides g
 
 ### Prerequisites
 
-- Python 3.8 or higher
+- Python 3.10 or higher
 - [uv](https://docs.astral.sh/uv/getting-started/installation/) package manager
 - Git
 

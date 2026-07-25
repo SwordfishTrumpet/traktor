@@ -8,7 +8,7 @@ Turn your liked Trakt lists into Plex playlists. Sync your watched status betwee
 
 ## Install in 30 seconds
 
-**Prerequisites:** Python 3.8+ and [uv](https://docs.astral.sh/uv/getting-started/installation/) (one-line install)
+**Prerequisites:** Python 3.10+ and [uv](https://docs.astral.sh/uv/getting-started/installation/) (one-line install)
 
 ```bash
 git clone https://github.com/SwordfishTrumpet/traktor.git && cd traktor
