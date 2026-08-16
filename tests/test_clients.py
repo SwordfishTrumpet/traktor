@@ -209,8 +209,8 @@ class TestTraktAuth:
         fake_env.write_text("TRAKT_ACCESS_TOKEN=old\nTRAKT_REFRESH_TOKEN=old\n")
 
         auth = clients.TraktAuth()
-        auth.access_token = "a" * 180  # realistic Trakt access token length
-        auth.refresh_token = "b" * 64  # realistic Trakt refresh token length
+        auth.access_token = "a" * 32  # current Trakt token length
+        auth.refresh_token = "b" * 32  # current Trakt token length
 
         import logging
 
@@ -260,8 +260,8 @@ class TestTraktAuth:
 
     def test_has_valid_tokens_accepts_real_tokens(self, monkeypatch):
         """Real-length tokens must pass validation."""
-        monkeypatch.setattr(clients, "TRAKT_ACCESS_TOKEN", "a" * 180)
-        monkeypatch.setattr(clients, "TRAKT_REFRESH_TOKEN", "b" * 64)
+        monkeypatch.setattr(clients, "TRAKT_ACCESS_TOKEN", "a" * 32)
+        monkeypatch.setattr(clients, "TRAKT_REFRESH_TOKEN", "b" * 32)
 
         auth = clients.TraktAuth()
         assert auth.has_valid_tokens() is True

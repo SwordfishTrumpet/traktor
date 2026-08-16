@@ -562,14 +562,14 @@ class CacheManager:
 class TraktAuth:
     """Handle Trakt OAuth authentication."""
 
-    # Trakt token sanity limits. Real Trakt access tokens are JWTs of roughly
-    # 150-200 characters and refresh tokens are roughly 64 characters. Values
-    # far shorter than this are placeholder text or truncated tokens and must
-    # never be treated as valid authentication (previously a literal
-    # "new-access-token" string in .env silently "authenticated" for months
-    # while every API call failed with 401).
-    MIN_ACCESS_TOKEN_LENGTH = 100
-    MIN_REFRESH_TOKEN_LENGTH = 40
+    # Trakt token sanity limits. Trakt currently issues 32-character tokens for
+    # both access and refresh (verified live 2026-08-16); historically they were
+    # longer JWTs. We only guard against obvious garbage here: placeholder text
+    # like "new-access-token" (16 chars) or truncated values far below any
+    # plausible Trakt format. Keep these floors LOW so a legitimate format
+    # change can never lock users out again.
+    MIN_ACCESS_TOKEN_LENGTH = 20
+    MIN_REFRESH_TOKEN_LENGTH = 20
     PLACEHOLDER_TOKENS = frozenset(
         {
             "new-access-token",
