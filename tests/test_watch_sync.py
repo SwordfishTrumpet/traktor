@@ -1,6 +1,6 @@
 """Tests for watch_sync module."""
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -751,3 +751,118 @@ class TestPlaybackProgressSync:
         assert result["success"] == 1
         assert result["failed"] == 1
         assert len(result["errors"]) == 1
+
+
+class TestDeltaSyncRegression:
+    """Regression tests for delta sync correctness (movies watched on other
+    services must be picked up regardless of when they were watched, and naive
+    Plex timestamps must not crash the Plex pull)."""
+
+    def test_parse_plex_timestamp_naive_iso_string(self):
+        """Naive ISO strings (plexapi cache format) must become aware UTC."""
+        dt = watch_sync.WatchSyncEngine._parse_plex_timestamp("2023-02-06T21:30:39")
+        assert dt is not None
+        assert dt.tzinfo is not None
+        assert dt.utcoffset() == timedelta(0)
+
+    def test_parse_plex_timestamp_naive_datetime(self):
+        """Naive datetimes (plexapi attribute access) must become aware UTC."""
+        result = watch_sync.WatchSyncEngine._parse_plex_timestamp(datetime(2023, 2, 6, 21, 30, 39))
+        assert result is not None
+        assert result.tzinfo is not None
+        assert result.utcoffset() == timedelta(0)
+
+    def test_parse_plex_timestamp_aware_and_epoch(self):
+        """Aware datetimes and epoch values must still parse."""
+        aware = datetime(2023, 2, 6, 21, 30, 39, tzinfo=timezone.utc)
+        assert watch_sync.WatchSyncEngine._parse_plex_timestamp(aware).utcoffset() == timedelta(0)
+        epoch = 1675719039  # 2023-02-06T21:30:39Z
+        assert watch_sync.WatchSyncEngine._parse_plex_timestamp(epoch).utcoffset() == timedelta(0)
+
+    def test_pull_from_trakt_movies_ignores_delta_window(self, sync_engine):
+        """Movies watched before the delta window must still be pulled.
+
+        Regression: _pull_from_trakt used get_watched_history(start_at=...)
+        which dropped any movie watched before the last sync, so movies watched
+        on other services weeks/months ago were never marked watched in Plex.
+        """
+        since = datetime.now(timezone.utc) - timedelta(days=7)
+        sync_engine.trakt.get_watched_movies.return_value = [
+            {
+                "last_watched_at": "2023-02-06T21:30:39.000Z",
+                "movie": {"title": "Old Movie", "ids": {"imdb": "tt1234567", "tmdb": 12345}},
+            }
+        ]
+        # get_watched_history must never be used for the movie state
+        sync_engine.trakt.get_watched_history = MagicMock(return_value=[])
+        sync_engine.trakt.get_all_watched_history = MagicMock(return_value=[])
+
+        state = sync_engine._pull_from_trakt(since=since, movies_only=True)
+
+        assert ("movie", "tt1234567", "12345") in state
+        assert state[("movie", "tt1234567", "12345")]["watched"] is True
+        sync_engine.trakt.get_watched_movies.assert_called_once()
+        sync_engine.trakt.get_watched_history.assert_not_called()
+        sync_engine.trakt.get_all_watched_history.assert_not_called()
+
+    def test_pull_from_plex_handles_naive_last_viewed(self, sync_engine):
+        """Naive ISO lastViewedAt values must not crash the Plex pull.
+
+        Regression: plexapi serializes lastViewedAt as a naive local datetime,
+        which the cache stores as a naive ISO string. Comparing it against the
+        aware `since` datetime raised TypeError, the outer except swallowed it,
+        and _pull_from_plex returned {} - so nothing was ever synced to Plex.
+        """
+        now = datetime.now(timezone.utc)
+        cache = {
+            "movies_by_imdb": {
+                "tt1111111": {"ratingKey": 111},
+                "tt2222222": {"ratingKey": 222},
+                "tt3333333": {"ratingKey": 333},
+            },
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+            "movies_list": [
+                # Watched long ago (outside delta window) - should be skipped
+                {
+                    "ratingKey": 111,
+                    "title": "Old Watched",
+                    "isWatched": True,
+                    "lastViewedAt": "2023-02-06T21:30:39",
+                },
+                # Unwatched - must always be included (this is the user's case)
+                {
+                    "ratingKey": 222,
+                    "title": "Unwatched Movie",
+                    "isWatched": False,
+                    "lastViewedAt": None,
+                },
+                # Watched recently (inside delta window) - should be included
+                {
+                    "ratingKey": 333,
+                    "title": "Recent Watched",
+                    "isWatched": True,
+                    "lastViewedAt": (now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S"),
+                },
+            ],
+            "shows_list": [],
+        }
+        sync_engine.plex.cache.memory_cache = cache
+        sync_engine.stats["items_skipped_due_to_delta"] = 0
+
+        plex_state = sync_engine._pull_from_plex(
+            movies_only=False, shows_only=False, since=now - timedelta(days=7)
+        )
+
+        # No crash, and the unwatched movie is present with its rating key
+        assert (
+            "movie",
+            "tt1111111",
+            None,
+        ) not in plex_state  # old watched: delta-skipped
+        assert ("movie", "tt2222222", None) in plex_state  # unwatched: present
+        assert ("movie", "tt3333333", None) in plex_state  # recent watched: present
+        assert sync_engine.stats["items_skipped_due_to_delta"] >= 1
+        unwatched = plex_state[("movie", "tt2222222", None)]
+        assert unwatched["watched"] is False
+        assert unwatched["rating_key"] == 222

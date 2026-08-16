@@ -562,10 +562,72 @@ class CacheManager:
 class TraktAuth:
     """Handle Trakt OAuth authentication."""
 
+    # Trakt token sanity limits. Real Trakt access tokens are JWTs of roughly
+    # 150-200 characters and refresh tokens are roughly 64 characters. Values
+    # far shorter than this are placeholder text or truncated tokens and must
+    # never be treated as valid authentication (previously a literal
+    # "new-access-token" string in .env silently "authenticated" for months
+    # while every API call failed with 401).
+    MIN_ACCESS_TOKEN_LENGTH = 100
+    MIN_REFRESH_TOKEN_LENGTH = 40
+    PLACEHOLDER_TOKENS = frozenset(
+        {
+            "new-access-token",
+            "new-refresh-token",
+            "your-access-token",
+            "your-refresh-token",
+            "access-token",
+            "refresh-token",
+            "changeme",
+            "change-me",
+            "<access-token>",
+            "<refresh-token>",
+        }
+    )
+
     def __init__(self):
         # Load tokens from environment if available
         self.access_token = TRAKT_ACCESS_TOKEN
         self.refresh_token = TRAKT_REFRESH_TOKEN
+
+    def has_valid_tokens(self) -> bool:
+        """Check whether loaded tokens look like real Trakt tokens.
+
+        Returns True only if both tokens are present, are long enough to be
+        genuine Trakt tokens, and are not placeholder text. This prevents
+        broken/placeholder .env values from silently passing the auth check
+        and failing later with 401s.
+
+        Returns:
+            True if tokens appear valid, False otherwise
+        """
+        if not self.access_token or not self.refresh_token:
+            return False
+
+        access = self.access_token.strip()
+        refresh = self.refresh_token.strip()
+
+        if access.lower() in self.PLACEHOLDER_TOKENS or refresh.lower() in self.PLACEHOLDER_TOKENS:
+            logger.warning(
+                "Trakt tokens in .env look like placeholder text "
+                f"(access={len(access)} chars, refresh={len(refresh)} chars). "
+                "Run with --force-auth to authenticate with real tokens."
+            )
+            return False
+
+        if (
+            len(access) < self.MIN_ACCESS_TOKEN_LENGTH
+            or len(refresh) < self.MIN_REFRESH_TOKEN_LENGTH
+        ):
+            logger.warning(
+                "Trakt tokens in .env are too short to be valid "
+                f"(access={len(access)} chars, refresh={len(refresh)} chars; "
+                f"expected >= {self.MIN_ACCESS_TOKEN_LENGTH} and >= {self.MIN_REFRESH_TOKEN_LENGTH}). "
+                "Run with --force-auth to re-authenticate."
+            )
+            return False
+
+        return True
 
     def save_tokens(self):
         """Save tokens to .env file for persistence.
@@ -574,6 +636,14 @@ class TraktAuth:
         so the user doesn't need to re-authenticate on each run.
         """
         logger.debug("Saving tokens to .env file")
+        if not self.has_valid_tokens():
+            logger.error(
+                "Refusing to save tokens: access/refresh token values are "
+                "missing, too short, or look like placeholders "
+                f"(access={len(self.access_token or '')} chars, "
+                f"refresh={len(self.refresh_token or '')} chars)"
+            )
+            return False
         if self.access_token and self.refresh_token:
             logger.info("Authentication tokens obtained successfully")
             # Log masked tokens for debugging (security: don't log full tokens)
@@ -1149,19 +1219,47 @@ class TraktClient:
         return all_items
 
     def get_watched_movies(self) -> List[Dict[str, Any]]:
-        """Get all watched movies from Trakt.
+        """Get all watched movies from Trakt (paginated).
 
         Returns:
             List of watched movies with 'last_watched_at' timestamps
         """
         logger.info("Fetching watched movies from Trakt...")
 
-        try:
-            response = self._request("sync/watched/movies")
-            data = response.json()
+        all_items: List[Dict[str, Any]] = []
+        page = 1
+        limit = DEFAULT_API_PAGE_SIZE
 
-            logger.info(f"Retrieved {len(data)} watched movie(s)")
-            return data
+        try:
+            while True:
+                response = self._request(
+                    "sync/watched/movies", params={"page": page, "limit": limit}
+                )
+                data = response.json()
+                if not data:
+                    break
+
+                all_items.extend(data)
+
+                # Respect Trakt pagination headers if present; otherwise treat
+                # a short page as the end of the list.
+                try:
+                    page_count = int(response.headers.get("X-Pagination-Page-Count", page))
+                except (TypeError, ValueError):
+                    page_count = page
+
+                if page >= page_count or len(data) < limit:
+                    break
+
+                page += 1
+
+                # Safety limit to prevent infinite loops
+                if page > MAX_HISTORY_PAGES:
+                    logger.warning(f"Reached page limit ({MAX_HISTORY_PAGES}), stopping pagination")
+                    break
+
+            logger.info(f"Retrieved {len(all_items)} watched movie(s)")
+            return all_items
 
         except Exception as e:
             logger.error(f"Failed to fetch watched movies: {e}", exc_info=True)

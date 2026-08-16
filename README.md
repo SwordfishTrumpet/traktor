@@ -80,6 +80,8 @@ See all options: `uv run traktor --help`
 
 **Watch Status & Progress (OAuth Required)**
 - Bidirectional watched/unwatched sync (movies & episodes)
+- Movies always pull Trakt's **full watched list** — movies watched on other services are
+  marked watched in Plex regardless of how long ago they were watched (no delta window loss)
 - Playback progress sync (resume points) from Trakt → Plex
 - Conflict resolution strategies when states disagree
 
@@ -172,6 +174,18 @@ See `uv run traktor --help` for all options.
 - **OAuth required for:** Liked lists, collection, watchlist, watch status sync, progress sync
 - On first run with OAuth-required features, you'll get a one-time browser prompt to authorize
 - Set `TRAKTOR_LIST_SOURCE=both` in `.env` to always sync liked lists without adding the CLI flag
+
+**Trakt OAuth details:**
+- `TRAKT_REDIRECT_URI` in `.env` must **exactly match** the "Redirect URI" registered for your app
+  at https://trakt.tv/oauth/applications (Trakt rejects mismatches with `invalid_redirect`).
+- If the registered redirect URI is a localhost URL (e.g. `http://127.0.0.1:7001/callback`),
+  traktor briefly listens on that port and captures the authorization code automatically —
+  no copy/paste needed. Otherwise, paste the code from the browser.
+- Tokens are validated on load: placeholder or truncated values (e.g. literal
+  `new-access-token` text, or anything shorter than real Trakt tokens) are treated as
+  unauthenticated and trigger a clear re-auth prompt instead of silently failing later.
+  `save_tokens()` also refuses to write invalid tokens to `.env`.
+- Re-authenticate at any time with `uv run traktor --force-auth`.
 
 **Note on Plex tokens:** Use your **server owner's token** for playlists visible to all users. Managed user tokens create private playlists only.
 

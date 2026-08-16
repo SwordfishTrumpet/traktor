@@ -201,11 +201,16 @@ class TestTraktAuth:
         assert auth.access_token == "test-access-token"
         assert auth.refresh_token == "test-refresh-token"
 
-    def test_save_tokens_logs_message(self, caplog):
+    def test_save_tokens_logs_message(self, caplog, tmp_path, monkeypatch):
         """Test that save_tokens logs message for in-memory tokens."""
+        # Run from a temp dir so save_tokens writes a fake .env, not the real one
+        monkeypatch.chdir(tmp_path)
+        fake_env = tmp_path / ".env"
+        fake_env.write_text("TRAKT_ACCESS_TOKEN=old\nTRAKT_REFRESH_TOKEN=old\n")
+
         auth = clients.TraktAuth()
-        auth.access_token = "new-access-token"
-        auth.refresh_token = "new-refresh-token"
+        auth.access_token = "a" * 180  # realistic Trakt access token length
+        auth.refresh_token = "b" * 64  # realistic Trakt refresh token length
 
         import logging
 
@@ -216,6 +221,50 @@ class TestTraktAuth:
         assert result is True
         # Should log message about tokens being in memory
         assert "tokens obtained" in caplog.text.lower() or "memory" in caplog.text.lower()
+
+    def test_save_tokens_refuses_placeholders(self, caplog, tmp_path, monkeypatch):
+        """Test that save_tokens refuses to write placeholder/short tokens."""
+        monkeypatch.chdir(tmp_path)
+        fake_env = tmp_path / ".env"
+        fake_env.write_text("TRAKT_ACCESS_TOKEN=old\nTRAKT_REFRESH_TOKEN=old\n")
+
+        auth = clients.TraktAuth()
+        auth.access_token = "new-access-token"  # literal placeholder text
+        auth.refresh_token = "new-refresh-token"
+
+        import logging
+
+        with caplog.at_level(logging.ERROR):
+            result = auth.save_tokens()
+
+        assert result is False
+        assert "refusing to save" in caplog.text.lower()
+        # The .env file must not have been overwritten with placeholders
+        assert fake_env.read_text() == "TRAKT_ACCESS_TOKEN=old\nTRAKT_REFRESH_TOKEN=old\n"
+
+    def test_has_valid_tokens_rejects_placeholders(self, monkeypatch):
+        """Placeholder tokens must not be treated as valid auth."""
+        monkeypatch.setattr(clients, "TRAKT_ACCESS_TOKEN", "new-access-token")
+        monkeypatch.setattr(clients, "TRAKT_REFRESH_TOKEN", "new-refresh-token")
+
+        auth = clients.TraktAuth()
+        assert auth.has_valid_tokens() is False
+
+    def test_has_valid_tokens_rejects_short_tokens(self, monkeypatch):
+        """Truncated tokens must not be treated as valid auth."""
+        monkeypatch.setattr(clients, "TRAKT_ACCESS_TOKEN", "abc123")
+        monkeypatch.setattr(clients, "TRAKT_REFRESH_TOKEN", "xyz789")
+
+        auth = clients.TraktAuth()
+        assert auth.has_valid_tokens() is False
+
+    def test_has_valid_tokens_accepts_real_tokens(self, monkeypatch):
+        """Real-length tokens must pass validation."""
+        monkeypatch.setattr(clients, "TRAKT_ACCESS_TOKEN", "a" * 180)
+        monkeypatch.setattr(clients, "TRAKT_REFRESH_TOKEN", "b" * 64)
+
+        auth = clients.TraktAuth()
+        assert auth.has_valid_tokens() is True
 
     def test_get_auth_url(self):
         """Test generating auth URL."""

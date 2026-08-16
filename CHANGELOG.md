@@ -8,6 +8,33 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **Watch sync: movies watched on other services were never marked watched in Plex (CRITICAL)**
+  - `_pull_from_trakt()` fetched movies via Trakt *history* filtered by `start_at` (last sync),
+    so any movie watched before the sync window (first run = last 7 days) never appeared in the
+    Trakt state and was never pushed to Plex. Shows were unaffected (always full `get_watched_shows()`)
+  - Movies now always fetch the full `get_watched_movies()` list (authoritative watched state);
+    delta filtering stays on the Plex side where unwatched items (no `lastViewedAt`) are never skipped
+  - Location: `src/traktor/watch_sync.py`
+
+- **Watch sync: naive/aware datetime crash silently emptied the Plex pull (CRITICAL)**
+  - plexapi returns `lastViewedAt` as a naive *local* datetime, serialized to naive ISO strings in the
+    cache; comparing it against the aware `since` datetime raised `TypeError: can't compare offset-naive
+    and offset-aware datetimes`, the broad `except` swallowed it, and `_pull_from_plex()` returned `{}` —
+    so nothing was ever synced to Plex whenever `since` was set and any library item had been watched
+  - `_parse_plex_timestamp()` now always returns an aware UTC datetime (naive values interpreted as
+    system local time, matching plexapi's `datetime.fromtimestamp()` behavior); also handles datetime
+    objects from API lookups
+  - Location: `src/traktor/watch_sync.py`
+
+- **Trakt auth: placeholder/truncated tokens silently "authenticated" for months (CRITICAL)**
+  - `authenticate_trakt()` only checked that the access token was non-empty, so literal placeholder
+    text like `new-access-token` in `.env` passed the check while every API call 401'd (liked lists /
+    watch sync silently dead; official lists kept working so it went unnoticed)
+  - New `TraktAuth.has_valid_tokens()` validates length (access >= 100, refresh >= 40 chars) and
+    rejects known placeholder strings; `save_tokens()` refuses to write invalid tokens
+  - Location: `src/traktor/clients.py`, `src/traktor/sync.py`
+
+
 - **Incremental cache update broken by plexapi datetime change (CRITICAL)**
   - `plexapi >= 4.17` returns `addedAt` as a naive local `datetime` (via `utils.toDatetime()`), but `_incremental_cache_update()` called `datetime.fromtimestamp(item.addedAt)`, raising `TypeError` on every run
   - Symptom in production logs: "Could not get recentlyAdded for section 'Films': 'datetime.datetime' object cannot be interpreted as an integer" → silent fallback to full cache rebuild (~30-60s wasted per run)
@@ -41,6 +68,13 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Changed
 
+- **Watch sync: movies always pull the full Trakt watched list**
+  - `_pull_from_trakt()` no longer delta-filters movie history; `get_watched_movies()` is used in all
+    modes so movies watched before the last sync are never lost (matches how shows were already handled)
+  - `get_watched_movies()` is now paginated (respects Trakt `X-Pagination-Page-Count`) so large watch
+    histories are not truncated
+  - Location: `src/traktor/watch_sync.py`, `src/traktor/clients.py`
+
 - **BREAKING: Python >= 3.10 now required** (was >=3.8)
   - `plexapi 4.18.2` and `requests 2.34.2` no longer support Python 3.8/3.9
   - `requires-python` bumped to `>=3.10`; black `target-version` bumped to `py310`
@@ -73,6 +107,14 @@ The format is based on Keep a Changelog and this project currently uses a simple
   - Location: `src/traktor/clients.py`, `src/traktor/sync.py`, `src/traktor/watch_sync.py`
 
 ### Added
+
+- **Trakt OAuth: automatic localhost callback capture**
+  - When `TRAKT_REDIRECT_URI` is a localhost URL (e.g. `http://127.0.0.1:7001/callback`), traktor
+    briefly listens on that port during `--force-auth` and captures the authorization code from the
+    browser redirect automatically (no copy/paste); falls back to manual code input on timeout/error
+  - `TRAKT_REDIRECT_URI` must exactly match the Redirect URI registered in the Trakt app settings;
+    documented in `.env.example` and README
+  - Location: `src/traktor/sync.py`
 
 - **Playback Progress Sync (Resume Points)** - Sync where you left off
   - New `--sync-progress` CLI flag to sync playback progress from Trakt to Plex

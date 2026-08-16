@@ -28,21 +28,32 @@ class WatchSyncEngine:
 
     @staticmethod
     def _parse_plex_timestamp(timestamp):
-        """Parse a Plex timestamp to datetime.
+        """Parse a Plex timestamp to an aware UTC datetime.
 
-        Plex returns timestamps as Unix epoch integers, but sometimes
-        they may be ISO format strings. This method handles both.
+        Plex (via plexapi) returns timestamps as naive *local* datetimes
+        (``datetime.fromtimestamp``), which are serialized to naive ISO strings
+        in the cache. This method handles Unix epoch ints/floats, ISO strings,
+        and datetime objects, and always returns a timezone-aware UTC datetime
+        so the result can be compared against ``since`` (an aware UTC datetime)
+        without raising TypeError.
+
+        Naive datetimes are interpreted as system local time, matching
+        plexapi's ``datetime.fromtimestamp()`` behavior.
 
         Args:
-            timestamp: Unix timestamp (int/float) or ISO string
+            timestamp: Unix timestamp (int/float), ISO string, or datetime
 
         Returns:
-            datetime or None if parsing fails
+            Aware UTC datetime or None if parsing fails
         """
         if timestamp is None:
             return None
 
         try:
+            # Handle datetime objects (e.g. from a PlexAPI item lookup)
+            if isinstance(timestamp, datetime):
+                return timestamp.astimezone(timezone.utc)
+
             # Handle Unix timestamp (int or float)
             if isinstance(timestamp, (int, float)):
                 return datetime.fromtimestamp(timestamp, tz=timezone.utc)
@@ -51,13 +62,15 @@ class WatchSyncEngine:
             if isinstance(timestamp, str):
                 # Try ISO format first
                 try:
-                    return datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+                    dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
                 except ValueError:
                     # Try parsing as Unix timestamp string
                     try:
                         return datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
                     except ValueError:
                         return None
+                # Naive ISO strings are system local time, matching plexapi
+                return dt.astimezone(timezone.utc)
 
             return None
         except (ValueError, TypeError, OverflowError):
@@ -460,7 +473,9 @@ class WatchSyncEngine:
         Args:
             movies_only: If True, only process movies
             shows_only: If True, only process shows/episodes
-            since: Optional datetime to only fetch items changed since this time
+            since: Optional datetime to only fetch items changed since this time.
+                NOTE: Only used for delta logging; movies always pull the full
+                watched list so items watched before the last sync are not lost.
 
         Returns:
             Dict mapping (media_type, imdb_id, tmdb_id) -> watch_info
@@ -473,20 +488,17 @@ class WatchSyncEngine:
         trakt_state = {}
 
         try:
-            # Convert since datetime to ISO string for Trakt API
-            start_at = since.isoformat() if since else None
-
-            # Get watched history with delta filtering
+            # Movies: always fetch the full watched list (authoritative state).
+            # We deliberately do NOT apply delta filtering here (history with
+            # start_at) because that would silently drop movies watched before
+            # the last sync - e.g. movies watched on other services weeks or
+            # months ago would never be marked as watched in Plex. This matches
+            # how shows are handled below (full get_watched_shows() list).
+            # Delta filtering is still applied on the Plex side, where unwatched
+            # items (no lastViewedAt) are never skipped, so the sync stays both
+            # correct and cheap.
             if not shows_only:
-                if since:
-                    # Delta mode: only fetch recent history since last sync
-                    movie_history = self.trakt.get_watched_history(
-                        media_type="movies", start_at=start_at
-                    )
-                else:
-                    # Full sync: fetch all history
-                    movie_history = self.trakt.get_all_watched_history(media_type="movies")
-                watched_movies = movie_history
+                watched_movies = self.trakt.get_watched_movies()
 
                 for movie in watched_movies:
                     ids = movie.get("movie", {}).get("ids", {})
