@@ -69,7 +69,9 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 - **CI matrix aligned with Python floor**
   - Removed 3.8/3.9 from the test matrix (project floor is now >= 3.10); tests run on 3.10-3.12
-  - Location: `.github/workflows/ci.yml`
+  - `uv sync --extra dev` -> `--group dev` in CI and Release workflows (dev tools moved to the
+    PEP 735 `[dependency-groups] dev` group); CI now emits `coverage.xml` for the Codecov upload
+  - Location: `.github/workflows/ci.yml`, `.github/workflows/release.yml`
 
 - **Dead code removed (audit C1-C13)**
   - Deleted: `update_cache_incremental`, `get_all_watched_history`, `get_watched_items`,
