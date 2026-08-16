@@ -768,3 +768,32 @@ def test_preview_changes_integration_playlist_cleanup():
             result = preview_changes(changes, change_type="playlist_cleanup")
 
     assert result is False
+
+
+class TestAuthCodeExtraction:
+    """Tests for _extract_auth_code (OAuth callback URL / code parsing)."""
+
+    def test_bare_code(self):
+        from traktor import sync
+
+        assert sync._extract_auth_code("abc123") == "abc123"
+        assert sync._extract_auth_code("   abc123  ") == "abc123"
+
+    def test_full_callback_url(self):
+        from traktor import sync
+
+        url = "http://127.0.0.1:7001/callback?code=h3W6linU2xXsoWVPBZvAUhqgsQB4ihrK"
+        assert sync._extract_auth_code(url) == "h3W6linU2xXsoWVPBZvAUhqgsQB4ihrK"
+
+    def test_bare_query(self):
+        from traktor import sync
+
+        assert sync._extract_auth_code("code=abc123") == "abc123"
+
+    def test_empty_and_invalid(self):
+        from traktor import sync
+
+        assert sync._extract_auth_code("") is None
+        assert sync._extract_auth_code("   ") is None
+        assert sync._extract_auth_code("http://x/?error=access_denied") is None
+        assert sync._extract_auth_code("http://127.0.0.1:7001/callback?state=x") is None

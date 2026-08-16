@@ -3,6 +3,7 @@
 import difflib
 import os
 import re
+import select
 import sys
 import threading
 import time
@@ -974,79 +975,138 @@ def process_watchlist_sync(
     return results
 
 
-def _wait_for_auth_code_callback(auth_url: str) -> Optional[str]:
-    """Capture the OAuth code via a localhost callback server.
+def _extract_auth_code(value: str) -> Optional[str]:
+    """Extract a Trakt authorization code from pasted input.
 
-    When the configured Trakt redirect URI points at a localhost address (e.g.
-    http://127.0.0.1:7001/callback), traktor can briefly listen on that port
-    and capture the authorization code automatically when the browser
-    redirects. Returns the code, or None if no localhost callback is
-    configured / the server could not be started / the wait timed out.
+    Accepts either the bare code ("abc123") or a full callback URL / query
+    string ("http://127.0.0.1:7001/callback?code=abc123", "code=abc123").
 
     Args:
-        auth_url: The full authorization URL to print for the user
+        value: Raw pasted text
 
     Returns:
-        Authorization code string, or None if callback capture unavailable
+        Authorization code string, or None if it cannot be extracted
     """
+    v = value.strip()
+    if not v:
+        return None
+    if "code=" in v:
+        query = v.split("?", 1)[1] if "?" in v else v
+        codes = parse_qs(query).get("code")
+        if codes:
+            return codes[0]
+        return None
+    if "://" in v or "?" in v or "=" in v:
+        # Looks like a URL/query but contains no code parameter - not a code
+        return None
+    return v
+
+
+def _collect_auth_code(auth_url: str) -> Optional[str]:
+    """Collect the Trakt authorization code from a local callback or stdin.
+
+    Two input paths run concurrently so either one works:
+
+    1. **Local callback listener**: if the configured redirect URI is a
+       localhost URL, briefly listen on that port and capture the code when the
+       browser redirects (works when the browser is on the same machine).
+    2. **Pasted stdin**: the user can paste the code (or the full callback URL)
+       into the terminal at any time and press Enter. This is the reliable path
+       on remote/headless boxes, where the browser redirect lands on the user's
+       own machine, not on the server.
+
+    Args:
+        auth_url: The full authorization URL that was printed for the user
+
+    Returns:
+        Authorization code string, or None on error/timeout
+    """
+    # Parse the redirect URI out of the authorization URL
     parsed = urlparse(auth_url)
-    params = parse_qs(parsed.query)
-    redirect_uri = params.get("redirect_uri", [None])[0]
-    if not redirect_uri:
-        return None
+    redirect_uri = parse_qs(parsed.query).get("redirect_uri", [None])[0]
+    cb = urlparse(redirect_uri) if redirect_uri else None
 
-    cb = urlparse(redirect_uri)
-    if cb.hostname not in ("127.0.0.1", "localhost", "::1"):
-        return None
+    server = None
+    thread = None
+    captured: Dict[str, Optional[str]] = {"code": None, "error": None}
 
-    port = cb.port or 80
-    captured = {"code": None, "error": None}
+    if cb and cb.hostname in ("127.0.0.1", "localhost", "::1"):
+        port = cb.port or 80
 
-    class CallbackHandler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            query = parse_qs(urlparse(self.path).query)
-            captured["code"] = query.get("code", [None])[0]
-            if "error" in query:
-                captured["error"] = query.get("error", [None])[0]
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            if captured["error"]:
-                self.wfile.write(
-                    b"<html><body><h1>Authentication failed</h1><p>Please close this window.</p></body></html>"
-                )
-            else:
-                self.wfile.write(
-                    b"<html><body><h1>Success!</h1><p>You can close this window and return to traktor.</p></body></html>"
-                )
+        class CallbackHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                query = parse_qs(urlparse(self.path).query)
+                captured["code"] = query.get("code", [None])[0]
+                if "error" in query:
+                    captured["error"] = query.get("error", [None])[0]
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                if captured["error"]:
+                    self.wfile.write(
+                        b"<html><body><h1>Authentication failed</h1>"
+                        b"<p>Please close this window.</p></body></html>"
+                    )
+                else:
+                    self.wfile.write(
+                        b"<html><body><h1>Success!</h1>"
+                        b"<p>You can close this window and return to traktor.</p></body></html>"
+                    )
 
-        def log_message(self, format, *args):  # noqa: A002 - match stdlib signature
-            logger.debug(f"Auth callback server: {format % args}")
+            def log_message(self, format, *args):  # noqa: A002 - match stdlib signature
+                logger.debug(f"Auth callback server: {format % args}")
 
-    try:
-        server = ThreadingHTTPServer((cb.hostname, port), CallbackHandler)
-    except OSError as e:
-        logger.warning(f"Could not start local auth callback server on port {port}: {e}")
-        return None
+        try:
+            server = ThreadingHTTPServer((cb.hostname, port), CallbackHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            print(f"   Listening for the browser redirect to {redirect_uri} ...")
+        except OSError as e:
+            logger.warning(f"Could not start local auth callback server on port {port}: {e}")
+            server = None
+    else:
+        print("   (redirect URI is not local - paste the authorization code below)")
 
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
+    print("   You can either:")
+    print("   - wait for the automatic redirect capture, or")
+    print("   - paste the code (or the full callback URL) here and press Enter")
+    print()
 
-    print(f"   Waiting for the browser to redirect to {redirect_uri} ...")
-    print("   (If it times out or the page fails to load, paste the code manually)")
-
+    code: Optional[str] = None
     deadline = time.time() + 300  # 5 minutes
-    while time.time() < deadline and not captured["code"] and not captured["error"]:
-        time.sleep(0.2)
+    while time.time() < deadline:
+        if captured["code"]:
+            code = captured["code"]
+            break
+        if captured["error"]:
+            logger.error(f"Trakt OAuth returned an error: {captured['error']}")
+            break
 
-    server.shutdown()
-    thread.join(timeout=2)
-    server.server_close()
+        # Concurrently check for pasted input (works immediately on paste)
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+        except (ValueError, OSError):
+            ready = []
+        if ready:
+            line = sys.stdin.readline()
+            if line:
+                code = _extract_auth_code(line)
+                if code:
+                    break
+                print(
+                    "   That didn't look like an authorization code - keep waiting or paste again."
+                )
 
-    if captured["error"]:
-        logger.error(f"Trakt OAuth returned an error: {captured['error']}")
-        return None
-    return captured["code"]
+    if code is None and not captured["error"]:
+        print("   Timed out waiting for the authorization code.")
+
+    if server is not None:
+        server.shutdown()
+        if thread:
+            thread.join(timeout=2)
+        server.server_close()
+
+    return code
 
 
 def authenticate_trakt(auth, force=False):
@@ -1076,16 +1136,16 @@ def authenticate_trakt(auth, force=False):
     print("1. Visit this URL in your browser:")
     print(f"   {auth_url}")
     print("\n2. Log in to Trakt and authorize the application")
+    print("3. After authorizing, either paste the code (or the full callback URL)")
+    print("   below and press Enter, or just wait a moment - if the redirect can")
+    print("   reach this machine it is captured automatically.")
+    print()
 
-    auth_code = _wait_for_auth_code_callback(auth_url)
+    auth_code = _collect_auth_code(auth_url)
 
     if auth_code is None:
-        print("3. After authorizing, your browser will try to open the callback URL")
-        print("   (http://127.0.0.1:7001/callback). The page may fail to load - that's normal.")
-        print("   Copy the authorization code from the browser's address bar")
-        print("   (the value after 'code=' in the URL) and paste it below.")
-        print()
-        auth_code = input("Authorization code: ").strip()
+        print("Authentication cancelled or timed out.")
+        return False
     logger.debug(f"Received auth code (length: {len(auth_code)})")
 
     try:
