@@ -1,6 +1,6 @@
 """Tests for utils module."""
 
-from traktor.utils import normalize_tmdb_id
+from traktor.utils import normalize_tmdb_id, parse_timestamp
 
 
 class TestNormalizeTmdbId:
@@ -67,3 +67,79 @@ class TestNormalizeTmdbId:
         """Test that False returns None (falsy check)."""
         result = normalize_tmdb_id(False)
         assert result is None
+
+
+class TestParseTimestamp:
+    """Tests for the canonical parse_timestamp function."""
+
+    def test_none_returns_none(self):
+        assert parse_timestamp(None) is None
+
+    def test_aware_datetime_converted_to_utc(self):
+        from datetime import datetime, timedelta, timezone
+
+        est = timezone(timedelta(hours=-5))
+        dt = datetime(2024, 6, 15, 12, 0, 0, tzinfo=est)
+        result = parse_timestamp(dt)
+        assert result.tzinfo == timezone.utc
+        assert result.hour == 17
+
+    def test_naive_datetime_interpreted_as_local(self):
+        from datetime import datetime, timezone
+
+        dt = datetime(2024, 6, 15, 12, 0, 0)
+        result = parse_timestamp(dt)
+        assert result.tzinfo == timezone.utc
+        assert result == dt.astimezone(timezone.utc)
+
+    def test_epoch_int(self):
+        from datetime import datetime, timezone
+
+        result = parse_timestamp(0)
+        assert result == datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    def test_epoch_float(self):
+        from datetime import datetime, timezone
+
+        result = parse_timestamp(1718467200.0)
+        assert result == datetime(2024, 6, 15, 16, 0, 0, tzinfo=timezone.utc)
+
+    def test_iso_string_with_z(self):
+        from datetime import datetime, timezone
+
+        result = parse_timestamp("2024-06-15T12:00:00Z")
+        assert result == datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+
+    def test_naive_iso_string_as_local(self):
+        from datetime import datetime, timezone
+
+        result = parse_timestamp("2024-06-15T12:00:00")
+        assert result == datetime(2024, 6, 15, 12, 0, 0).astimezone(timezone.utc)
+
+    def test_numeric_string_epoch(self):
+        from datetime import datetime, timezone
+
+        result = parse_timestamp("1718467200")
+        assert result == datetime(2024, 6, 15, 16, 0, 0, tzinfo=timezone.utc)
+
+    def test_unparseable_string_returns_none(self):
+        assert parse_timestamp("not-a-timestamp") is None
+
+    def test_invalid_type_returns_none(self):
+        assert parse_timestamp({"dict": True}) is None
+
+    def test_tz_name_interprets_naive(self):
+        from datetime import datetime, timezone
+
+        # 12:00 America/New_York (EDT, UTC-4 in June) -> 16:00 UTC
+        result = parse_timestamp(datetime(2024, 6, 15, 12, 0, 0), tz_name="America/New_York")
+        assert result.tzinfo == timezone.utc
+        assert result.hour == 16
+
+    def test_invalid_tz_name_falls_back_to_local(self):
+        from datetime import datetime, timezone
+
+        dt = datetime(2024, 6, 15, 12, 0, 0)
+        result = parse_timestamp(dt, tz_name="Invalid/Zone")
+        assert result.tzinfo == timezone.utc
+        assert result == dt.astimezone(timezone.utc)

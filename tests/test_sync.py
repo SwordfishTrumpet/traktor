@@ -1,3 +1,9 @@
+import time
+from unittest.mock import MagicMock
+
+import pytest
+import requests as _requests
+
 from traktor import sync
 
 
@@ -373,19 +379,6 @@ def test_missing_item_tracker_get_methods():
 
 def test_backward_compatible_wrappers():
     """Test that backward-compatible wrapper functions work."""
-    # Test _build_missing_item
-    item = sync._build_missing_item("List", "Movie", "Title", "2024", "tt123")
-    assert item["title"] == "Title"
-    assert item["imdb_id"] == "tt123"
-
-    # Test _extract_missing_item_details
-    trakt_item = {
-        "type": "movie",
-        "movie": {"title": "Test", "year": 2020, "ids": {"imdb": "tt456"}},
-    }
-    details = sync._extract_missing_item_details(trakt_item)
-    assert details["title"] == "Test"
-
     # Test _record_missing_result
     not_found = []
     missing_items = []
@@ -683,51 +676,6 @@ def test_save_playlist_snapshot_skips_not_found():
     assert "Missing Playlist" not in result
 
 
-def test_restore_playlist_snapshot():
-    """Test restoring playlists from snapshot."""
-    plex = FakePlexClient()
-    snapshot_data = {
-        "playlists": {
-            "Test Playlist": {
-                "items": ["123", "456"],
-                "description": "Test description",
-            }
-        }
-    }
-
-    restored = sync._restore_playlist_snapshot(plex, snapshot_data)
-
-    assert restored == 1
-
-
-def test_restore_playlist_snapshot_empty():
-    """Test restoring empty playlist snapshot."""
-    plex = FakePlexClient()
-    snapshot_data = {"playlists": {}}
-
-    restored = sync._restore_playlist_snapshot(plex, snapshot_data)
-
-    assert restored == 0
-
-
-def test_restore_playlist_snapshot_missing_item():
-    """Test restoring playlist snapshot with missing items."""
-    plex = FakePlexClient()
-    snapshot_data = {
-        "playlists": {
-            "Test Playlist": {
-                "items": ["missing_key"],
-                "description": "",
-            }
-        }
-    }
-
-    # Should not crash even if item is missing
-    restored = sync._restore_playlist_snapshot(plex, snapshot_data)
-
-    assert restored == 1
-
-
 def test_preview_changes_integration_watch_sync():
     """Test preview_changes integration with watch sync data."""
     from unittest.mock import patch
@@ -797,3 +745,712 @@ class TestAuthCodeExtraction:
         assert sync._extract_auth_code("   ") is None
         assert sync._extract_auth_code("http://x/?error=access_denied") is None
         assert sync._extract_auth_code("http://127.0.0.1:7001/callback?state=x") is None
+
+
+class TestSyncListsOrchestration:
+    """End-to-end tests for sync_lists() orchestration (TODO audit D1)."""
+
+    @staticmethod
+    def _args(monkeypatch, argv=None):
+        import sys
+
+        from traktor import cli
+
+        monkeypatch.setattr(sys, "argv", ["traktor", *(argv or [])])
+        return cli.parse_args()
+
+    def _setup(self, monkeypatch, tmp_path, trakt_authed=True):
+        """Install all module-level mocks sync_lists depends on."""
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(sync, "TRAKT_CLIENT_ID", "client-id")
+        monkeypatch.setattr(sync, "TRAKT_CLIENT_SECRET", "client-secret")
+        monkeypatch.setattr(sync, "TRAKTOR_LIST_SOURCE", "official")
+        monkeypatch.setattr(sync, "TRAKTOR_OFFICIAL_LISTS_ENABLED", True)
+        monkeypatch.setattr(sync, "LOG_FILE", tmp_path / "logs" / "traktor.log")
+        monkeypatch.setattr(sync, "SYNC_PROGRESS_FILE", tmp_path / "sync_progress.json")
+
+        monkeypatch.setattr(
+            sync.integrity_checker,
+            "run_all_checks",
+            lambda: {"overall_healthy": True, "checks": {}},
+        )
+        monkeypatch.setattr(sync, "load_config", lambda: {})
+        monkeypatch.setattr(
+            sync, "get_plex_credentials", lambda args=None: ("http://plex:32400", "tok")
+        )
+        monkeypatch.setattr(sync, "write_missing_report", lambda *a, **k: None)
+        monkeypatch.setattr(sync, "_check_memory", lambda *a, **k: None)
+        monkeypatch.setattr(sync, "_print_summary", lambda *a, **k: None)
+        monkeypatch.setattr(sync, "_save_playlist_snapshot", lambda *a, **k: {})
+        monkeypatch.setattr(sync, "authenticate_trakt", lambda auth, force=False: trakt_authed)
+
+        server = MagicMock()
+        server.machineIdentifier = "server-abc"
+        cache_mgr = MagicMock()
+        cache_mgr.load_cache.return_value = True
+
+        plex_client = MagicMock()
+        plex_client.cleanup_orphaned_playlists.return_value = []
+
+        trakt_client = MagicMock()
+        trakt_client.get_liked_lists.return_value = []
+        trakt_client.get_watched_movies.return_value = []
+        trakt_client.get_watched_shows.return_value = []
+
+        monkeypatch.setattr(sync, "PlexServer", lambda *a, **k: server)
+        monkeypatch.setattr(sync, "CacheManager", lambda *a, **k: cache_mgr)
+        monkeypatch.setattr(sync, "PlexClient", lambda *a, **k: plex_client)
+        monkeypatch.setattr(sync, "TraktClient", lambda *a, **k: trakt_client)
+        monkeypatch.setattr(sync, "SyncProgress", lambda *a, **k: MagicMock())
+
+        return {
+            "server": server,
+            "cache_mgr": cache_mgr,
+            "plex_client": plex_client,
+            "trakt_client": trakt_client,
+        }
+
+    def test_official_only_success(self, monkeypatch, tmp_path):
+        """Default official-lists sync completes with exit code 0."""
+        self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: [])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        result = sync.sync_lists(args)
+
+        assert result == 0
+
+    def test_missing_trakt_credentials_exits(self, monkeypatch, tmp_path):
+        """Missing Trakt credentials abort with exit code 1."""
+        self._setup(monkeypatch, tmp_path)
+        monkeypatch.setattr(sync, "TRAKT_CLIENT_ID", None)
+
+        with pytest.raises(SystemExit) as exc_info:
+            sync.sync_lists(self._args(monkeypatch))
+        assert exc_info.value.code == 1
+
+    def test_auth_failure_exits(self, monkeypatch, tmp_path):
+        """Authentication failure aborts with exit code 1."""
+        self._setup(monkeypatch, tmp_path, trakt_authed=False)
+        args = self._args(monkeypatch, ["--sync-watched"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: True)
+
+        with pytest.raises(SystemExit) as exc_info:
+            sync.sync_lists(args)
+        assert exc_info.value.code == 1
+
+    def test_plex_connection_failure_exits(self, monkeypatch, tmp_path):
+        """Plex connection failure aborts with exit code 1."""
+        self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch)
+
+        def raise_plex(*a, **k):
+            raise ConnectionError("plex down")
+
+        monkeypatch.setattr(sync, "PlexServer", raise_plex)
+
+        with pytest.raises(SystemExit) as exc_info:
+            sync.sync_lists(args)
+        assert exc_info.value.code == 1
+
+    def test_liked_lists_processed(self, monkeypatch, tmp_path):
+        """Liked lists flow: auth + process_list_parallel."""
+        mocks = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "liked"])
+
+        mocks["trakt_client"].get_liked_lists.return_value = [
+            {
+                "list": {"name": "My List", "user": {"username": "me"}, "ids": {"trakt": "123"}},
+            }
+        ]
+        monkeypatch.setattr(
+            sync,
+            "process_list_parallel",
+            lambda *a, **k: {"success": True, "matched": 3, "not_found": 1, "warning": ""},
+        )
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+
+        result = sync.sync_lists(args)
+
+        assert result == 0
+        # process_list_parallel is mocked, but the orchestration should have
+        # fetched liked lists and passed them through
+        mocks["trakt_client"].get_liked_lists.assert_called_once()
+
+    def test_watch_only_mode(self, monkeypatch, tmp_path):
+        """--sync-watched-only skips lists and runs the watch engine."""
+        mocks = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--sync-watched-only"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: True)
+
+        engine = MagicMock()
+        engine.sync_watched_status.return_value = {
+            "plex_watched": 1,
+            "plex_unwatched": 0,
+            "trakt_watched": 0,
+            "trakt_unwatched": 0,
+            "errors": 0,
+            "changes": [],
+        }
+        monkeypatch.setattr(sync, "WatchHistoryManager", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(sync, "ConflictResolver", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(sync, "WatchSyncEngine", lambda *a, **k: engine)
+
+        result = sync.sync_lists(args)
+
+        assert result == 0
+        engine.sync_watched_status.assert_called_once()
+        # Watch-only mode must skip orphaned playlist cleanup
+        mocks["plex_client"].cleanup_orphaned_playlists.assert_not_called()
+        # And must skip liked lists
+        mocks["trakt_client"].get_liked_lists.assert_not_called()
+
+    def test_interactive_orphaned_cleanup_confirmed(self, monkeypatch, tmp_path):
+        """Interactive mode previews orphaned cleanup and deletes on confirm."""
+        mocks = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--interactive", "--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+
+        monkeypatch.setattr(sync, "preview_changes", lambda *a, **k: True)
+
+        mocks["plex_client"].cleanup_orphaned_playlists.side_effect = [
+            [{"name": "Old Playlist"}],  # dry_run preview
+            ["Old Playlist"],  # actual deletion
+        ]
+
+        result = sync.sync_lists(args)
+
+        assert result == 0
+        # cleanup called twice: preview (dry_run=True) then real
+        assert mocks["plex_client"].cleanup_orphaned_playlists.call_count == 2
+
+    def test_watch_sync_skipped_without_auth(self, monkeypatch, tmp_path):
+        """--sync-watched without auth prints a warning and continues."""
+        self._setup(monkeypatch, tmp_path, trakt_authed=False)
+        args = self._args(monkeypatch, ["--sync-watched"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: True)
+        monkeypatch.setattr(sync, "authenticate_trakt", lambda auth, force=False: False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            sync.sync_lists(args)
+        assert exc_info.value.code == 1
+
+
+class TestCollectAuthCode:
+    """Tests for the OAuth callback/paste auth-code collector (TODO audit D1)."""
+
+    class _AdvancingTime:
+        def __init__(self, start=1000.0, step=1.0):
+            self.value = start
+            self.step = step
+
+        def time(self):
+            v = self.value
+            self.value += self.step
+            return v
+
+    def test_non_localhost_redirect_times_out(self, monkeypatch, capsys):
+        """Non-localhost redirect URI: no callback server, times out -> None."""
+        monkeypatch.setattr(sync, "time", self._AdvancingTime(step=100))
+        auth_url = "https://trakt.tv/oauth/authorize" "?redirect_uri=https%3A%2F%2Fexample.com%2Fcb"
+
+        result = sync._collect_auth_code(auth_url)
+
+        assert result is None
+        assert "paste the authorization code below" in capsys.readouterr().out
+
+    def test_port_bind_failure_times_out(self, monkeypatch):
+        """Localhost redirect but port bind fails: no server, times out -> None."""
+        monkeypatch.setattr(sync, "time", self._AdvancingTime(step=100))
+
+        def raise_oserror(*args, **kwargs):
+            raise OSError("port in use")
+
+        monkeypatch.setattr(sync, "ThreadingHTTPServer", raise_oserror)
+        auth_url = (
+            "https://trakt.tv/oauth/authorize" "?redirect_uri=http%3A%2F%2F127.0.0.1%3A32451%2Fcb"
+        )
+
+        result = sync._collect_auth_code(auth_url)
+
+        assert result is None
+
+    def test_code_capture_via_callback(self, monkeypatch):
+        """Browser redirect with a code is captured by the local listener."""
+        import threading
+
+        port = 47123
+        auth_url = (
+            "https://trakt.tv/oauth/authorize" f"?redirect_uri=http%3A%2F%2F127.0.0.1%3A{port}%2Fcb"
+        )
+        result_box: dict = {}
+        thread = threading.Thread(
+            target=lambda: result_box.setdefault("code", sync._collect_auth_code(auth_url)),
+            daemon=True,
+        )
+        thread.start()
+
+        deadline = time.time() + 5
+        delivered = False
+        while time.time() < deadline:
+            try:
+                resp = _requests.get(f"http://127.0.0.1:{port}/cb?code=abc123", timeout=1)
+                if resp.status_code == 200:
+                    delivered = True
+                    break
+            except _requests.exceptions.RequestException:
+                time.sleep(0.1)
+
+        thread.join(timeout=10)
+
+        assert delivered is True
+        assert result_box.get("code") == "abc123"
+
+    def test_error_query_param_returns_none(self, monkeypatch):
+        """Browser redirect carrying an error param is treated as failure."""
+        import threading
+
+        port = 47124
+        auth_url = (
+            "https://trakt.tv/oauth/authorize" f"?redirect_uri=http%3A%2F%2F127.0.0.1%3A{port}%2Fcb"
+        )
+        result_box: dict = {}
+        thread = threading.Thread(
+            target=lambda: result_box.setdefault("code", sync._collect_auth_code(auth_url)),
+            daemon=True,
+        )
+        thread.start()
+
+        deadline = time.time() + 5
+        delivered = False
+        while time.time() < deadline:
+            try:
+                resp = _requests.get(f"http://127.0.0.1:{port}/cb?error=access_denied", timeout=1)
+                if resp.status_code == 200:
+                    delivered = True
+                    break
+            except _requests.exceptions.RequestException:
+                time.sleep(0.1)
+
+        thread.join(timeout=10)
+
+        assert delivered is True
+        assert result_box.get("code") is None
+
+
+class TestProcessItemErrorPaths:
+    """Coverage for process_item_parallel error branches (TODO audit D1)."""
+
+    def test_show_not_found_reports_missing(self):
+        plex = FakePlex({})
+        result = sync.process_item_parallel(
+            0,
+            {"type": "show", "show": {"title": "Missing Show", "ids": {"imdb": "tt000"}}},
+            plex,
+        )
+        assert result["success"] is False
+        assert result["reason"] == "Show not found in Plex library"
+
+    def test_movie_not_found_reports_missing(self):
+        plex = FakePlex({})
+        result = sync.process_item_parallel(
+            0,
+            {"type": "movie", "movie": {"title": "Missing Movie", "ids": {"imdb": "tt000"}}},
+            plex,
+        )
+        assert result["success"] is False
+        assert result["reason"] == "Movie not found in Plex library"
+
+    def test_show_no_seasons(self):
+        plex = FakePlex({("show", "tt001", None): FakeShow([])})
+        result = sync.process_item_parallel(
+            0,
+            {"type": "show", "show": {"title": "No Seasons", "ids": {"imdb": "tt001"}}},
+            plex,
+        )
+        assert result["success"] is False
+        assert result["reason"] == "No seasons found in Plex"
+
+    def test_show_not_found_in_plex_seasons(self):
+        """NotFound raised while accessing show data."""
+        from plexapi.exceptions import NotFound
+
+        class RaisingShow:
+            def seasons(self):
+                raise NotFound("gone")
+
+        plex = FakePlex({("show", "tt002", None): RaisingShow()})
+        result = sync.process_item_parallel(
+            0,
+            {"type": "show", "show": {"title": "Gone Show", "ids": {"imdb": "tt002"}}},
+            plex,
+        )
+        assert result["success"] is False
+        assert result["reason"] == "Show data not accessible in Plex"
+
+    def test_show_attribute_error_accessing_data(self):
+        class BrokenSeason:
+            pass
+
+        class BrokenShow:
+            def seasons(self):
+                return [BrokenSeason()]
+
+        plex = FakePlex({("show", "tt003", None): BrokenShow()})
+        result = sync.process_item_parallel(
+            0,
+            {"type": "show", "show": {"title": "Broken Show", "ids": {"imdb": "tt003"}}},
+            plex,
+        )
+        assert result["success"] is False
+        assert result["reason"].startswith("Error accessing show data:")
+
+
+class TestProcessListParallel:
+    """Coverage for process_list_parallel orchestration (TODO audit D1)."""
+
+    def test_worker_exception_recorded(self, tmp_path, monkeypatch):
+        """Exceptions from worker futures are recorded via _record_worker_exception."""
+        from unittest.mock import patch
+
+        plex = MagicMock()
+        trakt = MagicMock()
+        stats = {
+            "items_total": 0,
+            "items_matched": 0,
+            "items_not_found": 0,
+            "playlists_updated": 0,
+            "lists_failed": 0,
+        }
+        missing_items = []
+
+        items = [
+            {"type": "movie", "movie": {"title": "A", "ids": {"imdb": "tt1"}}},
+            {"type": "movie", "movie": {"title": "B", "ids": {"imdb": "tt2"}}},
+        ]
+        trakt.get_list_items.return_value = items
+
+        def boom(idx, item, plex):
+            if idx == 0:
+                raise RuntimeError("worker exploded")
+            return {"success": True, "idx": idx, "item": object()}
+
+        with patch.object(sync, "process_item_parallel", side_effect=boom):
+            sync.process_list_parallel(
+                {"list": {"name": "L", "user": {"username": "u"}, "ids": {"trakt": 1}}},
+                plex,
+                trakt,
+                2,
+                stats,
+                set(),
+                missing_items,
+            )
+
+        assert stats["items_matched"] == 1
+        assert len(missing_items) == 1
+        assert "worker exploded" in missing_items[0]["reason"]
+
+
+class TestSyncListsFeatureSections:
+    """Coverage for official/collection/watchlist sections of sync_lists (TODO audit D1)."""
+
+    @staticmethod
+    def _args(monkeypatch, argv=None):
+        import sys
+
+        from traktor import cli
+
+        monkeypatch.setattr(sys, "argv", ["traktor", *(argv or [])])
+        return cli.parse_args()
+
+    def _setup(self, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(sync, "TRAKT_CLIENT_ID", "client-id")
+        monkeypatch.setattr(sync, "TRAKT_CLIENT_SECRET", "client-secret")
+        monkeypatch.setattr(sync, "TRAKTOR_LIST_SOURCE", "official")
+        monkeypatch.setattr(sync, "LOG_FILE", tmp_path / "logs" / "traktor.log")
+        monkeypatch.setattr(sync, "SYNC_PROGRESS_FILE", tmp_path / "sync_progress.json")
+        monkeypatch.setattr(
+            sync.integrity_checker,
+            "run_all_checks",
+            lambda: {"overall_healthy": True, "checks": {}},
+        )
+        monkeypatch.setattr(sync, "load_config", lambda: {})
+        monkeypatch.setattr(
+            sync, "get_plex_credentials", lambda args=None: ("http://plex:32400", "tok")
+        )
+        monkeypatch.setattr(sync, "write_missing_report", lambda *a, **k: None)
+        monkeypatch.setattr(sync, "_check_memory", lambda *a, **k: None)
+        monkeypatch.setattr(sync, "_print_summary", lambda *a, **k: None)
+        monkeypatch.setattr(sync, "_save_playlist_snapshot", lambda *a, **k: {})
+        monkeypatch.setattr(sync, "authenticate_trakt", lambda auth, force=False: True)
+
+        server = MagicMock()
+        server.machineIdentifier = "server-abc"
+        cache_mgr = MagicMock()
+        cache_mgr.load_cache.return_value = True
+        plex_client = MagicMock()
+        plex_client.cleanup_orphaned_playlists.return_value = []
+        trakt_client = MagicMock()
+        trakt_client.get_liked_lists.return_value = []
+
+        monkeypatch.setattr(sync, "PlexServer", lambda *a, **k: server)
+        monkeypatch.setattr(sync, "CacheManager", lambda *a, **k: cache_mgr)
+        monkeypatch.setattr(sync, "PlexClient", lambda *a, **k: plex_client)
+        monkeypatch.setattr(sync, "TraktClient", lambda *a, **k: trakt_client)
+        monkeypatch.setattr(sync, "SyncProgress", lambda *a, **k: MagicMock())
+
+        return {
+            "server": server,
+            "cache_mgr": cache_mgr,
+            "plex_client": plex_client,
+            "trakt_client": trakt_client,
+        }
+
+    def test_official_playlists_processed(self, monkeypatch, tmp_path):
+        """Official playlist processing loop runs and counts results."""
+        self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.trending"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        official_service = MagicMock()
+        official_service.get_playlists_from_endpoints.return_value = [{"name": "Trending Movies"}]
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+        monkeypatch.setattr(
+            sync,
+            "process_official_list_parallel",
+            lambda *a, **k: {
+                "success": True,
+                "list_name": "Trending Movies",
+                "matched": 4,
+                "warning": "",
+            },
+        )
+
+        result = sync.sync_lists(args)
+
+        assert result == 0
+        official_service.get_playlists_from_endpoints.assert_called_once()
+
+    def test_official_playlists_none(self, monkeypatch, tmp_path):
+        """No official playlists -> graceful message, exit 0."""
+        self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: [])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        official_service = MagicMock()
+        official_service.get_playlists_from_endpoints.return_value = []
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+
+        result = sync.sync_lists(args)
+
+        assert result == 0
+
+    def test_collection_sync(self, monkeypatch, tmp_path):
+        """--sync-collection runs process_collection_sync."""
+        self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--sync-collection", "--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: True)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+        process_collection = MagicMock(return_value=[{"success": True}])
+        monkeypatch.setattr(sync, "process_collection_sync", process_collection)
+
+        result = sync.sync_lists(args)
+
+        assert result == 0
+        process_collection.assert_called_once()
+
+    def test_watchlist_sync(self, monkeypatch, tmp_path):
+        """--sync-watchlist runs process_watchlist_sync."""
+        self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--sync-watchlist", "--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: True)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+        process_watchlist = MagicMock(return_value=[{"success": True}])
+        monkeypatch.setattr(sync, "process_watchlist_sync", process_watchlist)
+
+        result = sync.sync_lists(args)
+
+        assert result == 0
+        process_watchlist.assert_called_once()
+
+    def test_no_liked_lists_early_exit(self, monkeypatch, tmp_path):
+        """No liked lists + no official lists -> early return 0."""
+        mocks = self._setup(monkeypatch, tmp_path)
+        monkeypatch.setattr(sync, "TRAKTOR_LIST_SOURCE", "liked")
+        args = self._args(monkeypatch, ["--list-source", "liked"])
+
+        mocks["trakt_client"].get_liked_lists.return_value = []
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: True)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+
+        result = sync.sync_lists(args)
+
+        assert result == 0
+
+    def test_liked_list_fetch_failure_continues(self, monkeypatch, tmp_path):
+        """Trakt liked-list fetch failure degrades gracefully."""
+        mocks = self._setup(monkeypatch, tmp_path)
+        monkeypatch.setattr(sync, "TRAKTOR_LIST_SOURCE", "liked")
+        args = self._args(monkeypatch, ["--list-source", "liked"])
+
+        mocks["trakt_client"].get_liked_lists.side_effect = Exception("trakt down")
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: True)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+
+        result = sync.sync_lists(args)
+
+        assert result == 0
+
+
+class TestProcessOfficialList:
+    """Coverage for process_official_list_parallel (TODO audit D1)."""
+
+    def test_empty_playlist_cleared(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock
+
+        plex = MagicMock()
+        stats = {
+            "items_total": 0,
+            "items_matched": 0,
+            "items_not_found": 0,
+            "playlists_updated": 0,
+        }
+
+        result = sync.process_official_list_parallel(
+            {"name": "Empty", "items": [], "description": ""},
+            plex,
+            2,
+            stats,
+            set(),
+            [],
+        )
+
+        assert result["success"] is True
+        assert result["matched"] == 0
+        plex.create_or_update_playlist.assert_called_once()
+
+    def test_matched_items(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock, patch
+
+        plex = MagicMock()
+        stats = {
+            "items_total": 0,
+            "items_matched": 0,
+            "items_not_found": 0,
+            "playlists_updated": 0,
+        }
+
+        with patch.object(sync, "_collect_plex_items", return_value=[object()]):
+            result = sync.process_official_list_parallel(
+                {"name": "Trending", "items": [{"item": 1}], "description": ""},
+                plex,
+                2,
+                stats,
+                set(),
+                [],
+            )
+
+        assert result["success"] is True
+        assert result["matched"] == 1
+        assert stats["playlists_updated"] == 1
+
+    def test_no_matches_warning(self, tmp_path, monkeypatch):
+        from unittest.mock import MagicMock, patch
+
+        plex = MagicMock()
+        stats = {
+            "items_total": 0,
+            "items_matched": 0,
+            "items_not_found": 0,
+            "playlists_updated": 0,
+        }
+
+        with patch.object(sync, "_collect_plex_items", return_value=[]):
+            result = sync.process_official_list_parallel(
+                {"name": "Empty Matches", "items": [{"item": 1}], "description": ""},
+                plex,
+                2,
+                stats,
+                set(),
+                [],
+            )
+
+        assert result["success"] is True
+        assert result["warning"] == "no_matches"
+
+
+class TestPrintSummary:
+    """Coverage for _print_summary including the performance report branch."""
+
+    def test_summary_with_performance_report(self, monkeypatch, capsys):
+        from traktor.performance import PerformanceMonitor
+
+        monitor = PerformanceMonitor()
+        monitor.record_api_call("movies/popular", 0.5)
+        monkeypatch.setattr(sync, "performance_monitor", monitor)
+
+        stats = {
+            "lists_found": 1,
+            "lists_processed": 1,
+            "official_playlists_found": 0,
+            "official_playlists_processed": 0,
+            "lists_failed": 0,
+            "items_total": 5,
+            "items_matched": 4,
+            "items_not_found": 1,
+            "playlists_updated": 1,
+            "playlists_deleted": 0,
+        }
+
+        sync._print_summary(stats, 1.5, show_performance=True)
+
+        out = capsys.readouterr().out
+        assert "Sync complete!" in out
+        assert "movies/popular" in out
+
+    def test_summary_bottlenecks_flagged(self, monkeypatch, capsys):
+        from traktor.performance import PerformanceMonitor
+
+        monitor = PerformanceMonitor()
+        monitor.record_api_call("slow/endpoint", 2.0)
+        monkeypatch.setattr(sync, "performance_monitor", monitor)
+
+        stats = {
+            "lists_found": 0,
+            "lists_processed": 0,
+            "official_playlists_found": 0,
+            "official_playlists_processed": 0,
+            "lists_failed": 0,
+            "items_total": 0,
+            "items_matched": 0,
+            "items_not_found": 0,
+            "playlists_updated": 0,
+            "playlists_deleted": 0,
+        }
+
+        sync._print_summary(stats, 0.1, show_performance=True)
+
+        out = capsys.readouterr().out
+        assert "Bottlenecks" in out

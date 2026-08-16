@@ -4,6 +4,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from traktor import clients
 
@@ -175,6 +176,51 @@ class TestCacheManagerFinders:
         assert result is not None
         assert result["title"] == "Test Show"
 
+    def test_movie_key_to_ids_builds_both_indexes(self, populated_cache_manager):
+        """Test reverse map combines IMDb and TMDb indexes per rating key."""
+        result = populated_cache_manager.movie_key_to_ids
+
+        assert result == {"1": ("tt1234567", "987654")}
+        # Property is cached - same object on second access
+        assert populated_cache_manager.movie_key_to_ids is result
+
+    def test_show_key_to_imdb(self, populated_cache_manager):
+        """Test reverse map from show rating key to IMDb ID."""
+        assert populated_cache_manager.show_key_to_imdb == {"2": "tt7654321"}
+
+    def test_movie_imdb_to_rating_key(self, populated_cache_manager):
+        """Test reverse map from movie IMDb ID to rating key."""
+        assert populated_cache_manager.movie_imdb_to_rating_key == {"tt1234567": "1"}
+
+    def test_reverse_indexes_invalidated_on_add(self, tmp_path, monkeypatch):
+        """Test that adding an item invalidates the lazily-built reverse maps."""
+        mock_server = MagicMock()
+        monkeypatch.setattr(clients, "CACHE_DIR", tmp_path / ".traktor_cache")
+        cm = clients.CacheManager(mock_server)
+        cm.memory_cache = {
+            "movies_by_imdb": {},
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+            "shows_by_tmdb": {},
+            "movies_list": [],
+            "shows_list": [],
+            "by_rating_key": {},
+        }
+        assert cm.movie_key_to_ids == {}
+
+        item = MagicMock()
+        item.ratingKey = 42
+        item.title = "New Movie"
+        item.year = 2024
+        item.guid = "com.plexapp.agents.imdb://tt999?lang=en"
+        item.guids = []
+        item.lastViewedAt = None
+        item.isWatched = False
+
+        cm._add_item_to_cache(item, "movie")
+
+        assert cm.movie_key_to_ids == {42: ("tt999", None)}
+
 
 class TestTraktAuth:
     """Tests for TraktAuth class."""
@@ -334,6 +380,49 @@ class TestTraktClient:
 
         # Token refresh should have been called
         mock_auth.refresh_access_token.assert_called_once()
+
+    def test_post_token_refresh_on_401(self, trakt_client, mock_auth):
+        """Test that POST requests also refresh the token on 401.
+
+        Regression: the POST path previously caught HTTPError which
+        ``_request_with_retry`` never raises for 401s, so POST history
+        operations never triggered a token refresh. The shared
+        ``_execute_with_token_refresh`` helper now handles both methods.
+        """
+        mock_response_401 = MagicMock()
+        mock_response_401.status_code = 401
+
+        mock_response_200 = MagicMock()
+        mock_response_200.status_code = 200
+        mock_response_200.json.return_value = {"added": {"movies": 0, "episodes": 0}}
+        mock_response_200.content = b"{}"
+
+        mock_auth.refresh_access_token.return_value = True
+
+        with patch.object(
+            trakt_client._session, "post", side_effect=[mock_response_401, mock_response_200]
+        ):
+            response = trakt_client._post_with_token_refresh(
+                "https://api.trakt.tv/sync/history", {"movies": []}
+            )
+
+        mock_auth.refresh_access_token.assert_called_once()
+        assert response.status_code == 200
+
+    def test_post_token_refresh_failure_raises(self, trakt_client, mock_auth):
+        """Test that POST raises a clear error when token refresh fails."""
+        mock_response_401 = MagicMock()
+        mock_response_401.status_code = 401
+
+        mock_auth.refresh_access_token.return_value = False
+
+        with patch.object(trakt_client._session, "post", return_value=mock_response_401):
+            with pytest.raises(requests.exceptions.RequestException) as exc_info:
+                trakt_client._post_with_token_refresh(
+                    "https://api.trakt.tv/sync/history", {"movies": []}
+                )
+
+        assert "--force-auth" in str(exc_info.value)
 
     def test_get_watched_movies(self, trakt_client, mock_auth):
         """Test get_watched_movies method exists and can be mocked."""
@@ -541,17 +630,6 @@ class TestPlexClient:
 
         assert is_watched is False
         assert last_viewed is None
-
-    def test_get_play_history(self, plex_client):
-        """Test getting play history."""
-        mock_section = MagicMock()
-        mock_section.type = "movie"
-        mock_section.history.return_value = [MagicMock(), MagicMock()]
-        plex_client.server.library.sections.return_value = [mock_section]
-
-        result = plex_client.get_play_history()
-
-        assert len(result) == 2
 
     def test_create_or_update_playlist_sorts_items(self, plex_client):
         """Test that create_or_update_playlist sorts items with movies first."""
@@ -1223,3 +1301,440 @@ class TestTraktAuthRefresh:
         assert result is False
         assert auth.access_token is None
         assert auth.refresh_token is None
+
+
+class TestTraktClientPagination:
+    """Coverage for the shared _paginated_get helper (TODO audit D3/B2)."""
+
+    @pytest.fixture
+    def mock_auth(self):
+        auth = MagicMock()
+        auth.get_headers.return_value = {"Authorization": "Bearer test"}
+        return auth
+
+    def _response(self, data, page_count=None):
+        r = MagicMock()
+        r.status_code = 200
+        r.json.return_value = data
+        headers = {}
+        if page_count is not None:
+            headers["X-Pagination-Page-Count"] = str(page_count)
+        r.headers = headers
+        r.content = b"[]"
+        return r
+
+    def test_single_page(self, mock_auth):
+        """Short page -> stop after one request."""
+        client = clients.TraktClient(mock_auth)
+        data = [{"movie": {"title": "A"}}]
+        with patch.object(client._session, "get", return_value=self._response(data)):
+            result = client.get_watched_movies()
+        assert len(result) == 1
+
+    def test_multiple_pages(self, mock_auth):
+        """Page-count header drives pagination across pages."""
+        client = clients.TraktClient(mock_auth)
+        page1 = [{"movie": {"title": f"M{i}"}} for i in range(100)]
+        page2 = [{"movie": {"title": "M100"}}]
+        with patch.object(
+            client._session,
+            "get",
+            side_effect=[self._response(page1, page_count=2), self._response(page2, page_count=2)],
+        ):
+            result = client.get_watched_movies()
+        assert len(result) == 101
+
+    def test_page_count_header_respected(self, mock_auth):
+        """Even with full pages, the page-count header stops pagination."""
+        client = clients.TraktClient(mock_auth)
+        page1 = [{"movie": {"title": f"M{i}"}} for i in range(100)]
+        with patch.object(client._session, "get", return_value=self._response(page1, page_count=1)):
+            result = client.get_watched_movies()
+        assert len(result) == 100
+
+    def test_bad_page_count_header_falls_back(self, mock_auth):
+        """Non-integer page-count header falls back to short-page detection."""
+        client = clients.TraktClient(mock_auth)
+        data = [{"movie": {"title": "A"}}]
+        r = self._response(data)
+        r.headers = {"X-Pagination-Page-Count": "not-a-number"}
+        with patch.object(client._session, "get", return_value=r):
+            result = client.get_watched_movies()
+        assert len(result) == 1
+
+    def test_list_items_uses_helper(self, mock_auth):
+        """get_list_items paginates through the shared helper."""
+        client = clients.TraktClient(mock_auth)
+        data = [{"type": "movie", "movie": {"title": "A", "ids": {}}}]
+        with patch.object(client._session, "get", return_value=self._response(data)):
+            result = client.get_list_items("user", "list-id")
+        assert len(result) == 1
+
+
+class TestPlexClientBatchOps:
+    """Coverage for PlexClient batch operations (TODO audit D3)."""
+
+    @pytest.fixture
+    def plex_client(self):
+        server = MagicMock()
+        cache = MagicMock()
+        cache.memory_cache = {}
+        return clients.PlexClient(server, cache)
+
+    def test_batch_mark_watched_partial_failure(self, plex_client):
+        """Failures in mark_as_watched are aggregated."""
+        plex_client.mark_as_watched = MagicMock(side_effect=[True, False, Exception("boom")])
+
+        results = plex_client.batch_mark_as_watched([1, 2, 3])
+
+        assert results["success"] == 1
+        assert results["failed"] == 2
+        assert len(results["errors"]) == 2
+
+    def test_batch_mark_unwatched_partial_failure(self, plex_client):
+        """Failures in mark_as_unwatched are aggregated."""
+        plex_client.mark_as_unwatched = MagicMock(side_effect=[True, False])
+
+        results = plex_client.batch_mark_as_unwatched([1, 2])
+
+        assert results["success"] == 1
+        assert results["failed"] == 1
+
+    def test_batch_set_playback_progress_partial(self, plex_client):
+        """Partial failures in batch_set_playback_progress are aggregated."""
+        plex_client.set_playback_progress = MagicMock(side_effect=[True, False, Exception("x")])
+
+        results = plex_client.batch_set_playback_progress(
+            [
+                {"rating_key": 1, "view_offset_ms": 100},
+                {"rating_key": 2, "view_offset_ms": 200},
+                {"rating_key": 3, "view_offset_ms": 300},
+            ]
+        )
+
+        assert results["success"] == 1
+        assert results["failed"] == 2
+        assert len(results["errors"]) == 2
+
+
+class TestTraktAuthRefreshPaths:
+    """Coverage for refresh_access_token paths (TODO audit D3)."""
+
+    def test_no_refresh_token_returns_false(self, monkeypatch):
+        """Missing refresh token -> False."""
+        monkeypatch.setattr(clients, "TRAKT_ACCESS_TOKEN", None)
+        monkeypatch.setattr(clients, "TRAKT_REFRESH_TOKEN", None)
+        auth = clients.TraktAuth()
+        auth.refresh_token = None
+
+        assert auth.refresh_access_token() is False
+
+    def test_refresh_success(self, monkeypatch, tmp_path):
+        """Successful refresh updates tokens and returns True."""
+        monkeypatch.setattr(clients, "TRAKT_ACCESS_TOKEN", None)
+        monkeypatch.setattr(clients, "TRAKT_REFRESH_TOKEN", None)
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_ID", "cid")
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_SECRET", "csec")
+        monkeypatch.setattr(clients, "TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("TRAKT_ACCESS_TOKEN=old\nTRAKT_REFRESH_TOKEN=old\n")
+
+        auth = clients.TraktAuth()
+        auth.refresh_token = "valid-refresh"
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "access_token": "a" * 32,
+            "refresh_token": "b" * 32,
+        }
+
+        with patch.object(clients.requests.Session, "post", return_value=mock_response):
+            result = auth.refresh_access_token()
+
+        assert result is True
+        assert auth.access_token == "a" * 32
+
+    def test_refresh_400_clears_tokens(self, monkeypatch):
+        """HTTP 400 clears stored tokens to force re-auth."""
+        monkeypatch.setattr(clients, "TRAKT_ACCESS_TOKEN", None)
+        monkeypatch.setattr(clients, "TRAKT_REFRESH_TOKEN", None)
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_ID", "cid")
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_SECRET", "csec")
+        monkeypatch.setattr(clients, "TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")
+
+        auth = clients.TraktAuth()
+        auth.access_token = "old-access"
+        auth.refresh_token = "expired-refresh"
+
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+
+        with patch.object(clients.requests.Session, "post", return_value=mock_response):
+            result = auth.refresh_access_token()
+
+        assert result is False
+        assert auth.access_token is None
+        assert auth.refresh_token is None
+
+    def test_refresh_other_status_returns_false(self, monkeypatch):
+        """Other non-200/400 status returns False without clearing tokens."""
+        monkeypatch.setattr(clients, "TRAKT_ACCESS_TOKEN", None)
+        monkeypatch.setattr(clients, "TRAKT_REFRESH_TOKEN", None)
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_ID", "cid")
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_SECRET", "csec")
+        monkeypatch.setattr(clients, "TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")
+
+        auth = clients.TraktAuth()
+        auth.access_token = "old-access"
+        auth.refresh_token = "refresh"
+
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+
+        with patch.object(clients.requests.Session, "post", return_value=mock_response):
+            result = auth.refresh_access_token()
+
+        assert result is False
+        assert auth.access_token == "old-access"
+
+    def test_refresh_request_exception(self, monkeypatch):
+        """Network error during refresh returns False."""
+        monkeypatch.setattr(clients, "TRAKT_ACCESS_TOKEN", None)
+        monkeypatch.setattr(clients, "TRAKT_REFRESH_TOKEN", None)
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_ID", "cid")
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_SECRET", "csec")
+        monkeypatch.setattr(clients, "TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")
+
+        auth = clients.TraktAuth()
+        auth.refresh_token = "refresh"
+
+        with patch.object(
+            clients.requests.Session,
+            "post",
+            side_effect=clients.requests.exceptions.ConnectionError("down"),
+        ):
+            result = auth.refresh_access_token()
+
+        assert result is False
+
+
+class TestTraktClientCollectionAndWatchlist:
+    """Coverage for collection/watchlist fetching (TODO audit D3)."""
+
+    @pytest.fixture
+    def mock_auth(self):
+        auth = MagicMock()
+        auth.get_headers.return_value = {"Authorization": "Bearer test"}
+        return auth
+
+    def test_get_collection_movies(self, mock_auth):
+        client = clients.TraktClient(mock_auth)
+        data = [
+            {
+                "movie": {
+                    "title": "Heat",
+                    "year": 1995,
+                    "ids": {"imdb": "tt0113277", "tmdb": 949},
+                }
+            }
+        ]
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = data
+
+        with patch.object(client._session, "get", return_value=mock_response):
+            result = client.get_collection("movies")
+
+        assert len(result) == 1
+        assert result[0]["type"] == "movie"
+
+    def test_get_collection_invalid_type(self, mock_auth):
+        client = clients.TraktClient(mock_auth)
+        with pytest.raises(ValueError):
+            client.get_collection("podcasts")
+
+    def test_get_collection_shows(self, mock_auth):
+        client = clients.TraktClient(mock_auth)
+        data = [
+            {
+                "show": {
+                    "title": "Breaking Bad",
+                    "year": 2008,
+                    "ids": {"imdb": "tt0903747"},
+                }
+            }
+        ]
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = data
+
+        with patch.object(client._session, "get", return_value=mock_response):
+            result = client.get_collection("shows")
+
+        assert len(result) == 1
+        assert result[0]["type"] == "show"
+
+    def test_get_watchlist(self, mock_auth):
+        client = clients.TraktClient(mock_auth)
+        data = [
+            {
+                "type": "movie",
+                "listed_at": "2024-01-01T00:00:00Z",
+                "movie": {"title": "Heat", "year": 1995, "ids": {"imdb": "tt0113277"}},
+            }
+        ]
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = data
+
+        with patch.object(client._session, "get", return_value=mock_response):
+            result = client.get_watchlist()
+
+        assert len(result) == 1
+        assert result[0]["type"] == "movie"
+        assert result[0]["listed_at"] == "2024-01-01T00:00:00Z"
+
+
+class TestTraktClientBatchHistory:
+    """Coverage for batch history operations (TODO audit D3)."""
+
+    @pytest.fixture
+    def mock_auth(self):
+        auth = MagicMock()
+        auth.get_headers.return_value = {"Authorization": "Bearer test"}
+        return auth
+
+    def test_add_to_history_batches(self, mock_auth):
+        """Movies are split into batches of the given size."""
+        client = clients.TraktClient(mock_auth)
+        movies = [{"ids": {"imdb": f"tt{i}"}} for i in range(3)]
+
+        def make_response(*args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            batch = kwargs.get("json", {}).get("movies", [])
+            r.json.return_value = {"added": {"movies": len(batch), "episodes": 0}}
+            return r
+
+        with patch.object(client._session, "post", side_effect=make_response):
+            result = client.add_to_history(movies=movies, batch_size=2)
+
+        assert result is not None
+        assert result["added"]["movies"] == 3
+
+    def test_remove_from_history_episodes(self, mock_auth):
+        """Episodes are removed in batches."""
+        client = clients.TraktClient(mock_auth)
+        episodes = [{"ids": {"imdb": "tt1"}, "season": 1, "number": i} for i in range(1, 4)]
+
+        def make_response(*args, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            batch = kwargs.get("json", {}).get("episodes", [])
+            r.json.return_value = {"deleted": {"movies": 0, "episodes": len(batch)}}
+            return r
+
+        with patch.object(client._session, "post", side_effect=make_response):
+            result = client.remove_from_history(episodes=episodes, batch_size=2)
+
+        assert result is not None
+        assert result["deleted"]["episodes"] == 3
+
+    def test_batch_operation_request_failure(self, mock_auth):
+        """A failing batch is skipped and counted as an error."""
+        client = clients.TraktClient(mock_auth)
+        movies = [{"ids": {"imdb": "tt1"}}]
+
+        with patch.object(
+            client._session,
+            "post",
+            side_effect=clients.requests.exceptions.ConnectionError("down"),
+        ):
+            result = client.add_to_history(movies=movies, batch_size=2)
+
+        # All batches failed -> None
+        assert result is None
+
+    def test_batch_operation_no_items(self, mock_auth):
+        """No movies/episodes -> None without any API call."""
+        client = clients.TraktClient(mock_auth)
+
+        with patch.object(client._session, "post") as mock_post:
+            result = client.add_to_history()
+
+        assert result is None
+        mock_post.assert_not_called()
+
+
+class TestPlexClientOrphanedCleanup:
+    """Coverage for cleanup_orphaned_playlists (TODO audit D3)."""
+
+    @pytest.fixture
+    def plex_client(self, tmp_path, monkeypatch):
+        server = MagicMock()
+        cache = MagicMock()
+        cache.memory_cache = {}
+        return clients.PlexClient(server, cache)
+
+    def _make_playlist(self, title):
+        p = MagicMock()
+        p.title = title
+        return p
+
+    def test_no_orphans(self, plex_client):
+        plex_client.server.playlists.return_value = [self._make_playlist("Active")]
+        config = {"managed_playlists": ["Active"]}
+
+        deleted = plex_client.cleanup_orphaned_playlists(["Active"], config)
+
+        assert deleted == []
+        assert config["managed_playlists"] == ["Active"]
+
+    def test_deletes_orphaned(self, plex_client):
+        orphan = self._make_playlist("Old")
+        plex_client.server.playlists.return_value = [orphan, self._make_playlist("Active")]
+        config = {"managed_playlists": ["Active", "Old"]}
+
+        deleted = plex_client.cleanup_orphaned_playlists(["Active"], config)
+
+        assert deleted == ["Old"]
+        orphan.delete.assert_called_once()
+        assert config["managed_playlists"] == ["Active"]
+
+    def test_dry_run_returns_to_delete(self, plex_client):
+        orphan = self._make_playlist("Old")
+        plex_client.server.playlists.return_value = [orphan]
+        config = {"managed_playlists": ["Old"]}
+
+        to_delete = plex_client.cleanup_orphaned_playlists(["Active"], config, dry_run=True)
+
+        assert to_delete == ["Old"]
+        orphan.delete.assert_not_called()
+        # Config must not be modified in dry-run mode
+        assert config["managed_playlists"] == ["Old"]
+
+    def test_deletes_blacklisted(self, plex_client):
+        from plexapi.exceptions import NotFound
+
+        plex_client.server.playlist.side_effect = NotFound("nope")
+        plex_client.server.playlists.return_value = [self._make_playlist("Active")]
+        config = {
+            "managed_playlists": ["Active", "Blacklisted"],
+            "blacklisted_lists": ["Blacklisted"],
+        }
+
+        deleted = plex_client.cleanup_orphaned_playlists(["Active"], config)
+
+        # Blacklisted playlist not found -> skipped gracefully
+        assert deleted == []
+
+    def test_delete_error_handled(self, plex_client):
+        orphan = self._make_playlist("Old")
+        orphan.delete.side_effect = Exception("boom")
+        plex_client.server.playlists.return_value = [orphan]
+        config = {"managed_playlists": ["Old"]}
+
+        deleted = plex_client.cleanup_orphaned_playlists([], config)
+
+        assert deleted == []

@@ -2,20 +2,13 @@
 
 from __future__ import annotations
 
-import importlib.util
-from datetime import datetime, timezone
+from datetime import datetime
 
 from .log import logger
-
-# zoneinfo is available in Python 3.9+; find_spec guard provides a fallback
-# without try/except import redefinition issues flagged by mypy.
-ZoneInfo = __import__("zoneinfo").ZoneInfo if importlib.util.find_spec("zoneinfo") else None
+from .utils import parse_timestamp
 
 # Default threshold in seconds for considering timestamps significantly different
 DEFAULT_TIMESTAMP_THRESHOLD_SECONDS = 60
-
-# Timezone drift tolerance
-TIMEZONE_DRIFT_THRESHOLD_SECONDS = 300
 
 # Confidence scoring constants
 MAX_PLAY_COUNT_BONUS = 0.3
@@ -610,8 +603,10 @@ class ConflictResolver:
     ) -> datetime | None:
         """Normalize timestamp to UTC for comparison.
 
-        Handles naive datetimes by assuming UTC or converting from named timezone.
-        Handles timezone drift by checking if difference exceeds threshold.
+        Thin wrapper over the canonical :func:`utils.parse_timestamp`. Aware
+        datetimes are converted to UTC; naive datetimes are interpreted as
+        system local time (matching plexapi's ``datetime.fromtimestamp()``
+        behavior) or in the named timezone when ``tz_name`` is provided.
 
         Args:
             dt: Timestamp to normalize
@@ -620,26 +615,7 @@ class ConflictResolver:
         Returns:
             UTC-aware datetime or None
         """
-        if dt is None:
-            return None
-
-        # If already timezone-aware, convert to UTC
-        if dt.tzinfo is not None:
-            return dt.astimezone(timezone.utc)
-
-        # Naive datetime - try to interpret with timezone if provided
-        if tz_name and ZoneInfo is not None:
-            try:
-                tz = ZoneInfo(tz_name)
-                aware_dt = dt.replace(tzinfo=tz)
-                return aware_dt.astimezone(timezone.utc)
-            except Exception:
-                # If zoneinfo fails, assume UTC
-                logger.debug(f"Could not parse timezone {tz_name}, assuming UTC")
-                return dt.replace(tzinfo=timezone.utc)
-
-        # No timezone provided, assume UTC
-        return dt.replace(tzinfo=timezone.utc)
+        return parse_timestamp(dt, tz_name=tz_name)
 
     def _is_newer(self, dt1: datetime | None, dt2: datetime | None) -> bool:
         """Check if dt1 is newer than dt2.
@@ -674,37 +650,3 @@ class ConflictResolver:
 
         diff = abs((plex_last_watched - trakt_last_watched).total_seconds())
         return diff > threshold_seconds
-
-    def set_strategy(self, strategy: str) -> None:
-        """Change the resolution strategy.
-
-        Args:
-            strategy: New strategy name
-
-        Raises:
-            ValueError: If strategy is not valid
-        """
-        if strategy not in self.VALID_STRATEGIES:
-            raise ValueError(
-                f"Invalid strategy: {strategy}. Must be one of {self.VALID_STRATEGIES}",
-            )
-
-        self.strategy = strategy
-        logger.info(f"Conflict resolver strategy changed to: {strategy}")
-
-    def get_strategy(self) -> str:
-        """Get current resolution strategy.
-
-        Returns:
-            Current strategy name
-        """
-        return self.strategy
-
-    @staticmethod
-    def get_valid_strategies() -> list:
-        """Get list of valid strategy names.
-
-        Returns:
-            List of valid strategy names
-        """
-        return list(ConflictResolver.VALID_STRATEGIES)

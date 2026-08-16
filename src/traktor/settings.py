@@ -65,7 +65,6 @@ CACHE_MAX_AGE_HOURS = 24
 MAX_WORKERS = int(os.getenv("TRAKTOR_WORKERS", "8"))
 
 # Watch sync settings
-WATCH_SYNC_ENABLED = _parse_bool_env("WATCH_SYNC_ENABLED", "false")
 WATCH_SYNC_DIRECTION = os.getenv("WATCH_SYNC_DIRECTION", "both")
 WATCH_SYNC_CONFLICT_RESOLUTION = os.getenv("WATCH_SYNC_CONFLICT_RESOLUTION", "newest_wins")
 
@@ -86,8 +85,6 @@ HEALTH_SERVER_PORT = int(os.getenv("TRAKTOR_HEALTH_PORT", "8080"))
 
 # Resource management settings
 TRAKTOR_MAX_MEMORY_MB = int(os.getenv("TRAKTOR_MAX_MEMORY_MB", "512"))
-TRAKTOR_CPU_THROTTLE = _parse_bool_env("TRAKTOR_CPU_THROTTLE", "false")
-TRAKTOR_BANDWIDTH_LIMIT_KBPS = int(os.getenv("TRAKTOR_BANDWIDTH_LIMIT_KBPS", "0"))  # 0 = unlimited
 
 # Official lists cache TTLs (in hours)
 TRAKTOR_OFFICIAL_CACHE_TTL_TRENDING = int(os.getenv("TRAKTOR_OFFICIAL_CACHE_TTL_TRENDING", "1"))

@@ -19,32 +19,13 @@ class TestConflictResolver:
         """Test initialization with valid strategies."""
         for strategy in ["newest_wins", "plex_wins", "trakt_wins"]:
             resolver = conflict_resolver.ConflictResolver(strategy)
-            assert resolver.get_strategy() == strategy
+            assert resolver.strategy == strategy
 
     def test_init_invalid_strategy(self):
         """Test initialization with invalid strategy raises ValueError."""
         with pytest.raises(ValueError) as exc_info:
             conflict_resolver.ConflictResolver("invalid_strategy")
         assert "Invalid strategy" in str(exc_info.value)
-
-    def test_set_strategy_valid(self):
-        """Test setting a valid strategy."""
-        resolver = conflict_resolver.ConflictResolver("newest_wins")
-        resolver.set_strategy("plex_wins")
-        assert resolver.get_strategy() == "plex_wins"
-
-    def test_set_strategy_invalid(self):
-        """Test setting invalid strategy raises ValueError."""
-        resolver = conflict_resolver.ConflictResolver("newest_wins")
-        with pytest.raises(ValueError):
-            resolver.set_strategy("invalid")
-
-    def test_get_valid_strategies(self):
-        """Test getting list of valid strategies."""
-        strategies = conflict_resolver.ConflictResolver.get_valid_strategies()
-        assert "newest_wins" in strategies
-        assert "plex_wins" in strategies
-        assert "trakt_wins" in strategies
 
 
 class TestNewestWinsStrategy:
@@ -591,12 +572,20 @@ class TestTimezoneAwareComparison:
         assert dt_utc.tzinfo == timezone.utc
         assert dt_utc.hour == 17  # 12:00 EST -> 17:00 UTC
 
-    def test_normalize_timestamp_naive_assumes_utc(self, resolver):
-        """Test that naive timestamps are assumed UTC."""
+    def test_normalize_timestamp_naive_assumes_local(self, resolver):
+        """Test that naive timestamps are interpreted as system local time.
+
+        plexapi returns naive *local* datetimes (see AGENTS.md 2026-07-25
+        audit), so the canonical ``parse_timestamp`` interprets naive values as
+        system local time rather than UTC. The previous test spec assumed UTC,
+        which shifts the instant on non-UTC systems and produces incorrect
+        conflict decisions for Plex-sourced timestamps.
+        """
         dt_naive = datetime(2024, 6, 15, 12, 0, 0)
         dt_utc = resolver._normalize_timestamp(dt_naive)
         assert dt_utc.tzinfo == timezone.utc
-        assert dt_utc.hour == 12
+        # Expected: naive is system-local; convert via astimezone like the impl
+        assert dt_utc == dt_naive.astimezone(timezone.utc)
 
     def test_normalize_timestamp_with_zoneinfo(self, resolver):
         """Test normalization with zoneinfo timezone name."""
@@ -703,3 +692,196 @@ class TestConfidenceScoring:
             trakt_watched=True,
         )
         assert action == "no_action"
+
+
+class TestResolveWithContextBranches:
+    """Tests for resolve_with_context confidence-scoring branches.
+
+    Covers the timestamp-component, one-sided-timestamp, and tie paths that
+    were previously untested (TODO audit D6).
+    """
+
+    @pytest.fixture
+    def resolver(self):
+        return conflict_resolver.ConflictResolver("newest_wins")
+
+    def test_resolve_both_watched_plex_newer_updates_plex(self, resolver):
+        """Both watched, Plex timestamp newer -> update Plex timestamp."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve(
+            plex_watched=True,
+            trakt_watched=True,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(hours=1),
+        )
+        assert action == "push_to_plex"
+
+    def test_resolve_both_watched_trakt_newer_updates_trakt(self, resolver):
+        """Both watched, Trakt timestamp newer -> update Trakt timestamp."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve(
+            plex_watched=True,
+            trakt_watched=True,
+            plex_last_watched=now - timedelta(hours=1),
+            trakt_last_watched=now,
+        )
+        assert action == "push_to_trakt"
+
+    def test_resolve_with_context_both_watched_ts_update(self, resolver):
+        """resolve_with_context with both watched and differing timestamps."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=True,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(hours=1),
+            media_type="movie",
+        )
+        assert action == "push_to_plex"
+
+    def test_movie_only_plex_timestamp(self, resolver):
+        """Movie: only Plex has a timestamp -> Plex confidence wins."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=now,
+            trakt_last_watched=None,
+            media_type="movie",
+        )
+        assert action == "push_to_trakt"
+
+    def test_movie_only_trakt_timestamp(self, resolver):
+        """Movie: only Trakt has a timestamp -> Trakt confidence wins."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=False,
+            trakt_watched=True,
+            plex_last_watched=None,
+            trakt_last_watched=now,
+            media_type="movie",
+        )
+        assert action == "push_to_plex"
+
+    def test_movie_equal_timestamps_falls_back(self, resolver):
+        """Movie: equal timestamps and equal confidence -> newest_wins fallback.
+
+        With differing states and identical timestamps, the newest_wins fallback
+        trusts Trakt (trakt not older than plex), pushing Trakt's state to Plex.
+        """
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=now,
+            trakt_last_watched=now,
+            media_type="movie",
+        )
+        assert action == "push_to_plex"
+
+    def test_episode_only_plex_timestamp(self, resolver):
+        """Episode: only Plex has a timestamp -> Plex confidence wins."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=now,
+            trakt_last_watched=None,
+            media_type="episode",
+        )
+        assert action == "push_to_trakt"
+
+    def test_episode_no_timestamps_trakt_bias(self, resolver):
+        """Episode: no timestamps -> the default branch favors Trakt (documented
+        current behavior; do not change without a deliberate decision)."""
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=None,
+            trakt_last_watched=None,
+            media_type="episode",
+        )
+        assert action == "push_to_plex"
+
+    def test_episode_equal_scores_no_action(self, resolver):
+        """Episode: matching completion cancels out -> no action when watched."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=True,
+            plex_last_watched=now,
+            trakt_last_watched=now,
+            media_type="episode",
+            plex_completion_pct=0.9,
+            trakt_completion_pct=0.9,
+        )
+        assert action == "no_action"
+
+    def test_show_trakt_completion_wins(self, resolver):
+        """Show: Trakt wins on aggregate completion despite older timestamp."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(hours=1),
+            media_type="show",
+            plex_completion_pct=0.1,
+            trakt_completion_pct=0.9,
+        )
+        assert action == "push_to_plex"
+
+    def test_show_equal_scores_no_action(self, resolver):
+        """Show: equal confidence scores -> no action."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=True,
+            plex_last_watched=now,
+            trakt_last_watched=now,
+            media_type="show",
+        )
+        assert action == "no_action"
+
+    def test_season_effective_watched_timestamp_update(self, resolver):
+        """Season: both effective-watched, Plex newer -> timestamp update."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=True,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(hours=1),
+            media_type="season",
+        )
+        assert action == "push_to_plex"
+
+    def test_season_effective_differs_trakt_wins(self, resolver):
+        """Season: effective states differ, Trakt confidence higher -> push to Plex."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=False,
+            trakt_watched=True,
+            plex_last_watched=now - timedelta(hours=1),
+            trakt_last_watched=now,
+            media_type="season",
+            trakt_completion_pct=0.95,
+            plex_completion_pct=0.1,
+        )
+        # Plex effective watched (completion 0.1 <= 0.5 so stays unwatched),
+        # Trakt effective watched -> states differ; Trakt's high completion
+        # (+0.1 bonus) plus its newer timestamp (+0.3) beats Plex
+        assert action == "push_to_plex"
+
+    def test_season_effective_differs_plex_wins(self, resolver):
+        """Season: effective states differ, Plex confidence higher -> push to Trakt."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=False,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(hours=1),
+            media_type="season",
+            plex_completion_pct=0.9,
+            trakt_completion_pct=0.1,
+        )
+        assert action == "push_to_trakt"

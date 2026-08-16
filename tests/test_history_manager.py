@@ -263,3 +263,115 @@ class TestWatchHistoryManager:
         # And with integer
         item = mock_history_manager.get_synced_item(tmdb_id=987654)
         assert item is not None
+
+
+class TestWatchHistoryManagerEdgeCases:
+    """Edge-case coverage for state corruption and error paths (TODO audit D7)."""
+
+    def test_load_state_corrupt_json(self, temp_state_file):
+        """Corrupt JSON state file falls back to empty state."""
+        temp_state_file.write_text("{not valid json")
+        manager = history_manager.WatchHistoryManager(plex_server_id="test-server-123")
+
+        assert manager.state["synced_items"] == []
+        assert manager.state["plex_server_id"] == "test-server-123"
+
+    def test_load_state_invalid_format(self, temp_state_file):
+        """State file missing required keys falls back to empty state."""
+        temp_state_file.write_text(json.dumps({"foo": "bar"}))
+        manager = history_manager.WatchHistoryManager(plex_server_id="test-server-123")
+
+        assert manager.state["synced_items"] == []
+
+    def test_save_state_permission_error(self, mock_history_manager, monkeypatch):
+        """Save failure is logged, not raised."""
+        import builtins
+
+        real_open = builtins.open
+
+        def deny_write(*args, **kwargs):
+            if args and "w" in (args[1] if len(args) > 1 else kwargs.get("mode", "")):
+                raise PermissionError("denied")
+            return real_open(*args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", deny_write)
+        # Should not raise
+        mock_history_manager.save_state()
+
+
+def test_get_last_sync_timestamp_invalid_format(mock_history_manager, caplog):
+    """Invalid stored timestamp returns None with a warning."""
+    mock_history_manager.state["last_sync_timestamp"] = "not-a-timestamp"
+    assert mock_history_manager.get_last_sync_timestamp() is None
+
+
+def test_get_synced_item_by_trakt_id(mock_history_manager):
+    """Find synced item by Trakt ID."""
+    mock_history_manager.add_or_update_synced_item(
+        media_type="movie", imdb_id="tt123", trakt_id=500
+    )
+    item = mock_history_manager.get_synced_item(trakt_id=500)
+    assert item is not None
+    assert item["imdb_id"] == "tt123"
+
+
+def test_get_synced_item_by_plex_rating_key(mock_history_manager):
+    """Find synced item by Plex rating key."""
+    mock_history_manager.add_or_update_synced_item(
+        media_type="movie", imdb_id="tt123", plex_rating_key=999
+    )
+    item = mock_history_manager.get_synced_item(plex_rating_key=999)
+    assert item is not None
+    assert item["imdb_id"] == "tt123"
+
+
+def test_remove_synced_item_by_trakt_id(mock_history_manager):
+    """Remove synced item by Trakt ID."""
+    mock_history_manager.add_or_update_synced_item(media_type="movie", imdb_id="tt123", trakt_id=42)
+    assert mock_history_manager.remove_synced_item(trakt_id=42) is True
+    assert len(mock_history_manager.state["synced_items"]) == 0
+
+
+def test_remove_synced_item_by_plex_rating_key(mock_history_manager):
+    """Remove synced item by Plex rating key."""
+    mock_history_manager.add_or_update_synced_item(
+        media_type="episode", imdb_id="tt456", plex_rating_key=77
+    )
+    assert mock_history_manager.remove_synced_item(plex_rating_key=77) is True
+    assert len(mock_history_manager.state["synced_items"]) == 0
+
+
+def test_backup_state_permission_error(mock_history_manager, tmp_path, monkeypatch):
+    """Backup failure returns None without raising."""
+    import builtins
+
+    real_open = builtins.open
+
+    def deny_write(*args, **kwargs):
+        if args and "w" in (args[1] if len(args) > 1 else kwargs.get("mode", "")):
+            raise PermissionError("denied")
+        return real_open(*args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", deny_write)
+    result = mock_history_manager.backup_state(tmp_path / "backup.json")
+    assert result is None
+
+
+def test_restore_from_default_backup_path(mock_history_manager):
+    """Restore with no explicit path uses the default backup file."""
+    # No backup file exists yet -> False
+    assert mock_history_manager.restore_from_backup() is False
+
+
+def test_restore_invalid_state_format(mock_history_manager, tmp_path):
+    """Restore rejects a backup file with invalid state format."""
+    backup_path = tmp_path / "bad.json"
+    backup_path.write_text(json.dumps({"wrong": "shape"}))
+    assert mock_history_manager.restore_from_backup(backup_path) is False
+
+
+def test_restore_corrupt_json(mock_history_manager, tmp_path):
+    """Restore handles a corrupt backup file gracefully."""
+    backup_path = tmp_path / "corrupt.json"
+    backup_path.write_text("{not valid")
+    assert mock_history_manager.restore_from_backup(backup_path) is False

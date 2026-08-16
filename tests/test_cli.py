@@ -1,5 +1,7 @@
 import sys
 
+import pytest
+
 from traktor import cli
 
 
@@ -179,3 +181,312 @@ def test_parse_args_apply_update_default(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["traktor"])
     args = cli.parse_args()
     assert args.apply_update is False
+
+
+def _make_args(monkeypatch, *extra):
+    """Build a real argparse Namespace with optional extra flags."""
+    import sys as _sys
+
+    monkeypatch.setattr(_sys, "argv", ["traktor", *extra])
+    return cli.parse_args()
+
+
+def test_run_health_check_healthy(monkeypatch, capsys):
+    """Test health check returns 0 when all components healthy."""
+
+    monkeypatch.setattr(cli.health_checker, "register", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli.health_checker,
+        "check_all",
+        lambda: {
+            "status": "healthy",
+            "timestamp": "2026-01-01T00:00:00",
+            "components": {"cache": "healthy", "config": "healthy"},
+        },
+    )
+
+    exit_code = cli._run_health_check()
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "HEALTHY" in out
+
+
+def test_run_health_check_unhealthy(monkeypatch, capsys):
+    """Test health check returns 1 when a component is unhealthy."""
+    monkeypatch.setattr(cli.health_checker, "register", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli.health_checker,
+        "check_all",
+        lambda: {
+            "status": "unhealthy",
+            "timestamp": "2026-01-01T00:00:00",
+            "components": {"cache": "unhealthy"},
+        },
+    )
+
+    exit_code = cli._run_health_check()
+
+    assert exit_code == 1
+    out = capsys.readouterr().out
+    assert "UNHEALTHY" in out
+
+
+def test_run_backup(monkeypatch, capsys, tmp_path):
+    """Test manual backup creation."""
+    backup_path = tmp_path / "backup-2026"
+    monkeypatch.setattr(cli.backup_manager, "create_backup", lambda reason="manual": backup_path)
+
+    exit_code = cli._run_backup(_make_args(monkeypatch))
+
+    assert exit_code == 0
+    assert "backup-2026" in capsys.readouterr().out
+
+
+def test_list_backups_empty(monkeypatch, capsys):
+    """Test listing backups when none exist."""
+    monkeypatch.setattr(cli.backup_manager, "list_backups", lambda: [])
+
+    assert cli._list_backups() == 0
+    assert "No backups found." in capsys.readouterr().out
+
+
+def test_list_backups_with_items(monkeypatch, capsys):
+    """Test listing backups when backups exist."""
+    monkeypatch.setattr(
+        cli.backup_manager,
+        "list_backups",
+        lambda: [{"name": "b1", "created": "now", "reason": "manual", "path": "/tmp/b1"}],
+    )
+
+    assert cli._list_backups() == 0
+    out = capsys.readouterr().out
+    assert "b1" in out
+    assert "manual" in out
+
+
+def test_restore_backup_missing(monkeypatch, capsys, tmp_path):
+    """Test restore with a non-existent backup path."""
+    exit_code = cli._restore_backup(str(tmp_path / "nope"))
+
+    assert exit_code == 1
+    assert "Backup not found" in capsys.readouterr().out
+
+
+def test_restore_backup_success(monkeypatch, capsys, tmp_path):
+    """Test restore success."""
+    backup_path = tmp_path / "backup"
+    backup_path.mkdir()
+    monkeypatch.setattr(cli.backup_manager, "restore_backup", lambda path, verify=True: True)
+
+    exit_code = cli._restore_backup(str(backup_path))
+
+    assert exit_code == 0
+    assert "Restore completed" in capsys.readouterr().out
+
+
+def test_restore_backup_failure(monkeypatch, capsys, tmp_path):
+    """Test restore failure."""
+    backup_path = tmp_path / "backup"
+    backup_path.mkdir()
+    monkeypatch.setattr(cli.backup_manager, "restore_backup", lambda path, verify=True: False)
+
+    exit_code = cli._restore_backup(str(backup_path))
+
+    assert exit_code == 1
+    assert "Restore failed" in capsys.readouterr().out
+
+
+def test_run_integrity_check_healthy(monkeypatch, capsys):
+    """Test integrity check success path."""
+    monkeypatch.setattr(
+        cli.integrity_checker,
+        "run_all_checks",
+        lambda: {
+            "overall_healthy": True,
+            "timestamp": "t",
+            "checks": {"config": {"healthy": True, "details": {}}},
+        },
+    )
+
+    assert cli._run_integrity_check() == 0
+    assert "All integrity checks passed" in capsys.readouterr().out
+
+
+def test_run_integrity_check_failed(monkeypatch, capsys):
+    """Test integrity check failure path."""
+    monkeypatch.setattr(
+        cli.integrity_checker,
+        "run_all_checks",
+        lambda: {
+            "overall_healthy": False,
+            "timestamp": "t",
+            "checks": {"config": {"healthy": False, "details": {"error": "x"}}},
+        },
+    )
+
+    assert cli._run_integrity_check() == 1
+    assert "Some integrity checks failed" in capsys.readouterr().out
+
+
+def test_show_circuit_status(monkeypatch, capsys):
+    """Test circuit breaker status output."""
+    stats = {
+        "name": "trakt",
+        "state": "closed",
+        "failure_count": 0,
+        "failure_threshold": 5,
+        "cooldown_seconds": 60,
+        "last_failure": None,
+    }
+    monkeypatch.setattr(cli.trakt_circuit_breaker, "get_stats", lambda: stats)
+    monkeypatch.setattr(cli.plex_circuit_breaker, "get_stats", lambda: dict(stats, name="plex"))
+
+    assert cli._show_circuit_status() == 0
+    out = capsys.readouterr().out
+    assert "trakt" in out
+    assert "closed" in out
+
+
+def test_handle_undo_no_snapshots(monkeypatch, capsys):
+    """Test undo with no snapshots available."""
+    monkeypatch.setattr(cli, "list_undo_snapshots", lambda: [])
+    assert cli._handle_undo() == 1
+    assert "No undo snapshots available" in capsys.readouterr().out
+
+
+def test_handle_undo_non_interactive(monkeypatch, capsys):
+    """Test undo in non-interactive mode shows snapshot info only."""
+    monkeypatch.setattr(cli, "list_undo_snapshots", lambda: [{"operation_type": "playlist_sync"}])
+    monkeypatch.setattr(
+        cli,
+        "restore_undo_snapshot",
+        lambda: {"operation_type": "playlist_sync", "timestamp": "2026-01-01"},
+    )
+    monkeypatch.setattr(cli, "is_interactive", lambda: False)
+
+    assert cli._handle_undo() == 0
+    out = capsys.readouterr().out
+    assert "playlist_sync" in out
+
+
+def test_handle_undo_interactive_confirmed(monkeypatch, capsys):
+    """Test undo with interactive confirmation."""
+    monkeypatch.setattr(cli, "list_undo_snapshots", lambda: [{"operation_type": "watch_sync"}])
+    monkeypatch.setattr(
+        cli,
+        "restore_undo_snapshot",
+        lambda: {"operation_type": "watch_sync", "timestamp": "2026-01-01"},
+    )
+    monkeypatch.setattr(cli, "is_interactive", lambda: True)
+    monkeypatch.setattr(cli, "confirm_changes", lambda *a, **k: True)
+
+    assert cli._handle_undo() == 0
+
+
+def test_main_dispatch_diagnose(monkeypatch, capsys):
+    """Test main() dispatch for --diagnose."""
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda verbose=False, structured=False: None)
+    monkeypatch.setattr(cli, "run_diagnosis", lambda: 0)
+    monkeypatch.setattr(sys, "argv", ["traktor", "--diagnose"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 0
+
+
+def test_main_dispatch_health_check(monkeypatch, capsys):
+    """Test main() dispatch for --health-check."""
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda verbose=False, structured=False: None)
+    monkeypatch.setattr(cli, "_run_health_check", lambda: 0)
+    monkeypatch.setattr(sys, "argv", ["traktor", "--health-check"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 0
+
+
+def test_main_dispatch_backup_list(monkeypatch, capsys):
+    """Test main() dispatch for --backup-list."""
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda verbose=False, structured=False: None)
+    monkeypatch.setattr(cli, "_list_backups", lambda: 0)
+    monkeypatch.setattr(sys, "argv", ["traktor", "--backup-list"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 0
+
+
+def test_main_dispatch_integrity_check(monkeypatch, capsys):
+    """Test main() dispatch for --integrity-check."""
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda verbose=False, structured=False: None)
+    monkeypatch.setattr(cli, "_run_integrity_check", lambda: 0)
+    monkeypatch.setattr(sys, "argv", ["traktor", "--integrity-check"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 0
+
+
+def test_main_dispatch_circuit_status(monkeypatch, capsys):
+    """Test main() dispatch for --circuit-status."""
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda verbose=False, structured=False: None)
+    monkeypatch.setattr(cli, "_show_circuit_status", lambda: 0)
+    monkeypatch.setattr(sys, "argv", ["traktor", "--circuit-status"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 0
+
+
+def test_main_dispatch_check_update(monkeypatch, capsys):
+    """Test main() dispatch for --check-update."""
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda verbose=False, structured=False: None)
+    monkeypatch.setattr(cli, "check_and_print_update", lambda: 0)
+    monkeypatch.setattr(sys, "argv", ["traktor", "--check-update"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 0
+
+
+def test_main_sync_path(monkeypatch, capsys):
+    """Test main() calls sync_lists for a normal run."""
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda verbose=False, structured=False: None)
+    monkeypatch.setattr(cli, "sync_lists", lambda *a, **k: 0)
+    monkeypatch.setattr(sys, "argv", ["traktor"])
+
+    cli.main()  # exit code 0 means no sys.exit call
+
+
+def test_main_sync_exit_code(monkeypatch, capsys):
+    """Test main() propagates non-zero sync_lists exit code."""
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda verbose=False, structured=False: None)
+    monkeypatch.setattr(cli, "sync_lists", lambda *a, **k: 3)
+    monkeypatch.setattr(sys, "argv", ["traktor"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 3
+
+
+def test_main_unhandled_exception(monkeypatch, capsys):
+    """Test main() exits 1 on unhandled exception."""
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda verbose=False, structured=False: None)
+    monkeypatch.setattr(
+        cli, "sync_lists", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    monkeypatch.setattr(sys, "argv", ["traktor"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1

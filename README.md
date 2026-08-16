@@ -125,13 +125,12 @@ See [DOCKER.md](DOCKER.md) for scheduling and volume mounts.
 |----------|---------|-------------|
 | `TRAKTOR_LIST_SOURCE` | `official` | Which lists to sync: `official` (public lists only), `liked` (your liked lists), or `both` |
 | `TRAKTOR_WORKERS` | `8` | Parallel workers for processing |
-| `WATCH_SYNC_ENABLED` | `false` | Enable bidirectional watch status sync |
 | `TRAKTOR_OFFICIAL_LISTS_ENABLED` | `true` | Enable official Trakt lists (trending, popular) |
 | `DOCKER_MODE` | `false` | Use `/data/` paths instead of home directory |
 | `TRAKTOR_HEALTH_PORT` | `8080` | Port for HTTP health endpoints |
-| `TRAKTOR_MAX_MEMORY_MB` | `512` | Maximum memory usage in MB |
-| `TRAKTOR_CPU_THROTTLE` | `false` | Enable CPU throttling |
-| `TRAKTOR_BANDWIDTH_LIMIT_KBPS` | `0` | Network bandwidth limit (0 = unlimited) |
+| `TRAKTOR_MAX_MEMORY_MB` | `512` | Maximum memory usage in MB (CLI: `--max-memory-mb`) |
+| `WATCH_SYNC_DIRECTION` | `both` | Default watch sync direction (`both`, `plex-to-trakt`, `trakt-to-plex`) |
+| `WATCH_SYNC_CONFLICT_RESOLUTION` | `newest_wins` | Default conflict strategy (`newest_wins`, `plex_wins`, `trakt_wins`) |
 
 **CLI flags:**
 - `--verbose, -v` — Enable debug logging to console

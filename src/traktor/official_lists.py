@@ -42,10 +42,6 @@ class OfficialListsService:
         """Get the cache file path for an endpoint."""
         return self.cache_dir / f"{endpoint_name.replace('.', '_')}.json"
 
-    def _get_cache_metadata_file(self) -> Path:
-        """Get the cache metadata file path."""
-        return self.cache_dir / "cache_metadata.json"
-
     def _is_cache_valid(self, endpoint_name: str) -> bool:
         """Check if cache for an endpoint is still valid.
 

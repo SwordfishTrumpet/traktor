@@ -6,6 +6,91 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-16
+
+### Performance
+
+- **Episode watch-status fetch no longer storms the Plex API (CRITICAL)**
+  - `_process_episode_batch()` called `PlexClient.is_watched()` per episode, which always fell
+    through to `fetchItem` (episodes are not in the rating-key cache) — ~1 API call per episode,
+    ~100k+ calls for a large library per watch-sync run
+  - Watch state is now read directly from the `season.episodes()` response
+    (`isWatched` = `viewCount > 0`, plus `lastViewedAt`); zero per-episode API calls
+  - Also fixed a latent `KeyError: 'items_skipped_due_to_delta'` when the engine ran without
+    `sync_watched_status()` having initialized the full stats dict
+  - Location: `src/traktor/watch_sync.py`
+
+- **`PerformanceMonitor.api_calls` is now LRU-bounded**
+  - `MAX_API_CALLS_TRACKED` (1000) was defined but never enforced; the endpoint dict could grow
+    without bound in long-running processes (health server, cron)
+  - `record_api_call()` now evicts the least-recently-recorded endpoint at the cap
+  - Location: `src/traktor/performance.py`
+
+- **Watch sync reverse maps are built once per cache load**
+  - `_pull_from_plex()` and `sync_playback_progress()` rebuilt `rating_key -> (imdb, tmdb)` maps
+    from the cache on every run
+  - New `CacheManager` properties (`movie_key_to_ids`, `show_key_to_imdb`, `movie_imdb_to_rating_key`)
+    build them lazily and invalidate on cache changes
+  - Location: `src/traktor/clients.py`, `src/traktor/watch_sync.py`
+
+### Fixed
+
+- **POST history operations never refreshed expired tokens**
+  - `_post_with_token_refresh()` caught `HTTPError` for 401s, but `_request_with_retry()` returns
+    401 responses instead of raising — so token refresh never ran for Trakt history writes
+  - New shared `_execute_with_token_refresh()` helper handles 401 -> refresh -> retry-once for
+    both GET and POST paths
+  - Location: `src/traktor/clients.py`
+
+- **Trakt collection sync silently dropped all shows**
+  - `get_collection("shows")` looked up the `"shows"` key, but Trakt returns the singular
+    `"show"` key — every show was skipped
+  - Location: `src/traktor/clients.py`
+
+- **Restore path hardened for corrupt backups**
+  - `restore_backup()` now returns False (not raises) on an unreadable manifest; `_verify_backup_item()`
+    returns False on corrupt gzip streams instead of raising `BadGzipFile`
+  - Location: `src/traktor/resilience.py`
+
+### Changed
+
+- **Timestamp parsing unified in `utils.parse_timestamp()`**
+  - Three near-identical implementations (`CacheManager._normalize_added_at`,
+    `WatchSyncEngine._parse_plex_timestamp`, `ConflictResolver._normalize_timestamp`) replaced by
+    one canonical parser handling naive (system local), aware, epoch, ISO string, and named-tz input
+  - The conflict resolver now interprets naive timestamps as system local time (was: assume UTC),
+    matching plexapi's documented behavior
+  - Location: `src/traktor/utils.py`, `src/traktor/clients.py`, `src/traktor/watch_sync.py`, `src/traktor/conflict_resolver.py`
+
+- **Trakt pagination centralized**
+  - New `TraktClient._paginated_get()` shared by `get_watched_movies()` and `get_list_items()`
+    (page-count headers, short-page break, `MAX_HISTORY_PAGES` safety)
+  - Location: `src/traktor/clients.py`
+
+- **CI matrix aligned with Python floor**
+  - Removed 3.8/3.9 from the test matrix (project floor is now >= 3.10); tests run on 3.10-3.12
+  - Location: `.github/workflows/ci.yml`
+
+- **Dead code removed (audit C1-C13)**
+  - Deleted: `update_cache_incremental`, `get_all_watched_history`, `get_watched_items`,
+    `get_play_history`, `get_all_synced_items`, `restore_last_undo` (+ `_restore_playlist_snapshot`),
+    `ConflictResolver.set_strategy/get_strategy/get_valid_strategies`, `_get_cache_metadata_file`,
+    `get_sync_summary`, `_build_missing_item`/`_extract_missing_item_details` wrappers, and the
+    unused `compressed` parameter of `BackupManager._restore_item`
+  - Removed env vars with no consumers: `WATCH_SYNC_ENABLED`, `TRAKTOR_CPU_THROTTLE`,
+    `TRAKTOR_BANDWIDTH_LIMIT_KBPS` (and the unused constants `CONNECTION_MAX_REUSE`,
+    `MEMORY_SAMPLE_INTERVAL`, `TIMEZONE_DRIFT_THRESHOLD_SECONDS`)
+  - Watch sync is gated by CLI flags only; resource limits via `--max-memory-mb` / `--cpu-throttle`
+
+### Testing
+
+- 719 tests (was 550), line coverage 56% -> 79%
+- New coverage: `sync_lists()` orchestration, `cli.py` handlers + `main()` dispatch,
+  `_collect_auth_code()` callback paths, `sync_playback_progress()`, `_apply_changes()` failure
+  paths, BackupManager create/restore/verify/cleanup, IntegrityChecker, TraktAuth refresh paths,
+  Trakt pagination/batch history, PlexClient orphaned-playlist cleanup, `__main__` runner,
+  conflict-resolver confidence branches, config/diagnose edge cases
+
 ### Fixed
 
 - **Watch sync: movies watched on other services were never marked watched in Plex (CRITICAL)**

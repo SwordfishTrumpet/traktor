@@ -442,8 +442,12 @@ class BackupManager:
             logger.error(f"No manifest found in backup: {backup_path}")
             return False
 
-        with open(manifest_path) as f:
-            manifest = json.load(f)
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"Failed to read backup manifest: {e}")
+            return False
 
         # Verify backup integrity
         if verify:
@@ -465,38 +469,47 @@ class BackupManager:
                     shutil.rmtree(dest)
 
             # Restore
-            self._restore_item(source, dest, info.get("compressed", True))
+            self._restore_item(source, dest)
 
         logger.info("Restore completed successfully")
         return True
 
     def _verify_backup_item(self, backup_item: Path, expected_checksum: str) -> bool:
-        """Verify a backed up item matches its checksum."""
+        """Verify a backed up item matches its checksum.
+
+        Returns:
+            False if the item cannot be read (e.g. corrupt gzip stream) or
+            the checksum does not match.
+        """
         sha256 = hashlib.sha256()
 
-        if backup_item.is_file() or backup_item.with_suffix(".gz").exists():
-            # Single file
-            file_path = backup_item if backup_item.exists() else backup_item.with_suffix(".gz")
-            if file_path.suffix == ".gz":
-                with gzip.open(file_path, "rb") as f:
-                    sha256.update(f.read())
+        try:
+            if backup_item.is_file() or backup_item.with_suffix(".gz").exists():
+                # Single file
+                file_path = backup_item if backup_item.exists() else backup_item.with_suffix(".gz")
+                if file_path.suffix == ".gz":
+                    with gzip.open(file_path, "rb") as f:
+                        sha256.update(f.read())
+                else:
+                    with open(file_path, "rb") as f:
+                        sha256.update(f.read())
             else:
-                with open(file_path, "rb") as f:
-                    sha256.update(f.read())
-        else:
-            # Directory
-            for file_path in backup_item.rglob("*"):
-                if file_path.is_file():
-                    if file_path.suffix == ".gz":
-                        with gzip.open(file_path, "rb") as f:
-                            sha256.update(f.read())
-                    else:
-                        with open(file_path, "rb") as f:
-                            sha256.update(f.read())
+                # Directory
+                for file_path in backup_item.rglob("*"):
+                    if file_path.is_file():
+                        if file_path.suffix == ".gz":
+                            with gzip.open(file_path, "rb") as f:
+                                sha256.update(f.read())
+                        else:
+                            with open(file_path, "rb") as f:
+                                sha256.update(f.read())
+        except (OSError, EOFError) as e:
+            logger.error(f"Failed to verify backup item {backup_item}: {e}")
+            return False
 
         return sha256.hexdigest() == expected_checksum
 
-    def _restore_item(self, source: Path, dest: Path, compressed: bool) -> None:
+    def _restore_item(self, source: Path, dest: Path) -> None:
         """Restore a single item from backup."""
         if source.is_file() or source.with_suffix(".gz").exists():
             file_path = source if source.exists() else source.with_suffix(".gz")

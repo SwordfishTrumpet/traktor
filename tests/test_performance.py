@@ -4,6 +4,7 @@ import time
 
 from traktor.performance import (
     BOTTLENECK_THRESHOLD_MS,
+    MAX_API_CALLS_TRACKED,
     PerformanceMonitor,
 )
 
@@ -33,6 +34,34 @@ class TestPerformanceMonitor:
         monitor.record_api_call("movies/popular", 0.5)
         monitor.record_api_call("shows/trending", 0.3)
         assert len(monitor.api_calls) == 2
+
+    def test_api_calls_capped_lru(self):
+        """Test that the endpoint dict is bounded by MAX_API_CALLS_TRACKED.
+
+        Regression for A2: the cap constant was defined but never enforced,
+        so long-running processes could grow the dict without bound.
+        """
+        monitor = PerformanceMonitor()
+        for i in range(MAX_API_CALLS_TRACKED + 50):
+            monitor.record_api_call(f"endpoint_{i}", 0.01)
+
+        assert len(monitor.api_calls) == MAX_API_CALLS_TRACKED
+        # Least-recently-recorded endpoints are evicted first
+        assert "endpoint_0" not in monitor.api_calls
+        assert f"endpoint_{MAX_API_CALLS_TRACKED + 49}" in monitor.api_calls
+
+    def test_api_calls_lru_updated_endpoint_not_evicted(self):
+        """Test that re-recorded endpoints are treated as most-recent."""
+        monitor = PerformanceMonitor()
+        monitor.record_api_call("kept", 0.01)
+        for i in range(MAX_API_CALLS_TRACKED):
+            monitor.record_api_call(f"filler_{i}", 0.01)
+        # Re-record "kept" so it becomes the most-recent endpoint
+        monitor.record_api_call("kept", 0.02)
+
+        assert len(monitor.api_calls) == MAX_API_CALLS_TRACKED
+        assert "kept" in monitor.api_calls
+        assert "filler_0" not in monitor.api_calls
 
     def test_record_cache_hit(self):
         monitor = PerformanceMonitor()
@@ -160,3 +189,53 @@ class TestPerformanceMonitorIntegration:
         time.sleep(0.01)
         summary2 = monitor.get_summary()
         assert summary2["uptime_seconds"] > summary1["uptime_seconds"]
+
+
+class TestPerformanceMonitorMemoryPaths:
+    """Coverage for memory sampling fallback paths (TODO audit D3)."""
+
+    def test_memory_usage_without_psutil_resource_fallback(self, monkeypatch):
+        """Non-darwin resource-module fallback."""
+        import traktor.performance as perf
+
+        monkeypatch.setattr(perf, "psutil", None)
+        monkeypatch.setattr(perf, "sys", __import__("sys"))
+        monkeypatch.setattr(perf.sys, "platform", "linux")
+
+        monitor = perf.PerformanceMonitor()
+        monitor.record_memory_usage()
+
+        assert len(monitor.memory_samples) == 1
+        assert monitor.memory_samples[0]["rss_mb"] >= 0
+
+    def test_memory_usage_resource_error_fallback(self, monkeypatch):
+        """resource module failure falls back to 0.0."""
+        import traktor.performance as perf
+
+        monkeypatch.setattr(perf, "psutil", None)
+
+        def boom(*args, **kwargs):
+            raise OSError("no rusage")
+
+        monkeypatch.setattr(perf.resource, "getrusage", boom)
+
+        monitor = perf.PerformanceMonitor()
+        monitor.record_memory_usage()
+
+        assert monitor.memory_samples[0]["rss_mb"] == 0.0
+
+    def test_memory_usage_psutil_failure(self, monkeypatch):
+        """psutil failure falls back to 0.0."""
+        import traktor.performance as perf
+
+        class FakeProcess:
+            def memory_info(self):
+                raise RuntimeError("broken")
+
+        fake_psutil = type("FakePsutil", (), {"Process": staticmethod(lambda: FakeProcess())})
+        monkeypatch.setattr(perf, "psutil", fake_psutil)
+
+        monitor = perf.PerformanceMonitor()
+        monitor.record_memory_usage()
+
+        assert monitor.memory_samples[0]["rss_mb"] == 0.0

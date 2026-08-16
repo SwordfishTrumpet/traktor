@@ -13,7 +13,6 @@ from typing import Any
 psutil = __import__("psutil") if importlib.util.find_spec("psutil") else None
 
 BOTTLENECK_THRESHOLD_MS = 1000  # API calls slower than 1s are flagged
-MEMORY_SAMPLE_INTERVAL = 60  # Seconds between memory samples (for automated sampling)
 MAX_API_CALLS_TRACKED = 1000  # Prevent unbounded growth
 
 
@@ -33,24 +32,35 @@ class PerformanceMonitor:
     def record_api_call(self, endpoint: str, duration: float) -> None:
         """Record timing for an API call.
 
+        The tracked endpoint set is bounded by ``MAX_API_CALLS_TRACKED``;
+        when the cap is reached the least-recently-recorded endpoint is
+        evicted so the dict cannot grow without bound over long-running
+        processes (health server, frequent cron runs).
+
         Args:
             endpoint: API endpoint identifier (e.g., "movies/popular")
             duration: Duration in seconds
         """
-        if endpoint not in self.api_calls:
-            self.api_calls[endpoint] = {
+        if endpoint in self.api_calls:
+            # Pop + reinsert to implement LRU ordering (dicts preserve order)
+            stats = self.api_calls.pop(endpoint)
+        else:
+            if len(self.api_calls) >= MAX_API_CALLS_TRACKED:
+                oldest = next(iter(self.api_calls))
+                self.api_calls.pop(oldest)
+            stats = {
                 "count": 0,
                 "total_time": 0.0,
                 "min_time": float("inf"),
                 "max_time": 0.0,
             }
-        stats = self.api_calls[endpoint]
         stats["count"] += 1
         stats["total_time"] += duration
         if duration < stats["min_time"]:
             stats["min_time"] = duration
         if duration > stats["max_time"]:
             stats["max_time"] = duration
+        self.api_calls[endpoint] = stats
 
     def record_cache_hit(self) -> None:
         """Record a cache hit."""

@@ -1,11 +1,12 @@
 """Tests for Trakt official lists client."""
 
 import time
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 import requests
 
+from traktor import trakt_official
 from traktor.trakt_official import (
     DEFAULT_CACHE_TTLS,
     DEFAULT_LIMITS,
@@ -336,3 +337,105 @@ class TestTraktOfficialClientConstants:
         """Test rate limiting interval."""
         # 60 requests per minute = 1 second between requests
         assert MIN_REQUEST_INTERVAL == 1.0
+
+
+class TestTraktOfficialRemainingEndpoints:
+    """Coverage for remaining endpoints and _request edge cases (TODO audit D10)."""
+
+    @pytest.fixture
+    def client(self):
+        with patch("traktor.trakt_official.TRAKT_CLIENT_ID", "test_client_id"):
+            return trakt_official.TraktOfficialClient()
+
+    @pytest.fixture
+    def mock_response(self):
+        response = Mock()
+        response.status_code = 200
+        response.json.return_value = []
+        response.content = b"[]"
+        return response
+
+    @pytest.fixture
+    def mock_get(self):
+        with patch("traktor.trakt_official.requests.get") as mock:
+            yield mock
+
+    def test_request_empty_dict_returns_empty_list(self, client, mock_get):
+        """Empty dict response is normalized to an empty list."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = {}
+        mock_get.return_value = mock_response
+
+        result = client._request("movies/trending")
+
+        assert result == []
+
+    def test_request_scalar_response_wrapped(self, client, mock_get):
+        """Non-list, non-dict responses are wrapped in a list."""
+        mock_response = MagicMock()
+        mock_response.json.return_value = "single"
+        mock_get.return_value = mock_response
+
+        result = client._request("movies/trending")
+
+        assert result == ["single"]
+
+    def test_get_movies_anticipated(self, client, mock_get, mock_response):
+        """Movies anticipated endpoint."""
+        mock_get.return_value = mock_response
+        result = client.get_movies_anticipated(limit=5)
+        assert result == []
+
+    def test_get_movies_boxoffice_default_limit(self, client, mock_get, mock_response):
+        """Box office endpoint uses default limit 10."""
+        mock_get.return_value = mock_response
+        result = client.get_movies_boxoffice()
+        assert result == []
+
+    def test_get_shows_trending(self, client, mock_get, mock_response):
+        """Shows trending endpoint."""
+        mock_get.return_value = mock_response
+        result = client.get_shows_trending(limit=5)
+        assert result == []
+
+    def test_get_shows_played(self, client, mock_get, mock_response):
+        """Shows played endpoint builds the period path."""
+        mock_get.return_value = mock_response
+        result = client.get_shows_played(period="monthly", limit=5)
+        assert result == []
+
+    def test_get_shows_watched(self, client, mock_get, mock_response):
+        """Shows watched endpoint."""
+        mock_get.return_value = mock_response
+        result = client.get_shows_watched(period="yearly", limit=5)
+        assert result == []
+
+    def test_get_shows_collected(self, client, mock_get, mock_response):
+        """Shows collected endpoint."""
+        mock_get.return_value = mock_response
+        result = client.get_shows_collected(period="weekly", limit=5)
+        assert result == []
+
+    def test_get_shows_anticipated(self, client, mock_get, mock_response):
+        """Shows anticipated endpoint."""
+        mock_get.return_value = mock_response
+        result = client.get_shows_anticipated(limit=5)
+        assert result == []
+
+    def test_get_movies_collected(self, client, mock_get, mock_response):
+        """Movies collected endpoint."""
+        mock_get.return_value = mock_response
+        result = client.get_movies_collected(period="monthly", limit=5)
+        assert result == []
+
+    def test_get_movies_watched(self, client, mock_get, mock_response):
+        """Movies watched endpoint."""
+        mock_get.return_value = mock_response
+        result = client.get_movies_watched(period="weekly", limit=5)
+        assert result == []
+
+    def test_parse_items_skips_non_dict_entries(self, client):
+        """Non-dict entries are skipped during parsing."""
+        data = [{"invalid": True}, "string-entry", 42]
+        items = client._parse_items(data, "movies.trending")
+        assert len(items) == 0

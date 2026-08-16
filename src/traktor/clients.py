@@ -28,7 +28,7 @@ from .settings import (
     TRAKT_REDIRECT_URI,
     TRAKT_REFRESH_TOKEN,
 )
-from .utils import normalize_tmdb_id
+from .utils import normalize_tmdb_id, parse_timestamp
 
 # Constants for API pagination and safety limits
 MAX_HISTORY_PAGES = 1000  # Safety limit to prevent infinite loops in pagination
@@ -43,7 +43,6 @@ RETRY_BACKOFF_BASE = 2  # exponential backoff base
 # Connection pooling constants
 CONNECTION_POOL_SIZE = 10  # Maximum connections to keep in pool
 CONNECTION_POOL_MAXSIZE = 10  # Maximum connections to keep in pool for reuse
-CONNECTION_MAX_REUSE = 100  # Maximum times to reuse a connection before recycling
 
 # Playlist management constants
 MAX_PLAYLIST_SIZE_FOR_INCREMENTAL = 1000  # Playlists larger than this are deleted and recreated
@@ -107,6 +106,63 @@ class CacheManager:
         self.cache_meta_file = CACHE_DIR / "cache_metadata.json"
         self.memory_cache: Dict[str, Any] = {}
         self._plex_objects: Dict[str, Any] = {}
+        # Lazily-built reverse indexes (see properties below). Invalidated
+        # whenever the memory cache is replaced or extended.
+        self._movie_key_to_ids: Optional[Dict[int, Tuple[Optional[str], Optional[str]]]] = None
+        self._show_key_to_imdb: Optional[Dict[int, str]] = None
+        self._movie_imdb_to_rating_key: Optional[Dict[str, int]] = None
+
+    def _invalidate_reverse_indexes(self) -> None:
+        """Drop lazily-built reverse indexes; rebuilt on next property access."""
+        self._movie_key_to_ids = None
+        self._show_key_to_imdb = None
+        self._movie_imdb_to_rating_key = None
+
+    @property
+    def movie_key_to_ids(self) -> Dict[int, Tuple[Optional[str], Optional[str]]]:
+        """Map Plex movie rating key -> (imdb_id, tmdb_id), built once.
+
+        Pure function of the cache: avoids rebuilding this reverse map on every
+        watch-sync pull (see TODO audit A3/B3).
+        """
+        if self._movie_key_to_ids is None:
+            ids_map: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
+            for imdb_id, data in self.memory_cache.get("movies_by_imdb", {}).items():
+                rating_key = data.get("ratingKey")
+                if rating_key:
+                    ids_map.setdefault(rating_key, (imdb_id, None))
+            for tmdb_id, data in self.memory_cache.get("movies_by_tmdb", {}).items():
+                rating_key = data.get("ratingKey")
+                if rating_key:
+                    existing = ids_map.get(rating_key)
+                    if existing:
+                        ids_map[rating_key] = (existing[0], tmdb_id)
+                    else:
+                        ids_map[rating_key] = (None, tmdb_id)
+            self._movie_key_to_ids = ids_map
+        return self._movie_key_to_ids
+
+    @property
+    def show_key_to_imdb(self) -> Dict[int, str]:
+        """Map Plex show rating key -> show imdb_id, built once."""
+        if self._show_key_to_imdb is None:
+            self._show_key_to_imdb = {
+                data["ratingKey"]: imdb_id
+                for imdb_id, data in self.memory_cache.get("shows_by_imdb", {}).items()
+                if data.get("ratingKey")
+            }
+        return self._show_key_to_imdb
+
+    @property
+    def movie_imdb_to_rating_key(self) -> Dict[str, int]:
+        """Map movie imdb_id -> Plex rating key, built once."""
+        if self._movie_imdb_to_rating_key is None:
+            self._movie_imdb_to_rating_key = {
+                imdb_id: data["ratingKey"]
+                for imdb_id, data in self.memory_cache.get("movies_by_imdb", {}).items()
+                if data.get("ratingKey") and imdb_id
+            }
+        return self._movie_imdb_to_rating_key
 
     def _get_library_hash(self) -> Optional[str]:
         """Get a hash of current library state for cache invalidation."""
@@ -207,6 +263,7 @@ class CacheManager:
         Returns:
             True if loaded from disk/updated incrementally, False if rebuilt
         """
+        self._invalidate_reverse_indexes()
         if not force_refresh and self._is_cache_valid():
             logger.info("Loading library cache from disk...")
             try:
@@ -322,9 +379,12 @@ class CacheManager:
             # Ensure TMDb IDs are stored as strings for consistent lookup
             self.memory_cache[f"{media_type}s_by_tmdb"][str(tmdb_id)] = item_data
 
+        self._invalidate_reverse_indexes()
+
     def _build_cache(self):
         """Build cache by scanning all library items."""
         self._plex_objects.clear()
+        self._invalidate_reverse_indexes()
         self.memory_cache = {
             "movies_by_imdb": {},
             "movies_by_tmdb": {},
@@ -436,19 +496,12 @@ class CacheManager:
 
         plexapi >= 4.17 converts ``addedAt`` to a naive local ``datetime`` via
         ``utils.toDatetime()``; older versions exposed a raw epoch integer.
+        This is a thin wrapper over the canonical :func:`utils.parse_timestamp`.
 
         Returns:
             Timezone-aware datetime, or None if the value is missing/unparseable.
         """
-        if added_at is None:
-            return None
-        if isinstance(added_at, datetime):
-            # Naive datetimes from plexapi are in system local time;
-            # astimezone() on a naive datetime interprets it as local.
-            return added_at.astimezone(timezone.utc)
-        if isinstance(added_at, (int, float)):
-            return datetime.fromtimestamp(added_at, tz=timezone.utc)
-        return None
+        return parse_timestamp(added_at)
 
     def _incremental_cache_update(self) -> bool:
         """Update cache incrementally using recentlyAdded API.
@@ -536,15 +589,6 @@ class CacheManager:
         except Exception as e:
             logger.error(f"Incremental cache update failed: {e}")
             return False
-
-    def update_cache_incremental(self) -> bool:
-        """Public method to trigger incremental cache update.
-
-        Returns:
-            True if successful, False if fallback to full rebuild needed
-        """
-        logger.info("Attempting incremental cache update...")
-        return self._incremental_cache_update()
 
     def find_movie_by_imdb(self, imdb_id: str) -> Optional[Dict[str, Any]]:
         return self.memory_cache["movies_by_imdb"].get(imdb_id)
@@ -936,6 +980,57 @@ class TraktClient:
                 "Trakt API unavailable (circuit breaker open)"
             )
 
+    def _execute_with_token_refresh(
+        self,
+        method: str,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        json_data: Optional[Dict[str, Any]] = None,
+    ):
+        """Execute a Trakt request, refreshing the access token once on 401.
+
+        Shared by the GET (``_request``) and POST (``_post_with_token_refresh``)
+        paths so the 401 -> refresh -> retry-once logic lives in a single place.
+        On refresh failure the request is aborted with a clear error prompting
+        the user to re-authenticate (``--force-auth``).
+
+        Args:
+            method: HTTP method ("GET" or "POST")
+            url: Full request URL
+            headers: Request headers
+            params: Query parameters (GET)
+            json_data: JSON payload (POST)
+
+        Returns:
+            Response object from requests
+
+        Raises:
+            requests.exceptions.RequestException: If refresh fails or the
+                circuit breaker is open
+        """
+        response = self._execute_request(
+            method, url, headers=headers, params=params, json_data=json_data
+        )
+
+        if response.status_code == HTTP_UNAUTHORIZED:
+            logger.warning("Received 401 - Token expired, attempting refresh...")
+            if self.auth.refresh_access_token():
+                logger.info("Token refreshed successfully, retrying request...")
+                headers = self.auth.get_headers()
+                response = self._execute_request(
+                    method, url, headers=headers, params=params, json_data=json_data
+                )
+                logger.debug(f"Retry response status: {response.status_code}")
+            else:
+                logger.error("Failed to refresh token - authentication is invalid")
+                print("Trakt token refresh failed. Run with --force-auth to re-authenticate.")
+                raise requests.exceptions.RequestException(
+                    "Trakt authentication expired. Run with --force-auth to re-authenticate."
+                )
+
+        return response
+
     def _request(self, endpoint, params=None):
         url = f"{TRAKT_API_URL}/{endpoint}"
         headers = self.auth.get_headers()
@@ -949,7 +1044,7 @@ class TraktClient:
 
         start_time = time.time()
         try:
-            response = self._execute_request("GET", url, headers=headers, params=params)
+            response = self._execute_with_token_refresh("GET", url, headers=headers, params=params)
 
             elapsed = time.time() - start_time
             performance_monitor.record_api_call(endpoint, elapsed)
@@ -965,20 +1060,6 @@ class TraktClient:
                     }
                 },
             )
-
-            if response.status_code == HTTP_UNAUTHORIZED:
-                logger.warning("Received 401 - Token expired, attempting refresh...")
-                if self.auth.refresh_access_token():
-                    logger.info("Token refreshed successfully, retrying request...")
-                    headers = self.auth.get_headers()
-                    response = self._request_with_retry("GET", url, headers=headers, params=params)
-                    logger.debug(f"Retry response status: {response.status_code}")
-                else:
-                    logger.error("Failed to refresh token - authentication is invalid")
-                    print("Trakt token refresh failed. Run with --force-auth to re-authenticate.")
-                    raise requests.exceptions.RequestException(
-                        "Trakt authentication expired. Run with --force-auth to re-authenticate."
-                    )
 
             response.raise_for_status()
 
@@ -1022,25 +1103,7 @@ class TraktClient:
         logger.info(f"Fetching items from list: {list_id} (user: {username})")
 
         try:
-            all_items = []
-            page = 1
-            limit = 100
-
-            while True:
-                params = {"page": page, "limit": limit}
-                response = self._request(f"users/{username}/lists/{list_id}/items", params=params)
-                data = response.json()
-
-                if not data:
-                    break
-
-                all_items.extend(data)
-                logger.debug(f"Retrieved page {page}, got {len(data)} items")
-
-                if len(data) < limit:
-                    break
-
-                page += 1
+            all_items = self._paginated_get(f"users/{username}/lists/{list_id}/items")
 
             logger.info(f"Retrieved {len(all_items)} item(s) from list")
 
@@ -1090,7 +1153,9 @@ class TraktClient:
             items = []
             for item in data:
                 collected_at = item.get("collected_at")
-                media_data = item.get(media_type[:-1] if media_type == "movies" else media_type, {})
+                # Trakt collection responses use the singular media key
+                # ("movie" / "show") regardless of the endpoint plural.
+                media_data = item.get("movie" if media_type == "movies" else "show", {})
 
                 if media_data:
                     formatted_item = {
@@ -1185,27 +1250,47 @@ class TraktClient:
             logger.error(f"Failed to fetch watched history: {e}", exc_info=True)
             raise
 
-    def get_all_watched_history(self, media_type: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Fetch all watched history from Trakt (paginated).
+    def _paginated_get(
+        self,
+        endpoint: str,
+        params_base: Optional[Dict[str, Any]] = None,
+        page_size: int = DEFAULT_API_PAGE_SIZE,
+    ) -> List[Dict[str, Any]]:
+        """Fetch all pages of a Trakt endpoint.
+
+        Shared pagination helper: requests pages until the Trakt page-count
+        header is reached, a short page is returned, or the safety limit
+        ``MAX_HISTORY_PAGES`` is hit.
 
         Args:
-            media_type: Filter by type ('movies', 'episodes', 'shows') or None for all
+            endpoint: Trakt API endpoint path
+            params_base: Extra query params applied to every page
+            page_size: Items per page (max 100)
 
         Returns:
-            List of all watched history items
+            Concatenated list of items from all pages
         """
-        all_items = []
+        all_items: List[Dict[str, Any]] = []
         page = 1
-        limit = 100
+        params_base = params_base or {}
 
         while True:
-            items = self.get_watched_history(media_type=media_type, page=page, limit=limit)
-            if not items:
+            params = {**params_base, "page": page, "limit": page_size}
+            response = self._request(endpoint, params=params)
+            data = response.json()
+            if not data:
                 break
 
-            all_items.extend(items)
+            all_items.extend(data)
 
-            if len(items) < limit:
+            # Respect Trakt pagination headers if present; otherwise treat
+            # a short page as the end of the list.
+            try:
+                page_count = int(response.headers.get("X-Pagination-Page-Count", page))
+            except (TypeError, ValueError):
+                page_count = page
+
+            if page >= page_count or len(data) < page_size:
                 break
 
             page += 1
@@ -1215,7 +1300,6 @@ class TraktClient:
                 logger.warning(f"Reached page limit ({MAX_HISTORY_PAGES}), stopping pagination")
                 break
 
-        logger.info(f"Total history items fetched: {len(all_items)}")
         return all_items
 
     def get_watched_movies(self) -> List[Dict[str, Any]]:
@@ -1226,38 +1310,8 @@ class TraktClient:
         """
         logger.info("Fetching watched movies from Trakt...")
 
-        all_items: List[Dict[str, Any]] = []
-        page = 1
-        limit = DEFAULT_API_PAGE_SIZE
-
         try:
-            while True:
-                response = self._request(
-                    "sync/watched/movies", params={"page": page, "limit": limit}
-                )
-                data = response.json()
-                if not data:
-                    break
-
-                all_items.extend(data)
-
-                # Respect Trakt pagination headers if present; otherwise treat
-                # a short page as the end of the list.
-                try:
-                    page_count = int(response.headers.get("X-Pagination-Page-Count", page))
-                except (TypeError, ValueError):
-                    page_count = page
-
-                if page >= page_count or len(data) < limit:
-                    break
-
-                page += 1
-
-                # Safety limit to prevent infinite loops
-                if page > MAX_HISTORY_PAGES:
-                    logger.warning(f"Reached page limit ({MAX_HISTORY_PAGES}), stopping pagination")
-                    break
-
+            all_items = self._paginated_get("sync/watched/movies")
             logger.info(f"Retrieved {len(all_items)} watched movie(s)")
             return all_items
 
@@ -1308,20 +1362,7 @@ class TraktClient:
         endpoint = url.replace(f"{TRAKT_API_URL}/", "")
         start_time = time.time()
 
-        try:
-            response = self._request_with_retry("POST", url, headers=headers, json_data=payload)
-        except requests.exceptions.HTTPError as e:
-            if e.response.status_code == HTTP_UNAUTHORIZED:
-                logger.warning("Received 401 - Token expired, attempting refresh...")
-                if self.auth.refresh_access_token():
-                    headers = self.auth.get_headers()
-                    response = self._request_with_retry(
-                        "POST", url, headers=headers, json_data=payload
-                    )
-                else:
-                    raise
-            else:
-                raise
+        response = self._execute_with_token_refresh("POST", url, headers=headers, json_data=payload)
 
         elapsed = time.time() - start_time
         performance_monitor.record_api_call(endpoint, elapsed)
@@ -1852,52 +1893,6 @@ class PlexClient:
 
         return to_delete if dry_run else deleted
 
-    def get_watched_items(self, section_type: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Get all watched items from Plex.
-
-        Args:
-            section_type: Filter by section type ('movie', 'show') or None for all
-
-        Returns:
-            List of watched items with their metadata
-        """
-        logger.info(f"Fetching watched items from Plex (type={section_type})...")
-
-        watched_items = []
-
-        try:
-            for section in self.server.library.sections():
-                if section_type and section.type != section_type:
-                    continue
-
-                if section.type not in ("movie", "show"):
-                    continue
-
-                logger.debug(f"Checking section: {section.title} ({section.type})")
-
-                # Get recently watched items from section history
-                try:
-                    history = section.history()
-                    for item in history:
-                        watched_items.append(
-                            {
-                                "ratingKey": item.ratingKey,
-                                "title": item.title,
-                                "type": section.type,
-                                "lastViewedAt": getattr(item, "lastViewedAt", None),
-                                "viewCount": getattr(item, "viewCount", 0),
-                            }
-                        )
-                except Exception as e:
-                    logger.warning(f"Could not get history for section {section.title}: {e}")
-
-            logger.info(f"Found {len(watched_items)} watched item(s)")
-            return watched_items
-
-        except Exception as e:
-            logger.error(f"Failed to get watched items: {e}", exc_info=True)
-            return []
-
     def mark_as_watched(self, rating_key: Union[str, int]) -> bool:
         """Mark an item as watched in Plex.
 
@@ -2033,49 +2028,6 @@ class PlexClient:
             f"Batch mark as unwatched completed: {results['success']} succeeded, {results['failed']} failed"
         )
         return results
-
-    def get_play_history(
-        self, rating_key: Optional[Union[str, int]] = None, max_results: int = 100
-    ) -> List[Any]:
-        """Get play history for an item or all items.
-
-        Args:
-            rating_key: Specific item rating key or None for all history
-            max_results: Maximum number of history entries to return
-
-        Returns:
-            List of history entries
-        """
-        logger.info(f"Fetching play history (rating_key={rating_key})...")
-
-        history_entries = []
-
-        try:
-            if rating_key:
-                # Get history for specific item
-                item = self.server.fetchItem(rating_key)
-                if hasattr(item, "history"):
-                    history_entries = item.history()
-                else:
-                    logger.warning(f"Item does not support history: {item.title}")
-            else:
-                # Get all history from all sections
-                for section in self.server.library.sections():
-                    if section.type in ("movie", "show"):
-                        try:
-                            section_history = section.history(maxresults=max_results)
-                            history_entries.extend(section_history)
-                        except Exception as e:
-                            logger.warning(
-                                f"Could not get history for section {section.title}: {e}"
-                            )
-
-            logger.info(f"Retrieved {len(history_entries)} history entries")
-            return history_entries
-
-        except Exception as e:
-            logger.error(f"Failed to get play history: {e}", exc_info=True)
-            return []
 
     def is_watched(self, rating_key: Union[str, int]) -> Tuple[bool, Optional[Any]]:
         """Check if an item is watched using cache (no API call).

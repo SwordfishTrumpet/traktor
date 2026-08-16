@@ -211,14 +211,6 @@ class WatchHistoryManager:
 
         return False
 
-    def get_all_synced_items(self):
-        """Get all synced items.
-
-        Returns:
-            List of synced item dicts
-        """
-        return self.state["synced_items"].copy()
-
     def get_stats(self):
         """Get statistics about synced items.
 

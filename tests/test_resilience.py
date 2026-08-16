@@ -363,3 +363,192 @@ class TestCircuitBreaker:
 
         breaker.call(lambda: "success")
         assert breaker.get_stats()["failure_count"] == 0
+
+
+class TestBackupManager:
+    """Coverage for BackupManager create/restore/verify/cleanup (TODO audit D5)."""
+
+    @pytest.fixture
+    def backup_env(self, tmp_path, monkeypatch):
+        """BackupManager pointed at temp sources and backup dir."""
+        import traktor.resilience as res
+
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"key": "value"}')
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / "entry.json").write_text('{"cached": true}')
+
+        monkeypatch.setattr(res, "CONFIG_FILE", config_file)
+        monkeypatch.setattr(res, "TOKEN_FILE", tmp_path / "missing-token.json")
+        monkeypatch.setattr(res, "CACHE_DIR", cache_dir)
+
+        backup_dir = tmp_path / "backups"
+        manager = res.BackupManager(backup_dir=backup_dir, max_backups=2, compress=True)
+        return manager, tmp_path
+
+    def test_create_backup_compressed(self, backup_env):
+        """Backup compresses files and writes a manifest."""
+        manager, tmp_path = backup_env
+        backup_path = manager.create_backup(reason="test")
+
+        assert backup_path.exists()
+        manifest = json.loads((backup_path / "manifest.json").read_text())
+        assert "config" in manifest["items"]
+        assert manifest["items"]["config"]["compressed"] is True
+        # Missing token source is skipped
+        assert "token" not in manifest["items"]
+        # Cache dir backed up with gz entry
+        gz_files = [p.name for p in (backup_path / "cache").rglob("*.gz")]
+        assert "entry.json.gz" in gz_files
+
+    def test_create_and_restore_roundtrip(self, backup_env):
+        """Restore brings back the backed-up files."""
+        import traktor.resilience as res
+
+        manager, tmp_path = backup_env
+        backup_path = manager.create_backup(reason="test")
+
+        # Corrupt the original, then restore
+        res.CONFIG_FILE.write_text('{"corrupted": true}')
+        assert manager.restore_backup(backup_path) is True
+        assert res.CONFIG_FILE.read_text() == '{"key": "value"}'
+
+    def test_restore_missing_manifest(self, backup_env):
+        """Backup without manifest cannot be restored."""
+        manager, tmp_path = backup_env
+        empty = tmp_path / "empty"
+        empty.mkdir()
+        assert manager.restore_backup(empty) is False
+
+    def test_restore_corrupt_manifest(self, backup_env):
+        """Corrupt manifest is handled gracefully (returns False)."""
+        manager, tmp_path = backup_env
+        bad = tmp_path / "bad"
+        bad.mkdir()
+        (bad / "manifest.json").write_text("{not json")
+        assert manager.restore_backup(bad) is False
+
+    def test_restore_verification_failure(self, backup_env):
+        """Checksum mismatch aborts restore."""
+        manager, tmp_path = backup_env
+        backup_path = manager.create_backup(reason="test")
+
+        # Corrupt a backed-up item so verification fails
+        item_gz = backup_path / "config.gz"
+        item_gz.write_bytes(b"tampered")
+
+        assert manager.restore_backup(backup_path, verify=True) is False
+
+    def test_list_backups(self, backup_env):
+        """list_backups returns metadata from manifests."""
+        manager, _ = backup_env
+        manager.create_backup(reason="alpha")
+        manager.create_backup(reason="beta")
+
+        backups = manager.list_backups()
+
+        assert len(backups) == 2
+        reasons = {b["reason"] for b in backups}
+        assert reasons == {"alpha", "beta"}
+
+    def test_cleanup_old_backups(self, backup_env):
+        """max_backups bounds the number of retained backups."""
+        manager, _ = backup_env
+        for i in range(4):
+            manager.create_backup(reason=f"run-{i}")
+
+        backups = manager.list_backups()
+        assert len(backups) <= 2
+
+    def test_restore_uncompressed_backup(self, backup_env, monkeypatch):
+        """Restore works with compress=False backups too."""
+        import traktor.resilience as res
+
+        manager, tmp_path = backup_env
+        manager.compress = False
+        backup_path = manager.create_backup(reason="uncompressed")
+
+        res.CONFIG_FILE.write_text('{"corrupted": true}')
+        assert manager.restore_backup(backup_path) is True
+        assert res.CONFIG_FILE.read_text() == '{"key": "value"}'
+
+
+class TestIntegrityChecker:
+    """Coverage for IntegrityChecker checks (TODO audit D5)."""
+
+    @pytest.fixture
+    def checker(self, tmp_path, monkeypatch):
+        import traktor.resilience as res
+
+        config = tmp_path / "config.json"
+        token = tmp_path / "token.json"
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        monkeypatch.setattr(res, "CONFIG_FILE", config)
+        monkeypatch.setattr(res, "TOKEN_FILE", token)
+        monkeypatch.setattr(res, "CACHE_DIR", cache)
+        return res.IntegrityChecker(), tmp_path
+
+    def test_missing_files_are_healthy(self, checker):
+        """Missing config/token/cache are reported as healthy (optional)."""
+        checker, tmp_path = checker
+        results = checker.run_all_checks()
+        assert results["overall_healthy"] is True
+
+    def test_valid_config_and_token(self, checker):
+        """Valid config and token files pass."""
+        checker, tmp_path = checker
+        (tmp_path / "config.json").write_text('{"key": "value"}')
+        (tmp_path / "token.json").write_text('{"access_token": "a", "refresh_token": "b"}')
+
+        results = checker.run_all_checks()
+
+        assert results["overall_healthy"] is True
+        assert results["checks"]["config"]["healthy"] is True
+
+    def test_corrupt_config_fails(self, checker):
+        """Corrupt config JSON is flagged."""
+        checker, tmp_path = checker
+        (tmp_path / "config.json").write_text("{bad json")
+
+        results = checker.run_all_checks()
+
+        assert results["checks"]["config"]["healthy"] is False
+        assert results["overall_healthy"] is False
+
+    def test_token_missing_required_keys_fails(self, checker):
+        """Token file without required keys is flagged."""
+        checker, tmp_path = checker
+        (tmp_path / "token.json").write_text('{"foo": "bar"}')
+
+        results = checker.run_all_checks()
+
+        assert results["checks"]["token"]["healthy"] is False
+
+    def test_corrupt_cache_file_fails(self, checker):
+        """Corrupt JSON in the cache directory is flagged."""
+        checker, tmp_path = checker
+        (tmp_path / "cache" / "bad.json").write_text("{bad json")
+
+        results = checker.run_all_checks()
+
+        assert results["checks"]["cache"]["healthy"] is False
+
+    def test_check_exception_handled(self, checker, monkeypatch):
+        """A throwing check is reported as unhealthy, not raised."""
+        checker, tmp_path = checker
+
+        def boom():
+            raise RuntimeError("check crashed")
+
+        checker.checks = [
+            ("config", boom),
+            ("token", checker._check_token),
+            ("cache", checker._check_cache),
+        ]
+
+        results = checker.run_all_checks()
+
+        assert results["overall_healthy"] is False
+        assert "error" in results["checks"]["config"]

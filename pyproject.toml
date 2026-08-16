@@ -1,6 +1,6 @@
 [project]
 name = "traktor"
-version = "1.0.0"
+version = "1.1.0"
 description = "Sync liked Trakt lists into Plex playlists with cache-assisted matching"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -8,7 +8,7 @@ from plexapi.exceptions import NotFound
 
 from .log import logger
 from .progress import SyncProgress
-from .utils import normalize_tmdb_id
+from .utils import normalize_tmdb_id, parse_timestamp
 
 # Constants for progress sync
 DEFAULT_PROGRESS_THRESHOLD_MS = (
@@ -32,10 +32,11 @@ class WatchSyncEngine:
 
         Plex (via plexapi) returns timestamps as naive *local* datetimes
         (``datetime.fromtimestamp``), which are serialized to naive ISO strings
-        in the cache. This method handles Unix epoch ints/floats, ISO strings,
-        and datetime objects, and always returns a timezone-aware UTC datetime
-        so the result can be compared against ``since`` (an aware UTC datetime)
-        without raising TypeError.
+        in the cache. This thin wrapper over the canonical
+        :func:`utils.parse_timestamp` handles Unix epoch ints/floats, ISO
+        strings, and datetime objects, and always returns a timezone-aware UTC
+        datetime so the result can be compared against ``since`` (an aware UTC
+        datetime) without raising TypeError.
 
         Naive datetimes are interpreted as system local time, matching
         plexapi's ``datetime.fromtimestamp()`` behavior.
@@ -46,35 +47,7 @@ class WatchSyncEngine:
         Returns:
             Aware UTC datetime or None if parsing fails
         """
-        if timestamp is None:
-            return None
-
-        try:
-            # Handle datetime objects (e.g. from a PlexAPI item lookup)
-            if isinstance(timestamp, datetime):
-                return timestamp.astimezone(timezone.utc)
-
-            # Handle Unix timestamp (int or float)
-            if isinstance(timestamp, (int, float)):
-                return datetime.fromtimestamp(timestamp, tz=timezone.utc)
-
-            # Handle string timestamps (ISO format)
-            if isinstance(timestamp, str):
-                # Try ISO format first
-                try:
-                    dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-                except ValueError:
-                    # Try parsing as Unix timestamp string
-                    try:
-                        return datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
-                    except ValueError:
-                        return None
-                # Naive ISO strings are system local time, matching plexapi
-                return dt.astimezone(timezone.utc)
-
-            return None
-        except (ValueError, TypeError, OverflowError):
-            return None
+        return parse_timestamp(timestamp)
 
     def __init__(
         self,
@@ -103,6 +76,7 @@ class WatchSyncEngine:
             "trakt_unwatched": 0,
             "conflicts_resolved": 0,
             "errors": 0,
+            "items_skipped_due_to_delta": 0,
         }
 
     def sync_watched_status(
@@ -293,28 +267,10 @@ class WatchSyncEngine:
             # Get items from cache manager and check their watch status
             cache = self.plex.cache.memory_cache
 
-            # Build reverse lookup: rating_key -> external IDs for efficient lookup
-            # This avoids O(n*m) complexity when searching for external IDs
-            movie_key_to_ids = {}
-            for imdb_id, data in cache.get("movies_by_imdb", {}).items():
-                rating_key = data.get("ratingKey")
-                if rating_key:
-                    movie_key_to_ids[rating_key] = (imdb_id, None)
-            for tmdb_id, data in cache.get("movies_by_tmdb", {}).items():
-                rating_key = data.get("ratingKey")
-                if rating_key:
-                    existing = movie_key_to_ids.get(rating_key)
-                    if existing:
-                        movie_key_to_ids[rating_key] = (existing[0], tmdb_id)
-                    else:
-                        movie_key_to_ids[rating_key] = (None, tmdb_id)
-
-            # Build show lookup: rating_key -> show_imdb
-            show_key_to_imdb = {}
-            for imdb_id, data in cache.get("shows_by_imdb", {}).items():
-                rating_key = data.get("ratingKey")
-                if rating_key:
-                    show_key_to_imdb[rating_key] = imdb_id
+            # Reverse lookups are pre-built by CacheManager (pure functions of
+            # the cache, built once when loaded - see TODO audit A3/B3).
+            movie_key_to_ids = self.plex.cache.movie_key_to_ids
+            show_key_to_imdb = self.plex.cache.show_key_to_imdb
 
             # Process movies from cache (unless shows_only is True)
             if not shows_only:
@@ -441,10 +397,21 @@ class WatchSyncEngine:
 
         This helper method reduces memory usage by processing episodes in batches
         rather than all at once.
+
+        Watch status is read directly from the episode objects returned by
+        ``season.episodes()`` (``isWatched``/``lastViewedAt`` attributes are
+        populated from that response). Previously every episode triggered a
+        ``fetchItem`` API call via ``PlexClient.is_watched()`` because episodes
+        were never added to the rating-key cache - an API storm of ~100k calls
+        for large libraries (see TODO audit A1).
         """
         for episode in episodes:
             ep_rating_key = episode.ratingKey
-            is_watched, last_viewed = self.plex.is_watched(ep_rating_key)
+
+            # No per-episode API call: the season.episodes() response already
+            # carries viewCount/lastViewedAt for every episode.
+            is_watched = getattr(episode, "isWatched", False)
+            last_viewed = getattr(episode, "lastViewedAt", None)
 
             # Skip if we're in delta mode and item hasn't changed since last sync
             if since and last_viewed:
@@ -919,12 +886,10 @@ class WatchSyncEngine:
             # Get Plex cache for lookups
             cache = self.plex.cache.memory_cache
 
-            # Build lookup: imdb_id -> rating_key for movies
-            movie_imdb_to_rating_key = {}
-            for imdb_id, data in cache.get("movies_by_imdb", {}).items():
-                rating_key = data.get("ratingKey")
-                if rating_key and imdb_id:
-                    movie_imdb_to_rating_key[imdb_id] = rating_key
+            # Build lookup: imdb_id -> rating_key for movies (pre-built by
+            # CacheManager, see TODO audit B3 - avoids duplicate reverse-map
+            # construction between _pull_from_plex and this method).
+            movie_imdb_to_rating_key = self.plex.cache.movie_imdb_to_rating_key
 
             # Build lookup: (show_imdb, season, episode) -> rating_key for episodes
             # Note: Episode progress sync is not yet implemented.
@@ -1045,22 +1010,3 @@ class WatchSyncEngine:
             logger.error(f"Unexpected error during progress sync: {e}", exc_info=True)
             progress_stats["errors"] += 1
             return progress_stats
-
-    def get_sync_summary(self) -> Dict[str, Any]:
-        """Get a summary of the last sync operation.
-
-        Returns:
-            Dict with sync summary information
-        """
-        last_sync = self.history.get_last_sync_timestamp()
-        stats = self.history.get_stats()
-
-        return {
-            "last_sync": last_sync.isoformat() if last_sync else None,
-            "total_tracked_items": stats["total_items"],
-            "watched_both": stats["watched_both"],
-            "watched_plex_only": stats["watched_plex_only"],
-            "watched_trakt_only": stats["watched_trakt_only"],
-            "unwatched_both": stats["unwatched_both"],
-            "last_operation_stats": self.stats,
-        }

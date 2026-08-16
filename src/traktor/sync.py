@@ -24,7 +24,6 @@ from .conflict_resolver import ConflictResolver
 from .history_manager import WatchHistoryManager
 from .interactive import (
     preview_changes,
-    restore_undo_snapshot,
     save_undo_snapshot,
 )
 from .log import logger
@@ -562,16 +561,6 @@ class MissingItemTracker:
 
 # Module-level tracker instance for backward-compatible wrapper functions
 _default_tracker = MissingItemTracker()
-
-
-def _build_missing_item(list_name, media_type, title, year="", imdb_id="", tmdb_id=""):
-    """Backward-compatible wrapper - build a missing item dictionary."""
-    return _default_tracker.build_item(list_name, media_type, title, year, imdb_id, tmdb_id)
-
-
-def _extract_missing_item_details(item):
-    """Backward-compatible wrapper - extract missing item details."""
-    return _default_tracker.extract_details(item)
 
 
 def _record_missing_result(list_name, result, not_found, stats, missing_items):
@@ -1196,86 +1185,6 @@ def _save_playlist_snapshot(plex, config):
             pass
 
     return playlists
-
-
-def _restore_playlist_snapshot(plex, snapshot_data):
-    """Restore playlists from an undo snapshot.
-
-    Args:
-        plex: PlexClient instance.
-        snapshot_data: Snapshot data dict with playlist info.
-
-    Returns:
-        Number of playlists restored.
-    """
-    playlists = snapshot_data.get("playlists", {})
-    restored = 0
-
-    for name, info in playlists.items():
-        items = info.get("items", [])
-        description = info.get("description", "")
-
-        plex_items = []
-        for rating_key in items:
-            try:
-                item = plex._get_plex_item(rating_key)
-                if item:
-                    plex_items.append(item)
-            except Exception:
-                pass
-
-        try:
-            plex.create_or_update_playlist(name, plex_items, description=description)
-            restored += 1
-            logger.info(f"Restored playlist from snapshot: {name}")
-        except Exception as e:
-            logger.error(f"Failed to restore playlist '{name}': {e}")
-
-    return restored
-
-
-def restore_last_undo(plex_url, plex_token):
-    """Restore the most recent undo snapshot.
-
-    Args:
-        plex_url: Plex server URL.
-        plex_token: Plex token.
-
-    Returns:
-        Exit code (0 for success, 1 for failure).
-    """
-    snapshot = restore_undo_snapshot()
-    if not snapshot:
-        print("No undo snapshots found.")
-        return 1
-
-    operation_type = snapshot.get("operation_type", "unknown")
-    data = snapshot.get("data", {})
-
-    print(f"Restoring {operation_type} snapshot from {snapshot.get('timestamp', 'unknown')}")
-
-    try:
-        plex_server = PlexServer(plex_url, plex_token)
-        cache_manager = CacheManager(plex_server)
-        cache_manager.load_cache()
-        plex = PlexClient(plex_server, cache_manager)
-    except Exception as e:
-        logger.error(f"Failed to connect to Plex: {e}")
-        print(f"Failed to connect to Plex: {e}")
-        return 1
-
-    if operation_type == "playlist_sync":
-        restored = _restore_playlist_snapshot(plex, data)
-        print(f"Restored {restored} playlist(s)")
-        return 0 if restored > 0 else 1
-
-    elif operation_type == "watch_sync":
-        print("Watch sync undo: previous state has been logged.")
-        print("Please run a new sync to restore the previous watch state.")
-        return 0
-
-    print(f"Unknown operation type: {operation_type}")
-    return 1
 
 
 def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = None) -> int:

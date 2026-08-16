@@ -347,15 +347,6 @@ class TestWatchSyncEngine:
         assert sync_engine.stats["plex_watched"] == 2
         assert sync_engine.stats["trakt_unwatched"] == 2
 
-    def test_get_sync_summary(self, sync_engine):
-        """Test getting sync summary."""
-        summary = sync_engine.get_sync_summary()
-
-        assert "last_sync" in summary
-        assert "total_tracked_items" in summary
-        assert "watched_both" in summary
-        assert "last_operation_stats" in summary
-
 
 class TestEpisodeKeyUniqueness:
     """Tests for episode key uniqueness in watch sync."""
@@ -486,6 +477,66 @@ class TestEpisodeKeyUniqueness:
         assert item["show_title"] == "Test Show"
         assert item["season"] == 1
         assert item["episode"] == 1
+
+    def test_process_episode_batch_reads_state_directly(self, sync_engine):
+        """Regression A1: episode watch state comes from the season.episodes()
+        response, never from per-episode fetchItem calls via plex.is_watched().
+        """
+        watched_ep = MagicMock()
+        watched_ep.ratingKey = 101
+        watched_ep.episodeNumber = 1
+        watched_ep.isWatched = True
+        watched_ep.lastViewedAt = datetime(2024, 6, 15, 12, 0, 0)
+
+        unwatched_ep = MagicMock()
+        unwatched_ep.ratingKey = 102
+        unwatched_ep.episodeNumber = 2
+        unwatched_ep.isWatched = False
+        unwatched_ep.lastViewedAt = None
+
+        plex_state = {}
+        sync_engine._process_episode_batch(
+            [watched_ep, unwatched_ep], {"title": "Test Show"}, "tt123", 1, plex_state
+        )
+
+        sync_engine.plex.is_watched.assert_not_called()
+        assert plex_state[("episode", "tt123", 1, 1)]["watched"] is True
+        assert plex_state[("episode", "tt123", 1, 1)]["rating_key"] == 101
+        assert plex_state[("episode", "tt123", 1, 2)]["watched"] is False
+
+    def test_pull_from_plex_shows_no_episode_api_storm(self, sync_engine):
+        """Regression A1: _pull_from_plex must never call plex.is_watched for
+        episodes (previously 1 fetchItem per episode on large libraries).
+        """
+        watched_ep = MagicMock()
+        watched_ep.ratingKey = 201
+        watched_ep.episodeNumber = 3
+        watched_ep.isWatched = True
+        watched_ep.lastViewedAt = datetime(2024, 6, 15, 12, 0, 0)
+
+        season = MagicMock()
+        season.seasonNumber = 2
+        season.episodes.return_value = [watched_ep]
+
+        show_item = MagicMock()
+        show_item.seasons.return_value = [season]
+        sync_engine.plex._get_plex_item.return_value = show_item
+
+        sync_engine.plex.cache.memory_cache = {
+            "movies_by_imdb": {},
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {"tt999": {"ratingKey": 500}},
+            "movies_list": [],
+            "shows_list": [{"ratingKey": 500, "title": "Test Show"}],
+        }
+        sync_engine.plex.cache.movie_key_to_ids = {}
+        sync_engine.plex.cache.show_key_to_imdb = {500: "tt999"}
+
+        plex_state = sync_engine._pull_from_plex(shows_only=True)
+
+        sync_engine.plex.is_watched.assert_not_called()
+        assert plex_state[("episode", "tt999", 2, 3)]["watched"] is True
+        assert plex_state[("episode", "tt999", 2, 3)]["rating_key"] == 201
 
 
 class TestCalculateChangesEpisodeKeys:
@@ -795,7 +846,6 @@ class TestDeltaSyncRegression:
         ]
         # get_watched_history must never be used for the movie state
         sync_engine.trakt.get_watched_history = MagicMock(return_value=[])
-        sync_engine.trakt.get_all_watched_history = MagicMock(return_value=[])
 
         state = sync_engine._pull_from_trakt(since=since, movies_only=True)
 
@@ -803,7 +853,6 @@ class TestDeltaSyncRegression:
         assert state[("movie", "tt1234567", "12345")]["watched"] is True
         sync_engine.trakt.get_watched_movies.assert_called_once()
         sync_engine.trakt.get_watched_history.assert_not_called()
-        sync_engine.trakt.get_all_watched_history.assert_not_called()
 
     def test_pull_from_plex_handles_naive_last_viewed(self, sync_engine):
         """Naive ISO lastViewedAt values must not crash the Plex pull.
@@ -848,6 +897,12 @@ class TestDeltaSyncRegression:
             "shows_list": [],
         }
         sync_engine.plex.cache.memory_cache = cache
+        sync_engine.plex.cache.movie_key_to_ids = {
+            111: ("tt1111111", None),
+            222: ("tt2222222", None),
+            333: ("tt3333333", None),
+        }
+        sync_engine.plex.cache.show_key_to_imdb = {}
         sync_engine.stats["items_skipped_due_to_delta"] = 0
 
         plex_state = sync_engine._pull_from_plex(
@@ -866,3 +921,256 @@ class TestDeltaSyncRegression:
         unwatched = plex_state[("movie", "tt2222222", None)]
         assert unwatched["watched"] is False
         assert unwatched["rating_key"] == 222
+
+
+class TestSyncWatchedStatusOrchestration:
+    """Coverage for sync_watched_status branches (TODO audit D4)."""
+
+    def test_delta_mode(self, sync_engine):
+        """History timestamp present -> delta mode is enabled."""
+        sync_engine.history.update_last_sync_timestamp()
+        sync_engine._pull_from_plex = MagicMock(return_value={})
+        sync_engine._pull_from_trakt = MagicMock(return_value={})
+        sync_engine._calculate_changes = MagicMock(
+            return_value={
+                "plex": {"mark_watched": [], "mark_unwatched": []},
+                "trakt": {"mark_watched": [], "mark_unwatched": []},
+            }
+        )
+        sync_engine._apply_changes = MagicMock()
+
+        sync_engine.sync_watched_status()
+
+        assert sync_engine.stats["delta_mode"] is True
+        sync_engine._apply_changes.assert_called_once()
+
+    def test_backfill_mode(self, sync_engine):
+        """backfill_history=True forces a full sync (no delta)."""
+        sync_engine.history.update_last_sync_timestamp()
+        sync_engine._pull_from_plex = MagicMock(return_value={})
+        sync_engine._pull_from_trakt = MagicMock(return_value={})
+        sync_engine._calculate_changes = MagicMock(
+            return_value={
+                "plex": {"mark_watched": [], "mark_unwatched": []},
+                "trakt": {"mark_watched": [], "mark_unwatched": []},
+            }
+        )
+        sync_engine._apply_changes = MagicMock()
+
+        sync_engine.sync_watched_status(backfill_history=True)
+
+        assert sync_engine.stats["delta_mode"] is False
+
+    def test_first_run_uses_window(self, sync_engine):
+        """No history and no backfill -> first-run window is used."""
+        sync_engine._pull_from_plex = MagicMock(return_value={})
+        sync_engine._pull_from_trakt = MagicMock(return_value={})
+        sync_engine._calculate_changes = MagicMock(
+            return_value={
+                "plex": {"mark_watched": [], "mark_unwatched": []},
+                "trakt": {"mark_watched": [], "mark_unwatched": []},
+            }
+        )
+        sync_engine._apply_changes = MagicMock()
+
+        sync_engine.sync_watched_status()
+
+        # First run: last_sync is the 7-day window
+        last_sync = sync_engine.history.get_last_sync_timestamp()
+        assert last_sync is not None
+        # Called with a since window on the Plex pull
+        args, kwargs = sync_engine._pull_from_plex.call_args
+        assert kwargs.get("since") is not None
+
+    def test_both_filters_default_movies(self, sync_engine):
+        """movies_only + shows_only both set -> movies only wins."""
+        sync_engine._pull_from_plex = MagicMock(return_value={})
+        sync_engine._pull_from_trakt = MagicMock(return_value={})
+        sync_engine._calculate_changes = MagicMock(
+            return_value={
+                "plex": {"mark_watched": [], "mark_unwatched": []},
+                "trakt": {"mark_watched": [], "mark_unwatched": []},
+            }
+        )
+        sync_engine._apply_changes = MagicMock()
+
+        sync_engine.sync_watched_status(movies_only=True, shows_only=True)
+
+        args, kwargs = sync_engine._pull_from_plex.call_args
+        assert kwargs.get("movies_only") is True
+        assert kwargs.get("shows_only") is False
+
+
+class TestSyncPlaybackProgress:
+    """Coverage for sync_playback_progress (TODO audit D4)."""
+
+    def test_no_progress(self, sync_engine):
+        """Empty Trakt progress -> early return."""
+        sync_engine.trakt.get_playback_progress.return_value = {}
+
+        stats = sync_engine.sync_playback_progress()
+
+        assert stats["plex_progress_updated"] == 0
+        sync_engine.plex.batch_set_playback_progress.assert_not_called()
+
+    def test_movie_progress_updated(self, sync_engine):
+        """Movie progress is pushed to Plex."""
+        sync_engine.trakt.get_playback_progress.return_value = {
+            ("movie", "tt123"): {"title": "Movie", "progress_percent": 50.0}
+        }
+        sync_engine.plex.cache.memory_cache = {
+            "movies_by_imdb": {"tt123": {"ratingKey": 1, "duration": 600000}},
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+        }
+        sync_engine.plex.cache.movie_imdb_to_rating_key = {"tt123": 1}
+        sync_engine.plex.get_playback_progress.return_value = (0, 600000)
+        sync_engine.plex.batch_set_playback_progress.return_value = {
+            "success": 1,
+            "failed": 0,
+            "errors": [],
+        }
+
+        stats = sync_engine.sync_playback_progress()
+
+        assert stats["progress_conflicts"] == 1
+        assert stats["plex_progress_updated"] == 1
+        updates = sync_engine.plex.batch_set_playback_progress.call_args[0][0]
+        assert updates[0]["view_offset_ms"] == 300000
+
+    def test_movie_progress_already_in_sync(self, sync_engine):
+        """Small progress delta -> skipped."""
+        sync_engine.trakt.get_playback_progress.return_value = {
+            ("movie", "tt123"): {"title": "Movie", "progress_percent": 50.0}
+        }
+        sync_engine.plex.cache.memory_cache = {
+            "movies_by_imdb": {"tt123": {"ratingKey": 1, "duration": 600000}},
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+        }
+        sync_engine.plex.cache.movie_imdb_to_rating_key = {"tt123": 1}
+        # Plex already at ~50% (within 30s threshold)
+        sync_engine.plex.get_playback_progress.return_value = (300100, 600000)
+
+        stats = sync_engine.sync_playback_progress()
+
+        assert stats["skipped_already_in_sync"] == 1
+        sync_engine.plex.batch_set_playback_progress.assert_not_called()
+
+    def test_movie_progress_dry_run(self, sync_engine, caplog):
+        """Dry run logs the would-be update without applying."""
+        import logging
+
+        sync_engine.trakt.get_playback_progress.return_value = {
+            ("movie", "tt123"): {"title": "Movie", "progress_percent": 50.0}
+        }
+        sync_engine.plex.cache.memory_cache = {
+            "movies_by_imdb": {"tt123": {"ratingKey": 1, "duration": 600000}},
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+        }
+        sync_engine.plex.cache.movie_imdb_to_rating_key = {"tt123": 1}
+        sync_engine.plex.get_playback_progress.return_value = (0, 600000)
+
+        with caplog.at_level(logging.INFO):
+            stats = sync_engine.sync_playback_progress(dry_run=True)
+
+        assert stats["progress_conflicts"] == 1
+        sync_engine.plex.batch_set_playback_progress.assert_not_called()
+        assert "[DRY RUN]" in caplog.text
+
+    def test_movie_not_in_plex_skipped(self, sync_engine):
+        """Movie not found in Plex -> skipped."""
+        sync_engine.trakt.get_playback_progress.return_value = {
+            ("movie", "tt999"): {"title": "Missing", "progress_percent": 50.0}
+        }
+        sync_engine.plex.cache.memory_cache = {
+            "movies_by_imdb": {},
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+        }
+        sync_engine.plex.cache.movie_imdb_to_rating_key = {}
+
+        stats = sync_engine.sync_playback_progress()
+
+        assert stats["skipped_no_progress"] == 1
+        sync_engine.plex.batch_set_playback_progress.assert_not_called()
+
+    def test_episode_progress_skipped(self, sync_engine):
+        """Episode progress is not yet implemented -> skipped."""
+        sync_engine.trakt.get_playback_progress.return_value = {
+            ("episode", "tt123", 1, 1): {"title": "Ep", "progress_percent": 50.0}
+        }
+
+        stats = sync_engine.sync_playback_progress()
+
+        assert stats["skipped_no_progress"] == 1
+        sync_engine.plex.batch_set_playback_progress.assert_not_called()
+
+    def test_no_duration_skipped(self, sync_engine):
+        """Movie without duration info -> skipped."""
+        sync_engine.trakt.get_playback_progress.return_value = {
+            ("movie", "tt123"): {"title": "Movie", "progress_percent": 50.0}
+        }
+        sync_engine.plex.cache.memory_cache = {
+            "movies_by_imdb": {"tt123": {"ratingKey": 1, "duration": None}},
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+        }
+        sync_engine.plex.cache.movie_imdb_to_rating_key = {"tt123": 1}
+        sync_engine.plex.get_playback_progress.return_value = (None, None)
+
+        stats = sync_engine.sync_playback_progress()
+
+        assert stats["skipped_no_progress"] == 1
+
+
+class TestApplyChangesFailurePaths:
+    """Coverage for _apply_changes error paths (TODO audit D4)."""
+
+    def test_trakt_add_history_failure(self, sync_engine):
+        """Trakt add_to_history exception is counted as errors."""
+        changes = {
+            "plex": {"mark_watched": [], "mark_unwatched": []},
+            "trakt": {
+                "mark_watched": [
+                    {
+                        "key": ("movie", "tt123", None),
+                        "media_type": "movie",
+                        "imdb_id": "tt123",
+                        "tmdb_id": None,
+                        "title": "Movie",
+                        "rating_key": 1,
+                    }
+                ],
+                "mark_unwatched": [],
+            },
+        }
+        sync_engine.trakt.add_to_history.side_effect = Exception("boom")
+
+        sync_engine._apply_changes(changes)
+
+        assert sync_engine.stats["errors"] == 1
+
+    def test_trakt_remove_history_failure(self, sync_engine):
+        """Trakt remove_from_history exception is counted as errors."""
+        changes = {
+            "plex": {"mark_watched": [], "mark_unwatched": []},
+            "trakt": {
+                "mark_watched": [],
+                "mark_unwatched": [
+                    {
+                        "key": ("movie", "tt123", None),
+                        "media_type": "movie",
+                        "imdb_id": "tt123",
+                        "tmdb_id": None,
+                        "title": "Movie",
+                    }
+                ],
+            },
+        }
+        sync_engine.trakt.remove_from_history.side_effect = Exception("boom")
+
+        sync_engine._apply_changes(changes)
+
+        assert sync_engine.stats["errors"] == 1

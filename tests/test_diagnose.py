@@ -241,3 +241,128 @@ class TestRunDiagnosis:
         result = diagnose.run_diagnosis()
 
         assert result == 1
+
+
+class TestDiagnoseCommandCommonIssues:
+    """Coverage for _check_common_issues and configuration branches (TODO audit D8)."""
+
+    @pytest.fixture
+    def diagnose_cmd(self):
+        return diagnose.DiagnoseCommand()
+
+    def test_non_interactive_no_credentials_warns(self, diagnose_cmd, monkeypatch, tmp_path):
+        """Non-interactive mode with missing credentials produces a warning."""
+        import sys
+
+        monkeypatch.delenv("PLEX_URL", raising=False)
+        monkeypatch.delenv("PLEX_TOKEN", raising=False)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+        monkeypatch.setattr(diagnose, "CACHE_DIR", tmp_path / "no-cache")
+        monkeypatch.setattr(diagnose, "LOG_FILE", tmp_path / "no-log")
+        monkeypatch.setattr(diagnose, "load_config", lambda: {})
+
+        diagnose_cmd._check_common_issues()
+
+        names = {r.name for r in diagnose_cmd.results}
+        assert "Non-Interactive Mode" in names
+        result = next(r for r in diagnose_cmd.results if r.name == "Non-Interactive Mode")
+        assert result.status == "warn"
+
+    def test_non_interactive_with_saved_credentials_passes(
+        self, diagnose_cmd, monkeypatch, tmp_path
+    ):
+        """Non-interactive mode with saved credentials passes."""
+        import sys
+
+        monkeypatch.delenv("PLEX_URL", raising=False)
+        monkeypatch.delenv("PLEX_TOKEN", raising=False)
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: False)
+        monkeypatch.setattr(diagnose, "CACHE_DIR", tmp_path / "no-cache")
+        monkeypatch.setattr(diagnose, "LOG_FILE", tmp_path / "no-log")
+        monkeypatch.setattr(diagnose, "load_config", lambda: {"plex_url": "http://x"})
+
+        diagnose_cmd._check_common_issues()
+
+        result = next(r for r in diagnose_cmd.results if r.name == "Non-Interactive Mode")
+        assert result.status == "pass"
+
+    def test_large_cache_warns(self, diagnose_cmd, monkeypatch, tmp_path):
+        """Cache over 100MB produces a warning."""
+        import sys
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        big = cache_dir / "big.json"
+        # Write 1MB of data
+        big.write_bytes(b"x" * (1024 * 1024))
+        monkeypatch.setattr(diagnose, "CACHE_DIR", cache_dir)
+        monkeypatch.setattr(diagnose, "LOG_FILE", tmp_path / "no-log")
+
+        with patch("traktor.diagnose.os.path.getsize", return_value=200 * 1024 * 1024):
+            diagnose_cmd._check_common_issues()
+
+        result = next(r for r in diagnose_cmd.results if r.name == "Cache Size")
+        assert result.status == "warn"
+
+    def test_small_cache_passes(self, diagnose_cmd, monkeypatch, tmp_path):
+        """Small cache produces a passing result."""
+        import sys
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / "small.json").write_bytes(b"x" * 100)
+        monkeypatch.setattr(diagnose, "CACHE_DIR", cache_dir)
+        monkeypatch.setattr(diagnose, "LOG_FILE", tmp_path / "no-log")
+
+        diagnose_cmd._check_common_issues()
+
+        result = next(r for r in diagnose_cmd.results if r.name == "Cache Size")
+        assert result.status == "pass"
+
+    def test_large_log_warns(self, diagnose_cmd, monkeypatch, tmp_path):
+        """Log file over 50MB produces a warning."""
+        import sys
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(diagnose, "CACHE_DIR", tmp_path / "no-cache")
+        log_file = tmp_path / "traktor.log"
+        # Sparse 60MB file - real size check via stat()
+        with open(log_file, "wb") as f:
+            f.truncate(60 * 1024 * 1024)
+        monkeypatch.setattr(diagnose, "LOG_FILE", log_file)
+
+        diagnose_cmd._check_common_issues()
+
+        result = next(r for r in diagnose_cmd.results if r.name == "Log File Size")
+        assert result.status == "warn"
+
+    def test_small_log_passes(self, diagnose_cmd, monkeypatch, tmp_path):
+        """Small log file produces a passing result."""
+        import sys
+
+        monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
+        monkeypatch.setattr(diagnose, "CACHE_DIR", tmp_path / "no-cache")
+        log_file = tmp_path / "traktor.log"
+        log_file.write_bytes(b"x" * 100)
+        monkeypatch.setattr(diagnose, "LOG_FILE", log_file)
+
+        diagnose_cmd._check_common_issues()
+
+        result = next(r for r in diagnose_cmd.results if r.name == "Log File Size")
+        assert result.status == "pass"
+
+    def test_configuration_partial_trakt_fails(self, diagnose_cmd, monkeypatch, tmp_path):
+        """Only one Trakt credential set -> failure."""
+        monkeypatch.setattr(diagnose, "TRAKT_CLIENT_ID", "id-only")
+        monkeypatch.setattr(diagnose, "TRAKT_CLIENT_SECRET", None)
+        monkeypatch.setattr(diagnose, "CONFIG_FILE", tmp_path / "missing.json")
+        monkeypatch.setattr(diagnose, "CACHE_DIR", tmp_path / "no-cache")
+        monkeypatch.setattr(diagnose, "LOG_FILE", tmp_path / "no-log")
+        monkeypatch.setattr(diagnose, "load_config", lambda: {})
+
+        diagnose_cmd._check_configuration()
+
+        result = next(r for r in diagnose_cmd.results if r.name == "Trakt Credentials")
+        assert result.status == "fail"
