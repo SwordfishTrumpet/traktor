@@ -178,13 +178,16 @@ See `uv run traktor --help` for all options.
 **Trakt OAuth details:**
 - `TRAKT_REDIRECT_URI` in `.env` must **exactly match** the "Redirect URI" registered for your app
   at https://trakt.tv/oauth/applications (Trakt rejects mismatches with `invalid_redirect`).
-- If the registered redirect URI is a localhost URL (e.g. `http://127.0.0.1:7001/callback`),
-  traktor briefly listens on that port and captures the authorization code automatically —
-  no copy/paste needed. Otherwise, paste the code from the browser.
-- Tokens are validated on load: placeholder or truncated values (e.g. literal
-  `new-access-token` text, or anything shorter than real Trakt tokens) are treated as
-  unauthenticated and trigger a clear re-auth prompt instead of silently failing later.
-  `save_tokens()` also refuses to write invalid tokens to `.env`.
+- During `uv run traktor --force-auth`, traktor accepts the authorization code two ways at once:
+  - **paste it** into the terminal (the bare code or the full callback URL) and press Enter — works
+    on remote/headless boxes where the browser redirect can't reach the server, and
+  - if the redirect URI is a localhost URL, a local listener captures the browser redirect
+    automatically (paste still wins if both happen).
+- Tokens are validated on load: placeholder/truncated garbage (e.g. literal `new-access-token`
+  text, or anything under 20 characters) is treated as unauthenticated and triggers a clear
+  re-auth prompt instead of silently failing later. `save_tokens()` also refuses to write invalid
+  tokens. Trakt currently issues 32-character tokens; the floor is kept low so legitimate format
+  changes never lock you out.
 - Re-authenticate at any time with `uv run traktor --force-auth`.
 
 **Note on Plex tokens:** Use your **server owner's token** for playlists visible to all users. Managed user tokens create private playlists only.

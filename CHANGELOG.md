@@ -30,9 +30,26 @@ The format is based on Keep a Changelog and this project currently uses a simple
   - `authenticate_trakt()` only checked that the access token was non-empty, so literal placeholder
     text like `new-access-token` in `.env` passed the check while every API call 401'd (liked lists /
     watch sync silently dead; official lists kept working so it went unnoticed)
-  - New `TraktAuth.has_valid_tokens()` validates length (access >= 100, refresh >= 40 chars) and
-    rejects known placeholder strings; `save_tokens()` refuses to write invalid tokens
+  - New `TraktAuth.has_valid_tokens()` rejects known placeholder strings and values far too short
+    to be real tokens; `save_tokens()` refuses to write invalid tokens
   - Location: `src/traktor/clients.py`, `src/traktor/sync.py`
+
+- **Trakt auth: 32-char token format wrongly rejected (FIXED IMMEDIATELY AFTER)**
+  - Trakt now issues 32-character access/refresh tokens (verified via a live OAuth exchange), but
+    the length floors above assumed the old JWT format and rejected valid tokens, preventing
+    `save_tokens()` from persisting them
+  - Floors lowered to 20 chars — still catches the 16-17 char placeholder garbage while never
+    locking out a legitimate Trakt format change
+  - Location: `src/traktor/clients.py`
+
+- **Trakt auth: pasted code ignored while waiting on localhost callback (remote/headless UX bug)**
+  - On remote boxes the browser redirect to `http://127.0.0.1:7001/callback` lands on the user's
+    own machine, never the server, so the 5-minute listener wait swallowed pasted input and the
+    run had to be Ctrl+C'd
+  - `_collect_auth_code()` now watches stdin (`select`) and the callback listener concurrently;
+    a pasted code or full callback URL is accepted at any time and wins immediately
+  - `_extract_auth_code()` parses bare codes, bare query strings, and full callback URLs
+  - Location: `src/traktor/sync.py`
 
 
 - **Incremental cache update broken by plexapi datetime change (CRITICAL)**
