@@ -57,7 +57,7 @@ See all options: `uv run traktor --help`
 | **🎯 Smart fallback** | Shows without S01E01 automatically fall back to the first available episode |
 | **📊 Actionable reports** | `missing.txt` includes reasons (not just IDs) so you know why items weren't found |
 | **🔍 Smart suggestions** | Missing items include fuzzy title matches and naming mismatch detection |
-| **🖥️ Interactive mode** | Preview changes before applying, confirm deletions, undo recent operations |
+| **🖥️ Interactive mode** | Preview changes before applying, confirm deletions, inspect recent sync snapshots |
 | **🧠 Advanced conflict resolution** | Per-media-type rules, timezone-aware timestamps, and confidence scoring |
 | **🔒 Auth failure detection** | Auto-detects stale Trakt tokens and prompts for re-authentication |
 | **📝 Structured logging** | Optional JSON logs with correlation IDs for machine parsing |
@@ -146,7 +146,7 @@ See [DOCKER.md](DOCKER.md) for scheduling and volume mounts.
 - `--sync-movies-only`, `--sync-shows-only` — Filter watch sync by media type
 - `--backfill-history` — Full history sync (initial setup)
 - `--interactive` — Prompt for confirmation before significant changes
-- `--undo` — Restore the most recent operation
+- `--undo` — Show the most recent sync snapshot (inspection only; nothing is restored)
 - `--structured-logging` — Output JSON logs with correlation IDs
 - `--performance-report` — Print detailed performance metrics after sync
 - `--refresh-cache`, `--diagnose`, `--dry-run`, `--workers N` — Utility flags
