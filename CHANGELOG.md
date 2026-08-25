@@ -6,6 +6,15 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ## [Unreleased]
 
+### Fixed
+
+- **Watch sync no longer proceeds after failed state pulls (HIGH, issue #1)**
+  - `_pull_from_plex()` / `_pull_from_trakt()` caught all exceptions and returned an empty
+    dict; a transient Trakt outage made every Plex-watched item resolve to `push_to_trakt`,
+    triggering a full-history rewrite against Trakt while reporting success
+  - Pull failures now raise `WatchStatePullError`; `sync_watched_status()` aborts before any
+    change is applied, increments `errors`, and leaves `last_sync_timestamp` untouched
+
 ## [1.1.0] - 2026-08-16
 
 ### Performance

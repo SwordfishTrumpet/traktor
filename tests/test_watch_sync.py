@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 from plexapi.exceptions import NotFound
 
 from traktor import conflict_resolver, history_manager, watch_sync
@@ -1174,3 +1175,128 @@ class TestApplyChangesFailurePaths:
         sync_engine._apply_changes(changes)
 
         assert sync_engine.stats["errors"] == 1
+
+
+class TestPullFailurePropagation:
+    """Regression tests for GitHub issue #1.
+
+    Pull helpers must never silently degrade to an empty state dict: a
+    transient API failure used to produce trakt_state={}, which the resolver
+    interpreted as "everything unwatched on Trakt" and pushed a full-library
+    history rewrite. Failures must now propagate as WatchStatePullError so
+    sync_watched_status() aborts before applying changes or advancing
+    last_sync_timestamp.
+    """
+
+    def _plex_state_with_watched_movie(self):
+        """A Plex state that would trigger push_to_trakt if Trakt pull failed."""
+        return {
+            ("movie", "tt0111161", "278"): {
+                "watched": True,
+                "last_watched_at": datetime.now(timezone.utc),
+                "rating_key": 100,
+                "title": "The Shawshank Redemption",
+            }
+        }
+
+    def test_trakt_request_failure_aborts_sync(self, sync_engine):
+        """A raised exception from get_watched_movies() aborts before apply."""
+        sync_engine._pull_from_plex = MagicMock(return_value=self._plex_state_with_watched_movie())
+        sync_engine.trakt.get_watched_movies = MagicMock(
+            side_effect=requests.exceptions.ConnectionError("transient outage")
+        )
+        sync_engine._apply_changes = MagicMock()
+
+        with pytest.raises(watch_sync.WatchStatePullError):
+            sync_engine.sync_watched_status()
+
+        # No changes applied to either platform
+        sync_engine._apply_changes.assert_not_called()
+        # Failure is visible in stats
+        assert sync_engine.stats["errors"] > 0
+        # Delta timestamp not advanced by the failed run
+        assert sync_engine.history.get_last_sync_timestamp() is None
+
+    def test_trakt_shows_request_failure_aborts_sync(self, sync_engine):
+        """A raised exception from get_watched_shows() aborts before apply."""
+        sync_engine._pull_from_plex = MagicMock(return_value={})
+        sync_engine.trakt.get_watched_shows = MagicMock(
+            side_effect=requests.exceptions.Timeout("timeout")
+        )
+        sync_engine._apply_changes = MagicMock()
+
+        with pytest.raises(watch_sync.WatchStatePullError):
+            sync_engine.sync_watched_status()
+
+        sync_engine._apply_changes.assert_not_called()
+        assert sync_engine.stats["errors"] > 0
+        assert sync_engine.history.get_last_sync_timestamp() is None
+
+    def test_plex_pull_failure_aborts_sync(self, sync_engine):
+        """An unexpected Plex failure propagates instead of degrading to {}."""
+        sync_engine._pull_from_trakt = MagicMock(return_value={})
+        sync_engine._apply_changes = MagicMock()
+
+        # Break cache access - the first operation inside _pull_from_plex's try block
+        sync_engine.plex.cache.memory_cache.get.side_effect = RuntimeError("plex unavailable")
+        with pytest.raises(watch_sync.WatchStatePullError):
+            sync_engine.sync_watched_status()
+
+        # The real _pull_from_trakt was never reached (Plex pull is stage 1)
+        sync_engine._pull_from_trakt.assert_not_called()
+        sync_engine._apply_changes.assert_not_called()
+        assert sync_engine.stats["errors"] > 0
+        assert sync_engine.history.get_last_sync_timestamp() is None
+
+    def test_failed_run_does_not_advance_existing_timestamp(self, sync_engine):
+        """A previously stored timestamp survives a failed sync unchanged."""
+        original_ts = datetime(2026, 8, 25, 12, 0, 0, tzinfo=timezone.utc)
+        sync_engine.history.state["last_sync_timestamp"] = original_ts.isoformat()
+        sync_engine.history.save_state()
+
+        sync_engine._pull_from_plex = MagicMock(return_value=self._plex_state_with_watched_movie())
+        sync_engine.trakt.get_watched_movies = MagicMock(
+            side_effect=requests.exceptions.ConnectionError("outage")
+        )
+
+        with pytest.raises(watch_sync.WatchStatePullError):
+            sync_engine.sync_watched_status()
+
+        assert sync_engine.history.get_last_sync_timestamp() == original_ts
+
+    def test_pull_from_trakt_wraps_request_exception(self, sync_engine):
+        """_pull_from_trakt raises WatchStatePullError on RequestException."""
+        sync_engine.trakt.get_watched_movies = MagicMock(
+            side_effect=requests.exceptions.RequestException("boom")
+        )
+        with pytest.raises(watch_sync.WatchStatePullError):
+            sync_engine._pull_from_trakt(movies_only=True)
+
+    def test_pull_from_trakt_wraps_parsing_error(self, sync_engine):
+        """Malformed Trakt payloads also raise WatchStatePullError."""
+        # Force a KeyError inside the loop by returning a non-dict movie entry
+        sync_engine.trakt.get_watched_movies = MagicMock(return_value=[{"movie": ["not-a-dict"]}])
+        with pytest.raises(watch_sync.WatchStatePullError):
+            sync_engine._pull_from_trakt(movies_only=True)
+
+    def test_pull_from_plex_wraps_unexpected_error(self, sync_engine):
+        """_pull_from_plex raises WatchStatePullError on unexpected failure."""
+        sync_engine.plex.cache.memory_cache.get.side_effect = RuntimeError("cache exploded")
+        with pytest.raises(watch_sync.WatchStatePullError):
+            sync_engine._pull_from_plex()
+
+    def test_successful_pull_still_updates_timestamp(self, sync_engine):
+        """Happy path is unaffected: successful pulls still advance the stamp."""
+        sync_engine._pull_from_plex = MagicMock(return_value={})
+        sync_engine._pull_from_trakt = MagicMock(return_value={})
+        sync_engine._calculate_changes = MagicMock(
+            return_value={
+                "plex": {"mark_watched": [], "mark_unwatched": []},
+                "trakt": {"mark_watched": [], "mark_unwatched": []},
+            }
+        )
+        sync_engine._apply_changes = MagicMock()
+
+        sync_engine.sync_watched_status()
+
+        assert sync_engine.history.get_last_sync_timestamp() is not None
