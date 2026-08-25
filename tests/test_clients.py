@@ -1738,3 +1738,109 @@ class TestPlexClientOrphanedCleanup:
         deleted = plex_client.cleanup_orphaned_playlists([], config)
 
         assert deleted == []
+
+
+class TestBatchHistoryFailureReporting:
+    """Regression tests for issue #9: per-batch failures must be visible in
+    the combined result instead of silently swallowed."""
+
+    @pytest.fixture
+    def mock_auth(self):
+        auth = MagicMock()
+        auth.get_headers.return_value = {"Authorization": "Bearer test"}
+        return auth
+
+    def test_partial_batch_failure_reported(self, mock_auth):
+        """One failing movie batch yields failure counts + payloads in the result."""
+        client = clients.TraktClient(mock_auth)
+        movies = [{"ids": {"imdb": f"tt{i}"}} for i in range(4)]
+
+        def make_response(*args, **kwargs):
+            batch = kwargs.get("json", {}).get("movies", [])
+            # Second batch fails persistently (survives the client's retry layer)
+            if any(m["ids"]["imdb"] in ("tt2", "tt3") for m in batch):
+                raise clients.requests.exceptions.ConnectionError("transient outage")
+            r = MagicMock()
+            r.status_code = 201
+            r.json.return_value = {"added": {"movies": len(batch), "episodes": 0}}
+            return r
+
+        with patch.object(client._session, "post", side_effect=make_response):
+            result = client.add_to_history(movies=movies, batch_size=2)
+
+        # First batch succeeded (2 movies), second failed (2 movies)
+        assert result is not None
+        assert result["added"]["movies"] == 2
+        assert result["failed"]["movies"] == 2
+        assert result["failed"]["episodes"] == 0
+        assert result["failed_payloads"]["movies"] == movies[2:]
+        assert result["failed_payloads"]["episodes"] == []
+
+    def test_episode_batch_failure_reported(self, mock_auth):
+        """Failing episode batches are counted separately."""
+        client = clients.TraktClient(mock_auth)
+        episodes = [{"ids": {}, "season": 1, "number": i} for i in range(2)]
+
+        with patch.object(
+            client._session,
+            "post",
+            side_effect=clients.requests.exceptions.ConnectionError("down"),
+        ):
+            result = client.remove_from_history(episodes=episodes, batch_size=1)
+
+        assert result is None  # all batches failed -> no successful response
+
+    def test_all_success_reports_zero_failed(self, mock_auth):
+        """A fully successful run reports failed = 0 for both media types."""
+        client = clients.TraktClient(mock_auth)
+        movies = [{"ids": {"imdb": "tt1"}}]
+
+        def make_response(*args, **kwargs):
+            r = MagicMock()
+            r.status_code = 201
+            r.json.return_value = {"added": {"movies": 1, "episodes": 0}}
+            return r
+
+        with patch.object(client._session, "post", side_effect=make_response):
+            result = client.add_to_history(movies=movies)
+
+        assert result["failed"] == {"movies": 0, "episodes": 0}
+        assert "failed_payloads" not in result
+
+
+class TestPlexBatchFailedKeys:
+    """Plex batch operations must identify exactly which items failed."""
+
+    @pytest.fixture
+    def plex_client(self):
+        client = MagicMock(spec=clients.PlexClient)
+        return client
+
+    def test_failed_rating_keys_collected_watched(self):
+        """mark_as_watched failures are reported per rating key."""
+        client = clients.PlexClient.__new__(clients.PlexClient)
+        with patch.object(
+            client,
+            "mark_as_watched",
+            side_effect=lambda rk: rk != 2,  # key 2 fails
+        ):
+            results = client.batch_mark_as_watched([1, 2, 3])
+
+        assert results["success"] == 2
+        assert results["failed"] == 1
+        assert results["failed_rating_keys"] == [2]
+
+    def test_failed_rating_keys_collected_unwatched(self):
+        """mark_as_unwatched exceptions are reported per rating key."""
+        client = clients.PlexClient.__new__(clients.PlexClient)
+
+        def mark(rk):
+            if rk == "rk-bad":
+                raise RuntimeError("plex hiccup")
+            return True
+
+        with patch.object(client, "mark_as_unwatched", side_effect=mark):
+            results = client.batch_mark_as_unwatched(["rk-ok", "rk-bad"])
+
+        assert results["success"] == 1
+        assert results["failed_rating_keys"] == ["rk-bad"]

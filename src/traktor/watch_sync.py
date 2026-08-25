@@ -695,19 +695,23 @@ class WatchSyncEngine:
                 plex_unwatched_keys.append(item["rating_key"])
                 plex_items_to_update.append({"item": item, "watched": False})
 
-        # Batch mark as watched
+        # Batch mark as watched / unwatched, collecting per-item failures
+        # (issue #9): failed items must not be recorded as synced in history.
+        failed_rating_keys = set()
+
         if plex_watched_keys:
             logger.info(f"Batch marking {len(plex_watched_keys)} items as watched in Plex...")
             result = self.plex.batch_mark_as_watched(plex_watched_keys)
             self.stats["plex_watched"] += result["success"]
             self.stats["errors"] += result["failed"]
+            failed_rating_keys.update(result.get("failed_rating_keys", []))
 
-        # Batch mark as unwatched
         if plex_unwatched_keys:
             logger.info(f"Batch marking {len(plex_unwatched_keys)} items as unwatched in Plex...")
             result = self.plex.batch_mark_as_unwatched(plex_unwatched_keys)
             self.stats["plex_unwatched"] += result["success"]
             self.stats["errors"] += result["failed"]
+            failed_rating_keys.update(result.get("failed_rating_keys", []))
 
         # Update history for successful items, then persist once (issue #7):
         # add_or_update_synced_item() only mutates in-memory state; a single
@@ -715,8 +719,13 @@ class WatchSyncEngine:
         try:
             for update in plex_items_to_update:
                 item = update["item"]
-                # Note: In a real implementation, we'd track which items succeeded/failed
-                # For now, we'll update history for all items
+                if item["rating_key"] in failed_rating_keys:
+                    # Item's Plex operation failed - recording it as synced would
+                    # remember a state that was never applied (issue #9).
+                    logger.warning(
+                        f"Skipping history record for failed item: {item.get('title', 'unknown')}"
+                    )
+                    continue
                 self.history.add_or_update_synced_item(
                     media_type=item["media_type"],
                     imdb_id=item["imdb_id"],
@@ -767,6 +776,10 @@ class WatchSyncEngine:
                     added_movies = result.get("added", {}).get("movies", 0)
                     added_episodes = result.get("added", {}).get("episodes", 0)
                     self.stats["trakt_watched"] += added_movies + added_episodes
+                    # Per-batch failures are surfaced by the client (issue #9);
+                    # count the affected items as errors so partial outages are visible.
+                    failed = result.get("failed", {})
+                    self.stats["errors"] += failed.get("movies", 0) + failed.get("episodes", 0)
             except Exception as e:
                 logger.error(f"Failed to add items to Trakt history: {e}")
                 self.stats["errors"] += len(movies_to_add) + len(episodes_to_add)
@@ -809,6 +822,9 @@ class WatchSyncEngine:
                     deleted_movies = result.get("deleted", {}).get("movies", 0)
                     deleted_episodes = result.get("deleted", {}).get("episodes", 0)
                     self.stats["trakt_unwatched"] += deleted_movies + deleted_episodes
+                    # Per-batch failures are surfaced by the client (issue #9)
+                    failed = result.get("failed", {})
+                    self.stats["errors"] += failed.get("movies", 0) + failed.get("episodes", 0)
             except Exception as e:
                 logger.error(f"Failed to remove items from Trakt history: {e}")
                 self.stats["errors"] += len(movies_to_remove) + len(episodes_to_remove)

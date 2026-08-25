@@ -8,6 +8,17 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **Trakt batch history failures are now visible and tracked (issue #9)**
+  - `_batch_history_operation()` swallowed per-batch RequestExceptions; the combined result
+    now reports `failed` item counts (and failed payloads) alongside successes
+  - `_apply_changes()` adds batch failure counts to `stats["errors"]` for both add and remove
+    operations, so partial outages are visible in sync stats
+  - Plex batch operations report per-item `failed_rating_keys`; items whose Plex mark operation
+    failed are no longer recorded as synced in watch history state
+- **Dependency Review workflow fixed** — scoped to pull_request events (the action cannot run
+  on push: it needs a base/head ref diff) and granted the write permissions that
+  `comment-summary-in-pr` requires
+
 - **CI Bandit job now actually gates on findings (issue #8)**
   - The security job ran Bandit with `|| true` (could never fail) and uploaded its report under
     `if: failure()` (unreachable); the floating `PyCQA/bandit@main` action ref was replaced with a
