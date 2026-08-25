@@ -883,6 +883,72 @@ class TestSyncListsOrchestration:
         # fetched liked lists and passed them through
         mocks["trakt_client"].get_liked_lists.assert_called_once()
 
+    def test_liked_list_result_output(self, monkeypatch, tmp_path, capsys):
+        """Per-list console output matches the result shape (issue #2).
+
+        Regression: the failure print was nested as the else of the
+        not_found check inside the success path, so every fully successful
+        list printed "Failed to process list: Unknown error".
+        """
+        mocks = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "liked"])
+
+        mocks["trakt_client"].get_liked_lists.return_value = [
+            {
+                "list": {"name": "My List", "user": {"username": "me"}, "ids": {"trakt": "123"}},
+            }
+        ]
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+
+        # Full success: no failure text, success text present
+        monkeypatch.setattr(
+            sync,
+            "process_list_parallel",
+            lambda *a, **k: {"success": True, "matched": 5, "not_found": 0},
+        )
+        assert sync.sync_lists(args) == 0
+        out = capsys.readouterr().out
+        assert "Playlist updated with 5 item(s)" in out
+        assert "Failed to process list" not in out
+
+        # Success with partial matches: reports missing items, no failure text
+        monkeypatch.setattr(
+            sync,
+            "process_list_parallel",
+            lambda *a, **k: {"success": True, "matched": 3, "not_found": 2},
+        )
+        sync.sync_lists(args)
+        out = capsys.readouterr().out
+        assert "2 item(s) not found" in out
+        assert "Failed to process list" not in out
+
+        # Success with no matches warning
+        monkeypatch.setattr(
+            sync,
+            "process_list_parallel",
+            lambda *a, **k: {
+                "success": True,
+                "warning": "no_matches",
+                "matched": 0,
+                "not_found": 0,
+            },
+        )
+        sync.sync_lists(args)
+        out = capsys.readouterr().out
+        assert "No matching items found in Plex library" in out
+        assert "Failed to process list" not in out
+
+        # Genuine failure: failure text with the actual error
+        monkeypatch.setattr(
+            sync,
+            "process_list_parallel",
+            lambda *a, **k: {"success": False, "error": "plex exploded"},
+        )
+        sync.sync_lists(args)
+        out = capsys.readouterr().out
+        assert "Failed to process list: plex exploded" in out
+        assert "Playlist updated" not in out
+
     def test_watch_only_mode(self, monkeypatch, tmp_path):
         """--sync-watched-only skips lists and runs the watch engine."""
         mocks = self._setup(monkeypatch, tmp_path)
