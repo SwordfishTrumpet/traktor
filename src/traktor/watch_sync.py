@@ -19,6 +19,17 @@ DEFAULT_PROGRESS_THRESHOLD_MS = (
 DEFAULT_FIRST_SYNC_WINDOW_DAYS = 7
 
 
+class WatchStatePullError(Exception):
+    """Raised when pulling watch state from Plex or Trakt fails.
+
+    Pull helpers must NEVER silently degrade to an empty state dict: an empty
+    state is indistinguishable from "everything unwatched", which would cause
+    the resolver to push a full-library history rewrite against the other
+    platform (see GitHub issue #1). Raising aborts sync_watched_status() before
+    any change is applied and before last_sync_timestamp advances.
+    """
+
+
 class WatchSyncEngine:
     """Engine for bidirectional watch status synchronization.
 
@@ -381,8 +392,9 @@ class WatchSyncEngine:
             return plex_state
 
         except Exception as e:
-            logger.error(f"Failed to pull from Plex: {e}")
-            return {}
+            # Never degrade to empty state - see WatchStatePullError docstring.
+            logger.error(f"Failed to pull watch state from Plex: {e}", exc_info=True)
+            raise WatchStatePullError(f"Failed to pull watch state from Plex: {e}") from e
 
     def _process_episode_batch(
         self,
@@ -528,14 +540,19 @@ class WatchSyncEngine:
             return trakt_state
 
         except requests.exceptions.RequestException as e:
-            logger.error(f"Trakt API request failed: {e}")
-            return {}
+            # Never degrade to empty state - see WatchStatePullError docstring.
+            logger.error(f"Trakt API request failed: {e}", exc_info=True)
+            raise WatchStatePullError(
+                f"Trakt API request failed while pulling watch state: {e}"
+            ) from e
         except (KeyError, ValueError, TypeError) as e:
-            logger.error(f"Trakt data parsing error: {e}")
-            return {}
+            logger.error(f"Trakt data parsing error: {e}", exc_info=True)
+            raise WatchStatePullError(f"Trakt watch state parsing error: {e}") from e
         except Exception as e:
-            logger.error(f"Unexpected error pulling from Trakt: {e}")
-            return {}
+            logger.error(f"Unexpected error pulling from Trakt: {e}", exc_info=True)
+            raise WatchStatePullError(
+                f"Unexpected error pulling watch state from Trakt: {e}"
+            ) from e
 
     def _calculate_changes(self, plex_state, trakt_state, direction):
         """Calculate what changes need to be made.
