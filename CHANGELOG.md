@@ -8,6 +8,12 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **Pre-sync prompts no longer crash non-interactive/cron runs (issue #3)**
+  - Integrity-check and backup-failure prompts called `input()` without a TTY guard,
+    raising unhandled `EOFError` in cron/Docker runs
+  - New `_confirm_continue()` helper fails closed (clean exit 1) when stdin is not a TTY;
+    interactive behavior unchanged
+
 - **Watch sync no longer proceeds after failed state pulls (HIGH, issue #1)**
   - `_pull_from_plex()` / `_pull_from_trakt()` caught all exceptions and returned an empty
     dict; a transient Trakt outage made every Plex-watched item resolve to `push_to_trakt`,

@@ -1187,6 +1187,20 @@ def _save_playlist_snapshot(plex, config):
     return playlists
 
 
+def _confirm_continue(prompt: str) -> bool:
+    """Ask the user whether to continue; fail closed when non-interactive.
+
+    In cron/Docker contexts (no TTY) prompting is impossible, so this returns
+    False instead of raising EOFError from input() - callers abort cleanly
+    with a logged reason (issue #3).
+    """
+    if not sys.stdin.isatty():
+        logger.error("Cannot prompt for confirmation in non-interactive mode; aborting")
+        return False
+    response = input(prompt)
+    return response.lower() == "y"
+
+
 def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = None) -> int:
     """Main sync function with parallel processing."""
     # Initialize resource manager if not provided but memory limits are configured
@@ -1210,9 +1224,8 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
         print("⚠️  Integrity check failed. Data may be corrupted.")
         print("Run 'traktor --integrity-check' for details.")
         print("Consider restoring from backup before proceeding.")
-        response = input("Continue anyway? (y/N): ")
-        if response.lower() != "y":
-            logger.info("Sync aborted by user due to integrity check failure")
+        if not _confirm_continue("Continue anyway? (y/N): "):
+            logger.info("Sync aborted due to integrity check failure (non-interactive or declined)")
             sys.exit(1)
         logger.warning("User chose to continue despite integrity check failure")
 
@@ -1226,9 +1239,8 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
         except Exception as e:
             logger.error(f"Pre-sync backup failed: {e}")
             print("⚠️  Pre-sync backup failed!")
-            response = input("Continue without backup? (y/N): ")
-            if response.lower() != "y":
-                logger.info("Sync aborted by user due to backup failure")
+            if not _confirm_continue("Continue without backup? (y/N): "):
+                logger.info("Sync aborted due to backup failure (non-interactive or declined)")
                 sys.exit(1)
             logger.warning("User chose to continue without backup")
 
