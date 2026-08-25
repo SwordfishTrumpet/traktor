@@ -79,3 +79,17 @@ jobs:
         with:
           name: bandit-security-report
           path: bandit-report.json
+
+  # Validate workflow files themselves (issue #8 follow-up)
+  action-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install actionlint (pinned)
+        run: |
+          bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.9/scripts/download-actionlint.bash)
+
+      - name: Run actionlint
+        run: ./actionlint -color
