@@ -8,6 +8,12 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **Integrity checks now cover the gzip-compressed library cache (issue #5)**
+  - `IntegrityChecker._check_cache()` only scanned `*.json`, so the primary
+    `plex_library_cache.json.gz` was never validated and corrupt caches passed the gate
+  - `.json.gz` files are now decompressed and JSON-parsed; truncated/invalid gzip streams
+    (`BadGzipFile`, `EOFError`) are reported as corrupt files
+
 - **`--undo` no longer claims restore capability it never had (issue #4)**
   - `--undo` is now honest snapshot inspection: shows the most recent snapshot and its
     contents; the misleading "Restore from this snapshot on next sync?" prompt and the
