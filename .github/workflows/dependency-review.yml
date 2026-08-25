@@ -1,15 +1,17 @@
 name: Dependency Review
 
+# dependency-review-action requires a pull_request context (base vs head ref)
+# and cannot run on direct pushes - see CI failure on push to main.
 on:
   pull_request:
-    branches:
-      - main
-  push:
     branches:
       - main
 
 permissions:
   contents: read
+  # Required by comment-summary-in-pr
+  issues: write
+  pull-requests: write
 
 jobs:
   dependency-review:
