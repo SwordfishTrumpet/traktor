@@ -379,8 +379,13 @@ class TestBackupManager:
         cache_dir.mkdir()
         (cache_dir / "entry.json").write_text('{"cached": true}')
 
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "TRAKT_CLIENT_ID=abc\nTRAKT_ACCESS_TOKEN=tok1234567890\nTRAKT_REFRESH_TOKEN=ref9876543210\n"
+        )
+
         monkeypatch.setattr(res, "CONFIG_FILE", config_file)
-        monkeypatch.setattr(res, "TOKEN_FILE", tmp_path / "missing-token.json")
+        monkeypatch.setattr(res, "ENV_FILE", env_file)
         monkeypatch.setattr(res, "CACHE_DIR", cache_dir)
 
         backup_dir = tmp_path / "backups"
@@ -396,8 +401,8 @@ class TestBackupManager:
         manifest = json.loads((backup_path / "manifest.json").read_text())
         assert "config" in manifest["items"]
         assert manifest["items"]["config"]["compressed"] is True
-        # Missing token source is skipped
-        assert "token" not in manifest["items"]
+        # The live .env token store is included (issue #6)
+        assert "env" in manifest["items"]
         # Cache dir backed up with gz entry
         gz_files = [p.name for p in (backup_path / "cache").rglob("*.gz")]
         assert "entry.json.gz" in gz_files
@@ -482,11 +487,11 @@ class TestIntegrityChecker:
         import traktor.resilience as res
 
         config = tmp_path / "config.json"
-        token = tmp_path / "token.json"
+        env_file = tmp_path / ".env"
         cache = tmp_path / "cache"
         cache.mkdir()
         monkeypatch.setattr(res, "CONFIG_FILE", config)
-        monkeypatch.setattr(res, "TOKEN_FILE", token)
+        monkeypatch.setattr(res, "ENV_FILE", env_file)
         monkeypatch.setattr(res, "CACHE_DIR", cache)
         return res.IntegrityChecker(), tmp_path
 
@@ -500,7 +505,9 @@ class TestIntegrityChecker:
         """Valid config and token files pass."""
         checker, tmp_path = checker
         (tmp_path / "config.json").write_text('{"key": "value"}')
-        (tmp_path / "token.json").write_text('{"access_token": "a", "refresh_token": "b"}')
+        (tmp_path / ".env").write_text(
+            "TRAKT_ACCESS_TOKEN=tok1234567890\nTRAKT_REFRESH_TOKEN=ref9876543210\n"
+        )
 
         results = checker.run_all_checks()
 
@@ -517,12 +524,31 @@ class TestIntegrityChecker:
         assert results["checks"]["config"]["healthy"] is False
         assert results["overall_healthy"] is False
 
-    def test_token_missing_required_keys_fails(self, checker):
-        """Token file without required keys is flagged."""
+    def test_env_without_tokens_is_still_healthy(self, checker):
+        """A .env without token lines is normal before first auth (issue #6).
+
+        The pre-sync gate must not block fresh installs; only unreadability
+        of the credential store is unhealthy.
+        """
         checker, tmp_path = checker
-        (tmp_path / "token.json").write_text('{"foo": "bar"}')
+        (tmp_path / ".env").write_text("TRAKT_CLIENT_ID=abc\n")
 
         results = checker.run_all_checks()
+
+        check = results["checks"]["token"]
+        assert check["healthy"] is True
+        assert check["details"]["has_required_keys"] is False
+
+    def test_unreadable_env_fails(self, checker):
+        """An unreadable .env credential store is flagged."""
+        checker, tmp_path = checker
+        env_file = tmp_path / ".env"
+        env_file.write_text("TRAKT_ACCESS_TOKEN=x\n")
+        env_file.chmod(0o000)
+        try:
+            results = checker.run_all_checks()
+        finally:
+            env_file.chmod(0o644)
 
         assert results["checks"]["token"]["healthy"] is False
 
@@ -565,7 +591,7 @@ class TestIntegrityCheckerGzipCache:
         cache = tmp_path / "cache"
         cache.mkdir()
         monkeypatch.setattr(res, "CONFIG_FILE", tmp_path / "config.json")
-        monkeypatch.setattr(res, "TOKEN_FILE", tmp_path / "token.json")
+        monkeypatch.setattr(res, "ENV_FILE", tmp_path / ".env")
         monkeypatch.setattr(res, "CACHE_DIR", cache)
         return res.IntegrityChecker(), tmp_path / "cache"
 
@@ -620,3 +646,74 @@ class TestIntegrityCheckerGzipCache:
         assert results["healthy"] is False
         assert "bad.json" in (results["details"]["corrupt_files"] or [])
         assert results["details"]["file_count"] == 2
+
+
+class TestEnvBackupRoundtrip:
+    """Regression tests for issue #6: the live .env token store must survive
+    create_backup() -> restore_backup() so disaster recovery restores auth."""
+
+    @pytest.fixture
+    def env_backup_env(self, tmp_path, monkeypatch):
+        import traktor.resilience as res
+
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"key": "value"}')
+        env_file = tmp_path / ".env"
+        env_content = (
+            "# traktor credentials\n"
+            "TRAKT_CLIENT_ID=abc\n"
+            "TRAKT_ACCESS_TOKEN=tok1234567890abcdef\n"
+            "TRAKT_REFRESH_TOKEN=ref9876543210abcdef\n"
+        )
+        env_file.write_text(env_content)
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+
+        monkeypatch.setattr(res, "CONFIG_FILE", config_file)
+        monkeypatch.setattr(res, "ENV_FILE", env_file)
+        monkeypatch.setattr(res, "CACHE_DIR", cache_dir)
+
+        manager = res.BackupManager(backup_dir=tmp_path / "backups", compress=True)
+        return manager, tmp_path, env_file, env_content
+
+    def test_env_roundtrip_through_backup_and_restore(self, env_backup_env):
+        """A .env with token lines round-trips through backup and restore."""
+        import json
+
+        manager, tmp_path, env_file, env_content = env_backup_env
+
+        backup_path = manager.create_backup(reason="test")
+        manifest = json.loads((backup_path / "manifest.json").read_text())
+        assert "env" in manifest["items"]
+
+        # Simulate a fresh machine: the .env is gone
+        env_file.unlink()
+        assert not env_file.exists()
+
+        assert manager.restore_backup(backup_path) is True
+        assert env_file.read_text() == env_content
+
+        # Restrictive permissions on restored credential material
+        assert (env_file.stat().st_mode & 0o777) == 0o600
+
+    def test_backed_up_env_has_restrictive_permissions(self, env_backup_env):
+        """The archived .env inside the backup directory is mode 0o600."""
+
+        manager, tmp_path, _, _ = env_backup_env
+
+        backup_path = manager.create_backup(reason="test")
+        archived = backup_path / "env.gz"
+
+        assert archived.exists()
+        assert (archived.stat().st_mode & 0o777) == 0o600
+
+    def test_manifest_does_not_leak_env_contents(self, env_backup_env):
+        """The manifest stores only path + checksum, never token values."""
+
+        manager, tmp_path, _, _ = env_backup_env
+
+        backup_path = manager.create_backup(reason="test")
+        manifest_text = (backup_path / "manifest.json").read_text()
+
+        assert "TRAKT_ACCESS_TOKEN" not in manifest_text
+        assert "tok1234567890" not in manifest_text

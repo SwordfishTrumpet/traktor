@@ -8,6 +8,13 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **Backups now include the live .env token store (issue #6)**
+  - BackupManager archived the legacy token JSON file that current code never writes,
+    so backups could not restore Trakt authentication after a disaster
+  - The backup manifest now covers the active `.env` (Docker `/app/.env` or CWD `.env`,
+    matching `TraktAuth.save_tokens()` resolution); archived and restored copies get
+    mode 0o600; the manifest stores only path + checksum, never token values
+
 - **Integrity checks now cover the gzip-compressed library cache (issue #5)**
   - `IntegrityChecker._check_cache()` only scanned `*.json`, so the primary
     `plex_library_cache.json.gz` was never validated and corrupt caches passed the gate

@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .log import logger
-from .settings import CACHE_DIR, CONFIG_FILE, TOKEN_FILE
+from .settings import CACHE_DIR, CONFIG_FILE, ENV_FILE
 
 
 class CircuitState(Enum):
@@ -327,7 +327,9 @@ class BackupManager:
 
         self._items_to_backup = [
             ("config", CONFIG_FILE),
-            ("token", TOKEN_FILE),
+            # .env is the live token store (issue #6); the legacy token JSON file
+            # is no longer written by current code and is not backed up.
+            ("env", ENV_FILE),
             ("cache", CACHE_DIR),
         ]
 
@@ -369,6 +371,10 @@ class BackupManager:
                 "checksum": checksum,
                 "compressed": self.compress,
             }
+            if name == "env":
+                # Restrictive permissions on the archived credential material
+                archived = dest_path.with_suffix(".gz") if self.compress else dest_path
+                archived.chmod(0o600)
 
         # Write manifest
         manifest_path = backup_path / "manifest.json"
@@ -470,6 +476,10 @@ class BackupManager:
 
             # Restore
             self._restore_item(source, dest)
+
+            if name == "env":
+                # Restrictive permissions on restored credential material
+                Path(dest).chmod(0o600)
 
         logger.info("Restore completed successfully")
         return True
@@ -644,34 +654,37 @@ class IntegrityChecker:
             return {"healthy": False, "details": {"exists": True, "error": str(e)}}
 
     def _check_token(self) -> Dict[str, Any]:
-        """Check token file integrity."""
-        if not TOKEN_FILE.exists():
+        """Check the active credential store (.env, see issue #6).
+
+        Only availability/readability is validated here: a missing or
+        token-less .env is normal before first authentication, so it stays
+        "healthy" rather than blocking syncs at the pre-sync gate. Token
+        values are never read into memory by this check.
+        """
+        if not ENV_FILE.exists():
             return {
                 "healthy": True,
-                "details": {"exists": False, "note": "No token file (will auth on first run)"},
+                "details": {"exists": False, "note": "No .env yet (will auth on first run)"},
             }
 
         try:
-            with open(TOKEN_FILE) as f:
-                data = json.load(f)
-            required_keys = ["access_token", "refresh_token"]
-            has_keys = all(k in data for k in required_keys)
+            lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+            has_keys = any(line.startswith("TRAKT_ACCESS_TOKEN=") for line in lines) and any(
+                line.startswith("TRAKT_REFRESH_TOKEN=") for line in lines
+            )
             return {
-                "healthy": has_keys,
+                "healthy": True,
                 "details": {
                     "exists": True,
-                    "valid_json": True,
+                    "readable": True,
                     "has_required_keys": has_keys,
-                    "keys": list(data.keys()),
                 },
             }
-        except json.JSONDecodeError as e:
+        except OSError as e:
             return {
                 "healthy": False,
-                "details": {"exists": True, "valid_json": False, "error": str(e)},
+                "details": {"exists": True, "error": str(e)},
             }
-        except Exception as e:
-            return {"healthy": False, "details": {"exists": True, "error": str(e)}}
 
     def _check_cache(self) -> Dict[str, Any]:
         """Check cache directory integrity."""
