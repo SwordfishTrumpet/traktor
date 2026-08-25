@@ -88,6 +88,10 @@ TRAKTOR_LIST_SOURCE = os.getenv("TRAKTOR_LIST_SOURCE", "official")
 # Health server settings
 HEALTH_SERVER_PORT = int(os.getenv("TRAKTOR_HEALTH_PORT", "8080"))
 
+# Watch-history retention: synced-item entries older than this many days are pruned
+# during watch-sync apply (issue #7 follow-up). 0 disables pruning.
+HISTORY_RETENTION_DAYS = int(os.getenv("TRAKTOR_HISTORY_RETENTION_DAYS", "180"))
+
 # Resource management settings
 TRAKTOR_MAX_MEMORY_MB = int(os.getenv("TRAKTOR_MAX_MEMORY_MB", "512"))
 

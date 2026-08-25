@@ -1,10 +1,10 @@
 """Watch history tracking and sync state management."""
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .log import logger
-from .settings import DATA_DIR
+from .settings import DATA_DIR, HISTORY_RETENTION_DAYS
 
 # Sync state file location
 WATCH_SYNC_FILE = DATA_DIR / ".traktor_watch_sync.json"
@@ -203,12 +203,64 @@ class WatchHistoryManager:
             item["last_watched_at_plex"] = last_watched_at_plex
         if last_watched_at_trakt is not None:
             item["last_watched_at_trakt"] = last_watched_at_trakt
+        item["updated_at"] = datetime.now(timezone.utc).isoformat()
 
         logger.debug(f"Updated synced item: {item.get('imdb_id') or item.get('tmdb_id')}")
         if plex_rating_key is not None:
             self._item_index[plex_rating_key] = item
         # NOTE (issue #7): no save_state() here - callers mutate state for all
         # items and persist once at the end of the batch to avoid O(N) writes.
+
+    def prune_synced_items(self, max_age_days=None):
+        """Remove synced-item entries older than the retention window.
+
+        History state is bookkeeping only - reconciliation resolves from live
+        platform data - so stale entries can be dropped safely. This bounds
+        the state file's growth (issue #7 follow-up).
+
+        Args:
+            max_age_days: Retention window in days; None uses
+                settings.HISTORY_RETENTION_DAYS. 0 or negative disables pruning.
+
+        Returns:
+            Number of entries removed.
+        """
+        if max_age_days is None:
+            max_age_days = HISTORY_RETENTION_DAYS
+        if max_age_days <= 0:
+            return 0
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        kept = []
+        removed = 0
+        for item in self.state["synced_items"]:
+            updated_at = self._parse_entry_timestamp(item.get("updated_at"))
+            if updated_at is not None and updated_at < cutoff:
+                removed += 1
+                if item.get("plex_rating_key") is not None:
+                    self._item_index.pop(item.get("plex_rating_key"), None)
+            else:
+                kept.append(item)
+
+        if removed:
+            self.state["synced_items"] = kept
+            logger.info(
+                f"Pruned {removed} watch-history entr(y/ies) older than {max_age_days} days"
+            )
+        return removed
+
+    @staticmethod
+    def _parse_entry_timestamp(value):
+        """Parse an entry's updated_at ISO string; None if missing/invalid."""
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+        except (ValueError, TypeError):
+            return None
 
     def remove_synced_item(self, imdb_id=None, tmdb_id=None, trakt_id=None, plex_rating_key=None):
         """Remove a synced item from the state.

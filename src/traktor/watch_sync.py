@@ -736,6 +736,8 @@ class WatchSyncEngine:
                 )
         finally:
             if plex_items_to_update:
+                # Prune stale entries before the batch persist (issue #7 follow-up)
+                self.history.prune_synced_items()
                 self.history.save_state()
 
         # Apply Trakt changes in batches

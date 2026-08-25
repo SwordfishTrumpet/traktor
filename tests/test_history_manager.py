@@ -375,3 +375,69 @@ def test_restore_corrupt_json(mock_history_manager, tmp_path):
     backup_path = tmp_path / "corrupt.json"
     backup_path.write_text("{not valid")
     assert mock_history_manager.restore_from_backup(backup_path) is False
+
+
+class TestHistoryPruning:
+    """Tests for synced-item retention (issue #7 follow-up)."""
+
+    def _add_item(self, manager, rating_key, updated_at):
+        """Add an entry, then backdate its updated_at stamp."""
+        manager.add_or_update_synced_item(
+            media_type="movie", imdb_id=f"tt{rating_key}", plex_rating_key=rating_key
+        )
+        manager.state["synced_items"][-1]["updated_at"] = updated_at
+
+    def test_old_entries_pruned_recent_kept(self, mock_history_manager):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        self._add_item(mock_history_manager, 1, (now - timedelta(days=200)).isoformat())
+        self._add_item(mock_history_manager, 2, (now - timedelta(days=10)).isoformat())
+
+        removed = mock_history_manager.prune_synced_items(max_age_days=180)
+
+        assert removed == 1
+        remaining = [i["plex_rating_key"] for i in mock_history_manager.state["synced_items"]]
+        assert remaining == [2]
+        # Index stays consistent with the pruned list
+        assert mock_history_manager._item_index.get(1) is None
+        assert mock_history_manager._item_index.get(2) is not None
+
+    def test_entries_without_timestamp_are_kept(self, mock_history_manager):
+        """Legacy entries predating updated_at are never dropped by age."""
+        mock_history_manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt1", plex_rating_key=1
+        )
+        del mock_history_manager.state["synced_items"][-1]["updated_at"]
+
+        assert mock_history_manager.prune_synced_items(max_age_days=180) == 0
+        assert len(mock_history_manager.state["synced_items"]) == 1
+
+    def test_zero_disables_pruning(self, mock_history_manager):
+        from datetime import datetime, timedelta, timezone
+
+        old = (datetime.now(timezone.utc) - timedelta(days=999)).isoformat()
+        self._add_item(mock_history_manager, 1, old)
+
+        assert mock_history_manager.prune_synced_items(max_age_days=0) == 0
+        assert len(mock_history_manager.state["synced_items"]) == 1
+
+    def test_default_uses_settings_retention(self, mock_history_manager, monkeypatch):
+        """None max_age_days reads HISTORY_RETENTION_DAYS from settings."""
+        from datetime import datetime, timedelta, timezone
+
+        import traktor.history_manager as hm_module
+
+        now = datetime.now(timezone.utc)
+        self._add_item(mock_history_manager, 1, (now - timedelta(days=30)).isoformat())
+        monkeypatch.setattr(hm_module, "HISTORY_RETENTION_DAYS", 7)
+
+        assert mock_history_manager.prune_synced_items() == 1
+
+    def test_invalid_timestamp_treated_as_keep(self, mock_history_manager):
+        mock_history_manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt1", plex_rating_key=1
+        )
+        mock_history_manager.state["synced_items"][-1]["updated_at"] = "garbage"
+
+        assert mock_history_manager.prune_synced_items(max_age_days=1) == 0

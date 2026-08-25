@@ -6,6 +6,14 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ## [Unreleased]
 
+### Changed
+
+- **Watch history state growth is now bounded (issue #7 follow-up)**
+  - Synced-item entries carry an `updated_at` stamp; `_apply_changes()` prunes entries older
+    than the retention window before each batch persist
+  - Configurable via new `TRAKTOR_HISTORY_RETENTION_DAYS` env var (default: 180 days, 0 disables);
+    pruning is safe because reconciliation resolves from live platform data, not history state
+
 ### Fixed
 
 - **Trakt batch history failures are now visible and tracked (issue #9)**
