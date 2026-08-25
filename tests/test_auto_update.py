@@ -1,6 +1,5 @@
 """Tests for auto_update module."""
 
-import json
 from unittest.mock import MagicMock, patch
 
 from traktor.auto_update import (
@@ -65,17 +64,12 @@ class TestCheckForUpdate:
         updater.current_version = "1.0.0"
 
         mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps(
-            {
-                "tag_name": "v2.0.0",
-                "html_url": "https://github.com/SwordfishTrumpet/traktor/releases/v2.0.0",
-                "body": "New features",
-            }
-        ).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("traktor.auto_update.urlopen", return_value=mock_response):
+        mock_response.json.return_value = {
+            "tag_name": "v2.0.0",
+            "html_url": "https://github.com/SwordfishTrumpet/traktor/releases/v2.0.0",
+            "body": "New features",
+        }
+        with patch("traktor.auto_update.requests.get", return_value=mock_response):
             result = updater.check_for_update()
 
         assert result["current_version"] == "1.0.0"
@@ -91,17 +85,12 @@ class TestCheckForUpdate:
         updater.current_version = "2.0.0"
 
         mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps(
-            {
-                "tag_name": "v1.0.0",
-                "html_url": "https://github.com/SwordfishTrumpet/traktor/releases/v1.0.0",
-                "body": "Old release",
-            }
-        ).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("traktor.auto_update.urlopen", return_value=mock_response):
+        mock_response.json.return_value = {
+            "tag_name": "v1.0.0",
+            "html_url": "https://github.com/SwordfishTrumpet/traktor/releases/v1.0.0",
+            "body": "Old release",
+        }
+        with patch("traktor.auto_update.requests.get", return_value=mock_response):
             result = updater.check_for_update()
 
         assert result["current_version"] == "2.0.0"
@@ -113,17 +102,12 @@ class TestCheckForUpdate:
         updater.current_version = "1.0.0"
 
         mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps(
-            {
-                "tag_name": "v1.0.0",
-                "html_url": "https://github.com/SwordfishTrumpet/traktor/releases/v1.0.0",
-                "body": "Same",
-            }
-        ).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("traktor.auto_update.urlopen", return_value=mock_response):
+        mock_response.json.return_value = {
+            "tag_name": "v1.0.0",
+            "html_url": "https://github.com/SwordfishTrumpet/traktor/releases/v1.0.0",
+            "body": "Same",
+        }
+        with patch("traktor.auto_update.requests.get", return_value=mock_response):
             result = updater.check_for_update()
 
         assert result["update_available"] is False
@@ -136,9 +120,12 @@ class TestCheckForUpdateErrors:
         updater = AutoUpdater()
         updater.current_version = "1.0.0"
 
-        from urllib.error import URLError
+        import requests
 
-        with patch("traktor.auto_update.urlopen", side_effect=URLError("Network error")):
+        with patch(
+            "traktor.auto_update.requests.get",
+            side_effect=requests.exceptions.ConnectionError("Network error"),
+        ):
             result = updater.check_for_update()
 
         assert result["current_version"] == "1.0.0"
@@ -152,11 +139,9 @@ class TestCheckForUpdateErrors:
         updater.current_version = "1.0.0"
 
         mock_response = MagicMock()
-        mock_response.read.return_value = b"not valid json"
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("traktor.auto_update.urlopen", return_value=mock_response):
+        mock_response.raise_for_status.return_value = None
+        mock_response.json.side_effect = ValueError("invalid json")
+        with patch("traktor.auto_update.requests.get", return_value=mock_response):
             result = updater.check_for_update()
 
         assert result["current_version"] == "1.0.0"
@@ -165,10 +150,15 @@ class TestCheckForUpdateErrors:
         assert "error" in result
 
     def test_timeout_error(self):
+        import requests
+
         updater = AutoUpdater()
         updater.current_version = "1.0.0"
 
-        with patch("traktor.auto_update.urlopen", side_effect=TimeoutError("Connection timed out")):
+        with patch(
+            "traktor.auto_update.requests.get",
+            side_effect=requests.exceptions.Timeout("Connection timed out"),
+        ):
             result = updater.check_for_update()
 
         assert result["current_version"] == "1.0.0"

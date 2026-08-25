@@ -67,14 +67,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Run Bandit security linter
-        uses: PyCQA/bandit@main
-        with:
-          args: "-r src/ -f json -o bandit-report.json || true"
+      - name: Install Bandit
+        run: pip install bandit==1.9.4
+
+      - name: Run Bandit security linter (fails on medium+ severity, medium+ confidence)
+        run: bandit -r src/ -f json -o bandit-report.json -ll -ii
 
       - name: Upload security report
         uses: actions/upload-artifact@v4
-        if: failure()
+        if: always()
         with:
           name: bandit-security-report
           path: bandit-report.json

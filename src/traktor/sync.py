@@ -1181,8 +1181,9 @@ def _save_playlist_snapshot(plex, config):
                 ],
                 "description": getattr(playlist, "summary", "") or "",
             }
-        except Exception:
-            pass
+        except Exception as e:
+            # Snapshot is best-effort; a failure here must not abort the sync
+            logger.debug(f"Could not snapshot playlist {name}: {e}")
 
     return playlists
 
