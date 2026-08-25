@@ -1403,8 +1403,8 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
                         print(f"   Playlist updated with {result.get('matched', 0)} item(s)")
                     if result.get("not_found", 0) > 0:
                         print(f"   {result.get('not_found', 0)} item(s) not found")
-                    else:
-                        print(f"   Failed to process list: {result.get('error', 'Unknown error')}")
+                else:
+                    print(f"   Failed to process list: {result.get('error', 'Unknown error')}")
 
         _check_memory(resource_manager)
 
