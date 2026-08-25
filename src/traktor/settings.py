@@ -53,6 +53,11 @@ else:
 
 SYNC_PROGRESS_FILE = CACHE_DIR / "sync_progress.json"
 
+# Active .env file location - the canonical Trakt token store since the .env
+# persistence change (legacy TOKEN_FILE below is no longer written by current
+# code). Resolution mirrors TraktAuth.save_tokens(): Docker mount wins, then CWD.
+ENV_FILE = Path("/app/.env") if Path("/app/.env").exists() else Path(".env").resolve()
+
 
 def ensure_dirs():
     """Create runtime directories (cache and log) if they don't exist."""
