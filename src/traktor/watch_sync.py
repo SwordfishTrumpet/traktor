@@ -709,19 +709,25 @@ class WatchSyncEngine:
             self.stats["plex_unwatched"] += result["success"]
             self.stats["errors"] += result["failed"]
 
-        # Update history for successful items
-        for update in plex_items_to_update:
-            item = update["item"]
-            # Note: In a real implementation, we'd track which items succeeded/failed
-            # For now, we'll update history for all items
-            self.history.add_or_update_synced_item(
-                media_type=item["media_type"],
-                imdb_id=item["imdb_id"],
-                tmdb_id=item.get("tmdb_id"),
-                plex_rating_key=item["rating_key"],
-                trakt_id=item.get("trakt_id"),
-                watched_plex=update["watched"],
-            )
+        # Update history for successful items, then persist once (issue #7):
+        # add_or_update_synced_item() only mutates in-memory state; a single
+        # save_state() at the end replaces one full-file write per item.
+        try:
+            for update in plex_items_to_update:
+                item = update["item"]
+                # Note: In a real implementation, we'd track which items succeeded/failed
+                # For now, we'll update history for all items
+                self.history.add_or_update_synced_item(
+                    media_type=item["media_type"],
+                    imdb_id=item["imdb_id"],
+                    tmdb_id=item.get("tmdb_id"),
+                    plex_rating_key=item["rating_key"],
+                    trakt_id=item.get("trakt_id"),
+                    watched_plex=update["watched"],
+                )
+        finally:
+            if plex_items_to_update:
+                self.history.save_state()
 
         # Apply Trakt changes in batches
         movies_to_add = []

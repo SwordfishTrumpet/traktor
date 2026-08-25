@@ -26,6 +26,19 @@ class WatchHistoryManager:
         self.plex_server_id = plex_server_id
         self.sync_file = WATCH_SYNC_FILE
         self.state = self._load_state()
+        self._build_index()
+
+    def _build_index(self):
+        """Build the plex_rating_key -> item index for O(1) lookups.
+
+        Rebuilt on load/reset; maintained incrementally on add/remove
+        (issue #7). Items without a plex_rating_key are not indexed.
+        """
+        self._item_index = {
+            item.get("plex_rating_key"): item
+            for item in self.state["synced_items"]
+            if item.get("plex_rating_key") is not None
+        }
 
     def _load_state(self):
         """Load sync state from disk."""
@@ -96,6 +109,10 @@ class WatchHistoryManager:
     def get_synced_item(self, imdb_id=None, tmdb_id=None, trakt_id=None, plex_rating_key=None):
         """Get a synced item by any of its identifiers.
 
+        When ``plex_rating_key`` is provided, an O(1) index lookup is used
+        first (issue #7); the linear scan remains as fallback for legacy
+        entries stored before indexing or type-mismatched keys.
+
         Args:
             imdb_id: IMDb ID to search for
             tmdb_id: TMDb ID to search for
@@ -105,6 +122,11 @@ class WatchHistoryManager:
         Returns:
             Synced item dict or None if not found
         """
+        if plex_rating_key is not None:
+            indexed = self._item_index.get(plex_rating_key)
+            if indexed is not None:
+                return indexed
+
         for item in self.state["synced_items"]:
             if imdb_id and item.get("imdb_id") == imdb_id:
                 return item
@@ -143,13 +165,18 @@ class WatchHistoryManager:
             last_watched_at_plex: ISO timestamp string for Plex watch
             last_watched_at_trakt: ISO timestamp string for Trakt watch
         """
-        # Find existing item
-        existing = self.get_synced_item(
-            imdb_id=imdb_id,
-            tmdb_id=tmdb_id,
-            trakt_id=trakt_id,
-            plex_rating_key=plex_rating_key,
-        )
+        # Find existing item: exact O(1) lookup when we have a rating key.
+        # Deliberately no multi-identifier fallback in that case: episodes of
+        # one show share an imdb_id, so the legacy scan would cross-match them
+        # (issue #7). Without a rating key, use the legacy scan.
+        if plex_rating_key is not None:
+            existing = self._item_index.get(plex_rating_key)
+        else:
+            existing = self.get_synced_item(
+                imdb_id=imdb_id,
+                tmdb_id=tmdb_id,
+                trakt_id=trakt_id,
+            )
 
         if existing:
             # Update existing item
@@ -178,7 +205,10 @@ class WatchHistoryManager:
             item["last_watched_at_trakt"] = last_watched_at_trakt
 
         logger.debug(f"Updated synced item: {item.get('imdb_id') or item.get('tmdb_id')}")
-        self.save_state()
+        if plex_rating_key is not None:
+            self._item_index[plex_rating_key] = item
+        # NOTE (issue #7): no save_state() here - callers mutate state for all
+        # items and persist once at the end of the batch to avoid O(N) writes.
 
     def remove_synced_item(self, imdb_id=None, tmdb_id=None, trakt_id=None, plex_rating_key=None):
         """Remove a synced item from the state.
@@ -205,6 +235,8 @@ class WatchHistoryManager:
 
             if match:
                 self.state["synced_items"].pop(i)
+                if item.get("plex_rating_key") is not None:
+                    self._item_index.pop(item.get("plex_rating_key"), None)
                 logger.debug(f"Removed synced item: {item.get('imdb_id') or item.get('tmdb_id')}")
                 self.save_state()
                 return True
@@ -237,6 +269,7 @@ class WatchHistoryManager:
     def clear_all(self):
         """Clear all synced items and reset state."""
         self.state = self._create_empty_state()
+        self._build_index()
         self.save_state()
         logger.info("Cleared all watch sync state")
 
