@@ -1300,3 +1300,128 @@ class TestPullFailurePropagation:
         sync_engine.sync_watched_status()
 
         assert sync_engine.history.get_last_sync_timestamp() is not None
+
+
+class TestHistoryBatchPersistence:
+    """Regression tests for issue #7: the apply phase must persist history
+    state once (not once per item) and rating-key lookups must use an index
+    instead of scanning the synced_items list."""
+
+    @staticmethod
+    def _make_changes(n_movies):
+        """Build a changes dict with n_movies Plex mark_watched entries."""
+        items = [
+            {
+                "key": ("movie", f"tt{i}", None),
+                "media_type": "movie",
+                "imdb_id": f"tt{i}",
+                "tmdb_id": None,
+                "rating_key": 1000 + i,
+                "title": f"Movie {i}",
+            }
+            for i in range(n_movies)
+        ]
+        return {
+            "plex": {"mark_watched": items, "mark_unwatched": []},
+            "trakt": {"mark_watched": [], "mark_unwatched": []},
+        }
+
+    def test_apply_changes_persists_history_once(self, sync_engine):
+        """N history updates produce exactly one save_state() write."""
+        n = 25
+        changes = self._make_changes(n)
+
+        save_calls = []
+        original_save = sync_engine.history.save_state
+
+        def counting_save():
+            save_calls.append(1)
+            original_save()
+
+        sync_engine.history.save_state = counting_save
+
+        sync_engine._apply_changes(changes)
+
+        assert len(sync_engine.history.state["synced_items"]) == n
+        assert (
+            len(save_calls) == 1
+        ), f"Expected one save_state() per apply phase, got {len(save_calls)}"
+
+    def test_apply_changes_persists_once_even_on_error(self, sync_engine):
+        """A mid-batch failure still persists accumulated state exactly once."""
+        changes = self._make_changes(5)
+
+        calls = {"save": 0}
+        original_save = sync_engine.history.save_state
+
+        def failing_update(**kwargs):
+            raise RuntimeError("boom mid-batch")
+
+        original_add = sync_engine.history.add_or_update_synced_item
+
+        def add_then_fail(**kwargs):
+            if kwargs.get("plex_rating_key") == 1003:
+                raise RuntimeError("boom")
+            return original_add(**kwargs)
+
+        def counting_save():
+            calls["save"] += 1
+            original_save()
+
+        sync_engine.history.add_or_update_synced_item = add_then_fail
+        sync_engine.history.save_state = counting_save
+
+        with pytest.raises(RuntimeError, match="boom"):
+            sync_engine._apply_changes(changes)
+
+        # Items processed before the failure are preserved by the single write
+        assert len(sync_engine.history.state["synced_items"]) == 3
+        assert calls["save"] == 1
+
+    def test_rating_key_lookup_uses_index_not_scan(self, mock_history_manager):
+        """get_synced_item(plex_rating_key=...) resolves via the index without
+        iterating synced_items."""
+        manager = mock_history_manager
+        for i in range(50):
+            manager.add_or_update_synced_item(
+                media_type="episode",
+                imdb_id="tt_show",
+                plex_rating_key=i,
+            )
+
+        class CountingList(list):
+            iterations = 0
+
+            def __iter__(self):
+                CountingList.iterations += 1
+                return super().__iter__()
+
+        manager.state["synced_items"] = CountingList(manager.state["synced_items"])
+
+        CountingList.iterations = 0
+        item = manager.get_synced_item(plex_rating_key=42)
+
+        assert item is not None
+        assert item["plex_rating_key"] == 42
+        assert CountingList.iterations == 0, "Index hit must not iterate synced_items"
+
+    def test_index_maintained_across_remove_and_reload(self, tmp_path, monkeypatch):
+        """Index stays consistent after remove and after a reload from disk."""
+        from traktor import history_manager
+
+        state_file = tmp_path / ".traktor_watch_sync.json"
+        monkeypatch.setattr(history_manager, "WATCH_SYNC_FILE", state_file)
+
+        manager = history_manager.WatchHistoryManager(plex_server_id="srv")
+        manager.add_or_update_synced_item(media_type="movie", imdb_id="tt1", plex_rating_key="rk-1")
+        manager.add_or_update_synced_item(media_type="movie", imdb_id="tt2", plex_rating_key="rk-2")
+
+        # No explicit save happened in add; explicit batch-style persist here
+        manager.save_state()
+
+        assert manager.remove_synced_item(plex_rating_key="rk-1") is True
+        assert manager._item_index.get("rk-1") is None
+
+        reloaded = history_manager.WatchHistoryManager(plex_server_id="srv")
+        assert reloaded.get_synced_item(plex_rating_key="rk-2") is not None
+        assert reloaded.get_synced_item(plex_rating_key="rk-1") is None

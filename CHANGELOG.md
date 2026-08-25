@@ -8,6 +8,13 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **Watch history apply phase no longer rewrites the state file per item (issue #7)**
+  - `add_or_update_synced_item()` performed a linear scan plus a full-file `save_state()` per
+    item — O(N·(M+N)) CPU and N disk writes during watch-sync apply
+  - State is now mutated in memory and persisted exactly once after the batch (also on error);
+    `plex_rating_key` lookups use a dict index instead of scanning the list; rating-key matches
+    are exact-only, which also stops episodes of the same show from cross-matching via shared IMDb ID
+
 - **Backups now include the live .env token store (issue #6)**
   - BackupManager archived the legacy token JSON file that current code never writes,
     so backups could not restore Trakt authentication after a disaster
