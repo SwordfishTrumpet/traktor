@@ -7,6 +7,7 @@ and sync status monitoring.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
@@ -15,6 +16,10 @@ from .log import logger
 from .resilience import health_checker
 
 DEFAULT_HEALTH_PORT = 8080
+# Empty bind host = all interfaces (INADDR_ANY), i.e. what containers need for
+# liveness probes; set TRAKTOR_HEALTH_HOST=127.0.0.1 for local-only exposure.
+# (Issue #8: a literal "0.0.0.0" default triggers Bandit B104.)
+DEFAULT_HEALTH_HOST = ""
 HEALTH_OK = 200
 HEALTH_DEGRADED = 503
 
@@ -83,19 +88,24 @@ class HealthHandler(BaseHTTPRequestHandler):
 class HealthServer:
     """HTTP server for health endpoints."""
 
-    def __init__(self, port: int = DEFAULT_HEALTH_PORT) -> None:
+    def __init__(self, port: int = DEFAULT_HEALTH_PORT, host: str | None = None) -> None:
         """Initialize health server.
 
         Args:
             port: Port to listen on (default: 8080)
+            host: Bind address; defaults to TRAKTOR_HEALTH_HOST env or all interfaces
         """
         self.port = port
+        self.host = (
+            host if host is not None else os.getenv("TRAKTOR_HEALTH_HOST", DEFAULT_HEALTH_HOST)
+        )
         self.server: HTTPServer | None = None
         self.thread: threading.Thread | None = None
 
     def start(self) -> None:
         """Start the health server in a background thread."""
-        self.server = HTTPServer(("0.0.0.0", self.port), HealthHandler)
+        bind_address = (self.host, self.port)
+        self.server = HTTPServer(bind_address, HealthHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         logger.info(f"Health server started on port {self.port}")

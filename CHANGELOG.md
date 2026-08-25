@@ -8,6 +8,17 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **CI Bandit job now actually gates on findings (issue #8)**
+  - The security job ran Bandit with `|| true` (could never fail) and uploaded its report under
+    `if: failure()` (unreachable); the floating `PyCQA/bandit@main` action ref was replaced with a
+    version-pinned `bandit==1.9.4` invocation failing on medium+ severity / medium+ confidence
+  - Report artifact is now uploaded on every run (`if: always()`)
+- Resolved the three pre-existing Bandit findings so the new gate starts green:
+  - `auto_update`: `urlopen` → `requests` (removes B310; error handling preserved)
+  - `health_server`: bind host configurable via `TRAKTOR_HEALTH_HOST` (default: all interfaces;
+    set `127.0.0.1` for local-only) instead of a hardcoded `0.0.0.0` literal (B104)
+  - `sync.py`: silent `except Exception: pass` in playlist snapshotting now logs at debug (B110)
+
 - **Watch history apply phase no longer rewrites the state file per item (issue #7)**
   - `add_or_update_synced_item()` performed a linear scan plus a full-file `save_state()` per
     item — O(N·(M+N)) CPU and N disk writes during watch-sync apply

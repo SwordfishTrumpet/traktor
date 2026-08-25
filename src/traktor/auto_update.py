@@ -11,8 +11,8 @@ import json
 import types
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
-from urllib.request import Request, urlopen
+
+import requests
 
 from .log import logger
 
@@ -59,30 +59,29 @@ class AutoUpdater:
         release_url, release_notes.
         """
         try:
-            req = Request(
+            response = requests.get(
                 UPDATE_CHECK_URL,
                 headers={
                     "Accept": "application/vnd.github.v3+json",
                     "User-Agent": "traktor-updater",
                 },
+                timeout=UPDATE_TIMEOUT_SECONDS,
             )
-            with urlopen(req, timeout=UPDATE_TIMEOUT_SECONDS) as response:
-                data = json.loads(response.read().decode("utf-8"))
-                self.latest_version = data.get("tag_name", "unknown")
-                self.release_info = data
+            response.raise_for_status()
+            data = response.json()
+            self.latest_version = data.get("tag_name", "unknown")
+            self.release_info = data
 
-                update_available = (
-                    self._version_compare(self.latest_version, self.current_version) > 0
-                )
+            update_available = self._version_compare(self.latest_version, self.current_version) > 0
 
-                return {
-                    "current_version": self.current_version,
-                    "latest_version": self.latest_version,
-                    "update_available": update_available,
-                    "release_url": data.get("html_url", ""),
-                    "release_notes": data.get("body", ""),
-                }
-        except (URLError, json.JSONDecodeError, TimeoutError) as e:
+            return {
+                "current_version": self.current_version,
+                "latest_version": self.latest_version,
+                "update_available": update_available,
+                "release_url": data.get("html_url", ""),
+                "release_notes": data.get("body", ""),
+            }
+        except (requests.RequestException, json.JSONDecodeError, ValueError) as e:
             logger.error(f"Failed to check for updates: {e}")
             return {
                 "current_version": self.current_version,
