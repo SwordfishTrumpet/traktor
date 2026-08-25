@@ -49,7 +49,7 @@ jobs:
         run: |
           # Extract changelog section for this version
           VERSION=${GITHUB_REF_NAME#v}
-          awk '/^## \['$VERSION'\]/{found=1} found{print} /^## \[/{if(found)exit}' CHANGELOG.md > RELEASE_NOTES.md || echo "See CHANGELOG.md for details" > RELEASE_NOTES.md
+          awk -v ver="$VERSION" 'index($0, "## [" ver "]") == 1 {found=1} found{print} /^## \[/{if(found)exit}' CHANGELOG.md > RELEASE_NOTES.md || echo "See CHANGELOG.md for details" > RELEASE_NOTES.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
