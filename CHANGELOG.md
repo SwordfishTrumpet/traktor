@@ -8,6 +8,14 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **`--undo` no longer claims restore capability it never had (issue #4)**
+  - `--undo` is now honest snapshot inspection: shows the most recent snapshot and its
+    contents; the misleading "Restore from this snapshot on next sync?" prompt and the
+    "restoration on next sync run" claim were removed (no restore code path exists)
+  - Removed the post-sync watch-sync snapshot save in the non-interactive branch — it
+    captured post-change state, which can never serve as undo state
+  - README/CLI help updated to match actual behavior
+
 - **Pre-sync prompts no longer crash non-interactive/cron runs (issue #3)**
   - Integrity-check and backup-failure prompts called `input()` without a TTY guard,
     raising unhandled `EOFError` in cron/Docker runs

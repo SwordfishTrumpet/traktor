@@ -1623,12 +1623,9 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
                         shows_only=args.sync_shows_only,
                         backfill_history=args.backfill_history,
                     )
-                    # Save undo snapshot for non-interactive mode
-                    if not args.dry_run and args and (args.interactive or args.undo):
-                        changes = watch_stats.get("changes")
-                        if changes:
-                            save_undo_snapshot("watch_sync", {"changes": changes})
-                            logger.info("Saved post-sync watch sync snapshot for undo")
+                    # NOTE (issue #4): no snapshot is saved after apply - a
+                    # post-change snapshot cannot serve as undo state, and
+                    # nothing restores snapshots anyway (--undo is inspection-only).
 
                     if args.dry_run:
                         print("\n[DRY RUN] Changes that would be made:")

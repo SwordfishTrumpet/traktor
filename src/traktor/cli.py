@@ -10,8 +10,6 @@ from .auto_update import apply_update_and_print, check_and_print_update
 from .diagnose import run_diagnosis
 from .health_server import HealthServer
 from .interactive import (
-    confirm_changes,
-    is_interactive,
     list_undo_snapshots,
     restore_undo_snapshot,
 )
@@ -215,7 +213,7 @@ def parse_args():
     parser.add_argument(
         "--undo",
         action="store_true",
-        help="Undo the most recent operation",
+        help="Show the most recent sync snapshot (inspection only; nothing is restored)",
     )
 
     # Auto-update arguments
@@ -390,8 +388,13 @@ def _show_circuit_status():
 
 
 def _handle_undo() -> int:
-    """Handle the --undo command."""
-    print("Undo Operations")
+    """Handle the --undo command: show the most recent snapshot.
+
+    Snapshots are inspection-only (issue #4): no code path restores playlist
+    membership or watch state from a snapshot, so this must not claim or
+    offer restoration.
+    """
+    print("Sync Snapshot (inspection only - no automatic restore)")
     print("=" * 60)
 
     snapshots = list_undo_snapshots()
@@ -410,27 +413,18 @@ def _handle_undo() -> int:
     timestamp = snapshot.get("timestamp", "unknown")
 
     print(f"Most recent snapshot: {operation_type} ({timestamp})")
-    print(
-        "\nUndo requires restoring from a previous state. "
-        "Please run the sync again with the appropriate settings."
-    )
-    print("\nNote: For playlist changes, the previous playlist items are stored in the snapshot.")
-    print("For watch sync changes, the previous watch state is preserved.")
+    print("\nNote: traktor does not currently restore state from snapshots.")
+    print("Snapshot contents are shown for manual inspection/recovery only.")
 
-    if not is_interactive():
-        print("\nNon-interactive mode: showing snapshot info only.")
-        return 0
+    data = snapshot.get("data", {})
+    if data:
+        import json as _json
 
-    confirmed = confirm_changes(
-        "Restore from this snapshot on next sync?",
-        default=False,
-    )
-    if confirmed:
-        print("\nSnapshot will be used for restoration on next sync run.")
-        return 0
-    else:
-        print("\nUndo cancelled.")
-        return 1
+        print("\nSnapshot contents:")
+        print(_json.dumps(data, indent=2, default=str)[:2000])
+
+    print("\nNon-interactive and interactive runs both end here.")
+    return 0
 
 
 def main():

@@ -356,32 +356,42 @@ def test_handle_undo_no_snapshots(monkeypatch, capsys):
 
 
 def test_handle_undo_non_interactive(monkeypatch, capsys):
-    """Test undo in non-interactive mode shows snapshot info only."""
+    """Test undo shows snapshot info without claiming restoration (issue #4)."""
     monkeypatch.setattr(cli, "list_undo_snapshots", lambda: [{"operation_type": "playlist_sync"}])
     monkeypatch.setattr(
         cli,
         "restore_undo_snapshot",
-        lambda: {"operation_type": "playlist_sync", "timestamp": "2026-01-01"},
+        lambda: {
+            "operation_type": "playlist_sync",
+            "timestamp": "2026-01-01",
+            "data": {"playlists": {"Movies": {"items": [1, 2]}}},
+        },
     )
-    monkeypatch.setattr(cli, "is_interactive", lambda: False)
 
     assert cli._handle_undo() == 0
     out = capsys.readouterr().out
     assert "playlist_sync" in out
+    # Honest messaging: no restore claim, inspection only
+    assert "does not currently restore state from snapshots" in out
+    assert "inspection only" in out.lower()
+    # Snapshot contents are displayed for manual recovery
+    assert "playlists" in out
 
 
-def test_handle_undo_interactive_confirmed(monkeypatch, capsys):
-    """Test undo with interactive confirmation."""
+def test_handle_undo_no_restore_prompt(monkeypatch, capsys):
+    """--undo must not offer or simulate a restore path (issue #4)."""
     monkeypatch.setattr(cli, "list_undo_snapshots", lambda: [{"operation_type": "watch_sync"}])
     monkeypatch.setattr(
         cli,
         "restore_undo_snapshot",
         lambda: {"operation_type": "watch_sync", "timestamp": "2026-01-01"},
     )
-    monkeypatch.setattr(cli, "is_interactive", lambda: True)
-    monkeypatch.setattr(cli, "confirm_changes", lambda *a, **k: True)
 
     assert cli._handle_undo() == 0
+    out = capsys.readouterr().out
+    # The old misleading prompts are gone
+    assert "Restore from this snapshot on next sync?" not in out
+    assert "will be used for restoration on next sync run" not in out
 
 
 def test_main_dispatch_diagnose(monkeypatch, capsys):
