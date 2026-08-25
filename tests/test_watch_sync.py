@@ -1425,3 +1425,140 @@ class TestHistoryBatchPersistence:
         reloaded = history_manager.WatchHistoryManager(plex_server_id="srv")
         assert reloaded.get_synced_item(plex_rating_key="rk-2") is not None
         assert reloaded.get_synced_item(plex_rating_key="rk-1") is None
+
+
+class TestBatchFailureSurfacing:
+    """Regression tests for issue #9: per-batch failures must be counted as
+    errors and failed items must not be recorded as synced."""
+
+    def test_trakt_add_batch_failures_count_as_errors(self, sync_engine):
+        """Partial Trakt add failures surface in stats['errors']."""
+        sync_engine.trakt.add_to_history = MagicMock(
+            return_value={
+                "added": {"movies": 2, "episodes": 0},
+                "failed": {"movies": 3, "episodes": 0},
+            }
+        )
+        changes = {
+            "plex": {"mark_watched": [], "mark_unwatched": []},
+            "trakt": {
+                "mark_watched": [
+                    {
+                        "key": ("movie", f"tt{i}", None),
+                        "media_type": "movie",
+                        "imdb_id": f"tt{i}",
+                        "tmdb_id": None,
+                        "title": f"M{i}",
+                    }
+                    for i in range(5)
+                ],
+                "mark_unwatched": [],
+            },
+        }
+
+        sync_engine._apply_changes(changes)
+
+        assert sync_engine.stats["errors"] == 3
+        assert sync_engine.stats["trakt_watched"] == 2
+
+    def test_trakt_remove_batch_failures_count_as_errors(self, sync_engine):
+        """Partial Trakt remove failures surface in stats['errors']."""
+        sync_engine.trakt.remove_from_history = MagicMock(
+            return_value={
+                "deleted": {"movies": 0, "episodes": 1},
+                "failed": {"movies": 0, "episodes": 2},
+            }
+        )
+        changes = {
+            "plex": {"mark_watched": [], "mark_unwatched": []},
+            "trakt": {
+                "mark_watched": [],
+                "mark_unwatched": [
+                    {
+                        "key": ("episode", "tt_show", 1, i),
+                        "media_type": "episode",
+                        "imdb_id": "tt_show",
+                        "tmdb_id": None,
+                        "title": f"E{i}",
+                    }
+                    for i in range(1, 4)
+                ],
+            },
+        }
+
+        sync_engine._apply_changes(changes)
+
+        assert sync_engine.stats["errors"] == 2
+        assert sync_engine.stats["trakt_unwatched"] == 1
+
+    def test_failed_plex_items_not_recorded_synced(self, sync_engine):
+        """Items whose Plex mark operation failed are not written to history state."""
+        changes = {
+            "plex": {
+                "mark_watched": [
+                    {
+                        "key": ("movie", "tt_ok", None),
+                        "media_type": "movie",
+                        "imdb_id": "tt_ok",
+                        "tmdb_id": None,
+                        "rating_key": 1,
+                        "title": "OK",
+                    },
+                    {
+                        "key": ("movie", "tt_bad", None),
+                        "media_type": "movie",
+                        "imdb_id": "tt_bad",
+                        "tmdb_id": None,
+                        "rating_key": 2,
+                        "title": "BAD",
+                    },
+                ],
+                "mark_unwatched": [],
+            },
+            "trakt": {"mark_watched": [], "mark_unwatched": []},
+        }
+        sync_engine.plex.batch_mark_as_watched = MagicMock(
+            return_value={
+                "success": 1,
+                "failed": 1,
+                "errors": ["Error marking 2 as watched: boom"],
+                "failed_rating_keys": [2],
+            }
+        )
+
+        sync_engine._apply_changes(changes)
+
+        recorded_keys = [
+            item.get("plex_rating_key") for item in sync_engine.history.state["synced_items"]
+        ]
+        assert recorded_keys == [
+            1
+        ], "Failed item must not be remembered as synced; only the successful item is"
+
+    def test_all_plex_items_succeed_all_recorded(self, sync_engine):
+        """Happy path unchanged: every item lands in history state (issue #7 behavior)."""
+        changes = {
+            "plex": {
+                "mark_watched": [
+                    {
+                        "key": ("movie", f"tt{i}", None),
+                        "media_type": "movie",
+                        "imdb_id": f"tt{i}",
+                        "tmdb_id": None,
+                        "rating_key": 100 + i,
+                        "title": f"M{i}",
+                    }
+                    for i in range(3)
+                ],
+                "mark_unwatched": [],
+            },
+            "trakt": {"mark_watched": [], "mark_unwatched": []},
+        }
+        sync_engine.plex.batch_mark_as_watched = MagicMock(
+            return_value={"success": 3, "failed": 0, "errors": [], "failed_rating_keys": []}
+        )
+
+        sync_engine._apply_changes(changes)
+
+        assert len(sync_engine.history.state["synced_items"]) == 3
+        assert sync_engine.stats["errors"] == 0

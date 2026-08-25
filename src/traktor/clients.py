@@ -1400,6 +1400,8 @@ class TraktClient:
         )
 
         all_responses = []
+        failed_movie_payloads = []
+        failed_episode_payloads = []
 
         # Process movies in batches
         if movies:
@@ -1421,7 +1423,8 @@ class TraktClient:
                     all_responses.append(data)
 
                 except requests.exceptions.RequestException as e:
-                    logger.error(f"Failed to process movie batch: {e}")
+                    logger.error(f"Failed to process movie batch ({len(batch)} items): {e}")
+                    failed_movie_payloads.extend(batch)
                     continue
 
         # Process episodes in batches
@@ -1444,11 +1447,18 @@ class TraktClient:
                     all_responses.append(data)
 
                 except requests.exceptions.RequestException as e:
-                    logger.error(f"Failed to process episode batch: {e}")
+                    logger.error(f"Failed to process episode batch ({len(batch)} items): {e}")
+                    failed_episode_payloads.extend(batch)
                     continue
 
         if not all_responses:
-            logger.warning(f"No items were successfully processed for {operation_name}")
+            if not failed_movie_payloads and not failed_episode_payloads:
+                logger.warning(f"No items were successfully processed for {operation_name}")
+            else:
+                logger.error(
+                    f"All batches failed for {operation_name}: "
+                    f"{len(failed_movie_payloads)} movies, {len(failed_episode_payloads)} episodes"
+                )
             return None
 
         # Combine results
@@ -1461,7 +1471,18 @@ class TraktClient:
                 "movies": sum(r.get("not_found", {}).get("movies", 0) for r in all_responses),
                 "episodes": sum(r.get("not_found", {}).get("episodes", 0) for r in all_responses),
             },
+            # Per-batch failure information (issue #9): callers must surface these,
+            # otherwise partial failures are invisible and drift goes unreconciled.
+            "failed": {
+                "movies": len(failed_movie_payloads),
+                "episodes": len(failed_episode_payloads),
+            },
         }
+        if failed_movie_payloads or failed_episode_payloads:
+            combined_result["failed_payloads"] = {
+                "movies": failed_movie_payloads,
+                "episodes": failed_episode_payloads,
+            }
 
         logger.info(
             f"Batch {operation_name} completed: {combined_result[success_key]['movies']} movies, "
@@ -1975,7 +1996,12 @@ class PlexClient:
         """
         logger.info(f"Batch marking {len(rating_keys)} items as watched in Plex...")
 
-        results: Dict[str, Any] = {"success": 0, "failed": 0, "errors": []}
+        results: Dict[str, Any] = {
+            "success": 0,
+            "failed": 0,
+            "errors": [],
+            "failed_rating_keys": [],
+        }
 
         for rating_key in rating_keys:
             try:
@@ -1983,9 +2009,11 @@ class PlexClient:
                     results["success"] += 1
                 else:
                     results["failed"] += 1
+                    results["failed_rating_keys"].append(rating_key)
                     results["errors"].append(f"Failed to mark {rating_key} as watched")
             except Exception as e:
                 results["failed"] += 1
+                results["failed_rating_keys"].append(rating_key)
                 results["errors"].append(f"Error marking {rating_key} as watched: {e}")
 
         logger.info(
@@ -2011,7 +2039,12 @@ class PlexClient:
         """
         logger.info(f"Batch marking {len(rating_keys)} items as unwatched in Plex...")
 
-        results: Dict[str, Any] = {"success": 0, "failed": 0, "errors": []}
+        results: Dict[str, Any] = {
+            "success": 0,
+            "failed": 0,
+            "errors": [],
+            "failed_rating_keys": [],
+        }
 
         for rating_key in rating_keys:
             try:
@@ -2019,9 +2052,11 @@ class PlexClient:
                     results["success"] += 1
                 else:
                     results["failed"] += 1
+                    results["failed_rating_keys"].append(rating_key)
                     results["errors"].append(f"Failed to mark {rating_key} as unwatched")
             except Exception as e:
                 results["failed"] += 1
+                results["failed_rating_keys"].append(rating_key)
                 results["errors"].append(f"Error marking {rating_key} as unwatched: {e}")
 
         logger.info(
