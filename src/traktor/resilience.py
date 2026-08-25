@@ -681,14 +681,14 @@ class IntegrityChecker:
                 "details": {"exists": False, "note": "No cache (will build on first run)"},
             }
 
-        cache_files = list(CACHE_DIR.rglob("*.json"))
+        # Scan both plain and gzip-compressed cache files. The primary Plex
+        # library cache is gzip-compressed (plex_library_cache.json.gz) - see
+        # issue #5; scanning only *.json silently skipped it.
+        cache_files = sorted(list(CACHE_DIR.rglob("*.json")) + list(CACHE_DIR.rglob("*.json.gz")))
         corrupt_files = []
 
         for cache_file in cache_files:
-            try:
-                with open(cache_file) as f:
-                    json.load(f)
-            except json.JSONDecodeError:
+            if not self._is_valid_cache_file(cache_file):
                 corrupt_files.append(str(cache_file.relative_to(CACHE_DIR)))
 
         return {
@@ -699,6 +699,28 @@ class IntegrityChecker:
                 "corrupt_files": corrupt_files if corrupt_files else None,
             },
         }
+
+    @staticmethod
+    def _is_valid_cache_file(cache_file: Path) -> bool:
+        """Return True if a cache file parses as JSON (plain or gzipped).
+
+        Mirrors CacheManager.load_cache()'s corruption handling: unreadable or
+        malformed files are treated as corrupt rather than crashing the check.
+        """
+        try:
+            if cache_file.name.endswith(".gz"):
+                with gzip.open(cache_file, "rt", encoding="utf-8") as f:
+                    json.load(f)
+            else:
+                with open(cache_file, encoding="utf-8") as f:
+                    json.load(f)
+        except json.JSONDecodeError:
+            return False
+        except (OSError, EOFError):
+            # Covers truncated/invalid gzip streams (BadGzipFile, EOFError) and read errors
+            return False
+        else:
+            return True
 
 
 def retry_with_backoff(

@@ -552,3 +552,71 @@ class TestIntegrityChecker:
 
         assert results["overall_healthy"] is False
         assert "error" in results["checks"]["config"]
+
+
+class TestIntegrityCheckerGzipCache:
+    """Regression tests for issue #5: the primary .json.gz library cache must
+    be included in integrity checks (previously only *.json was scanned)."""
+
+    @pytest.fixture
+    def checker(self, tmp_path, monkeypatch):
+        import traktor.resilience as res
+
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        monkeypatch.setattr(res, "CONFIG_FILE", tmp_path / "config.json")
+        monkeypatch.setattr(res, "TOKEN_FILE", tmp_path / "token.json")
+        monkeypatch.setattr(res, "CACHE_DIR", cache)
+        return res.IntegrityChecker(), tmp_path / "cache"
+
+    def test_valid_gzip_cache_is_healthy(self, checker):
+        """A well-formed plex_library_cache.json.gz passes the check."""
+        import gzip as _gzip
+        import json as _json
+
+        checker_obj, cache_dir = checker
+        payload = {"movies_by_imdb": {}, "version": 3}
+        with _gzip.open(cache_dir / "plex_library_cache.json.gz", "wt", encoding="utf-8") as f:
+            _json.dump(payload, f)
+
+        results = checker_obj._check_cache()
+
+        assert results["healthy"] is True
+        assert results["details"]["file_count"] == 1
+        assert results["details"]["corrupt_files"] is None
+
+    def test_truncated_gzip_cache_is_flagged(self, checker):
+        """A truncated gzip stream is reported corrupt with the file listed."""
+        checker_obj, cache_dir = checker
+        # Write a valid gzip header then truncate before any deflate data
+        (cache_dir / "plex_library_cache.json.gz").write_bytes(b"\x1f\x8b\x08\x00")
+
+        results = checker_obj._check_cache()
+
+        assert results["healthy"] is False
+        assert "plex_library_cache.json.gz" in (results["details"]["corrupt_files"] or [])
+
+    def test_gzip_with_invalid_json_is_flagged(self, checker):
+        """Gzipped content that is not valid JSON is flagged."""
+        import gzip as _gzip
+
+        checker_obj, cache_dir = checker
+        with _gzip.open(cache_dir / "official_trending.json.gz", "wt", encoding="utf-8") as f:
+            f.write("{bad json")
+
+        results = checker_obj._check_cache()
+
+        assert results["healthy"] is False
+        assert "official_trending.json.gz" in (results["details"]["corrupt_files"] or [])
+
+    def test_plain_json_still_checked_alongside_gzip(self, checker):
+        """Plain *.json files remain covered when .gz files are present."""
+        checker_obj, cache_dir = checker
+        (cache_dir / "cache_metadata.json").write_text('{"ok": true}')
+        (cache_dir / "bad.json").write_text("{bad json")
+
+        results = checker_obj._check_cache()
+
+        assert results["healthy"] is False
+        assert "bad.json" in (results["details"]["corrupt_files"] or [])
+        assert results["details"]["file_count"] == 2
