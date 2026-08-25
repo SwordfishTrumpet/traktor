@@ -1520,3 +1520,120 @@ class TestPrintSummary:
 
         out = capsys.readouterr().out
         assert "Bottlenecks" in out
+
+
+class TestNonInteractivePrompts:
+    """Regression tests for issue #3: pre-sync prompts must fail closed
+    in non-interactive contexts instead of raising EOFError from input()."""
+
+    @staticmethod
+    def _non_interactive_stdin(monkeypatch):
+        import io
+        import sys
+
+        fake = io.StringIO()
+        fake.isatty = lambda: False
+        monkeypatch.setattr(sys, "stdin", fake)
+        # input() must never be reached in non-interactive mode
+        import builtins
+
+        monkeypatch.setattr(
+            builtins,
+            "input",
+            lambda *a: pytest.fail("input() called in non-interactive mode"),
+        )
+
+    def test_confirm_continue_non_interactive_aborts(self, monkeypatch):
+        """_confirm_continue returns False without calling input() on non-TTY."""
+        self._non_interactive_stdin(monkeypatch)
+
+        assert sync._confirm_continue("Continue anyway? (y/N): ") is False
+
+    def test_confirm_continue_interactive_declined(self, monkeypatch):
+        """Interactive 'N' answer returns False."""
+        import sys
+
+        fake = MagicMock()
+        fake.isatty = lambda: True
+        monkeypatch.setattr(sys, "stdin", fake)
+        import builtins
+
+        monkeypatch.setattr(builtins, "input", lambda *a: "n")
+        assert sync._confirm_continue("Continue anyway? (y/N): ") is False
+
+    def test_confirm_continue_interactive_accepted(self, monkeypatch):
+        """Interactive 'y' answer returns True (behavior unchanged)."""
+        import sys
+
+        fake = MagicMock()
+        fake.isatty = lambda: True
+        monkeypatch.setattr(sys, "stdin", fake)
+        import builtins
+
+        monkeypatch.setattr(builtins, "input", lambda *a: "y")
+        assert sync._confirm_continue("Continue anyway? (y/N): ") is True
+
+    @staticmethod
+    def _orchestration_setup(monkeypatch, tmp_path):
+        TestSyncListsOrchestration()._setup(monkeypatch, tmp_path)
+        args = TestSyncListsOrchestration._args(monkeypatch, ["--list-source", "official"])
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+        return args
+
+    def test_integrity_failure_non_interactive_exits_cleanly(self, monkeypatch, tmp_path, capsys):
+        """Failed integrity check in cron context aborts with exit code 1, no EOFError."""
+        self._non_interactive_stdin(monkeypatch)
+        args = self._orchestration_setup(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            sync.integrity_checker,
+            "run_all_checks",
+            lambda: {"overall_healthy": False, "checks": {}},
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            sync.sync_lists(args)
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "Integrity check failed" in out
+
+    def test_backup_failure_non_interactive_exits_cleanly(self, monkeypatch, tmp_path, capsys):
+        """Failed backup in cron context aborts with exit code 1, no EOFError."""
+        self._non_interactive_stdin(monkeypatch)
+        args = self._orchestration_setup(monkeypatch, tmp_path)
+        monkeypatch.setenv("TRAKTOR_BACKUP_BEFORE_SYNC", "true")
+
+        def failing_backup(reason=None):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(sync.backup_manager, "create_backup", failing_backup)
+
+        with pytest.raises(SystemExit) as exc_info:
+            sync.sync_lists(args)
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "Pre-sync backup failed" in out
+
+    def test_integrity_failure_interactive_decline_exits(self, monkeypatch, tmp_path):
+        """Interactive user declining continues to exit 1 (behavior unchanged)."""
+        import sys
+
+        args = self._orchestration_setup(monkeypatch, tmp_path)
+        fake = MagicMock()
+        fake.isatty = lambda: True
+        monkeypatch.setattr(sys, "stdin", fake)
+        import builtins
+
+        monkeypatch.setattr(builtins, "input", lambda *a: "n")
+        monkeypatch.setattr(
+            sync.integrity_checker,
+            "run_all_checks",
+            lambda: {"overall_healthy": False, "checks": {}},
+        )
+
+        with pytest.raises(SystemExit) as exc_info:
+            sync.sync_lists(args)
+
+        assert exc_info.value.code == 1
