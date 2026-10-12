@@ -434,6 +434,12 @@ class BackupManager:
     def restore_backup(self, backup_path: Path, verify: bool = True) -> bool:
         """Restore from a backup.
 
+        Only the paths this build knows are restored, and only for item names
+        it issued (issue #11). A manifest that names another destination, or an
+        item name this build did not write, is refused: a backup that arrived
+        from elsewhere must never be able to overwrite or remove an arbitrary
+        file.
+
         Args:
             backup_path: Path to backup directory
             verify: Whether to verify checksums before restoring
@@ -455,17 +461,43 @@ class BackupManager:
             logger.error(f"Failed to read backup manifest: {e}")
             return False
 
+        # The destination of every item comes from this build's own path list,
+        # never from the manifest (issue #11). The manifest is attacker-
+        # reachable data, so both the item name and the named source are
+        # validated before anything is removed or written.
+        items = manifest.get("items", {})
+        if not isinstance(items, dict):
+            logger.error(f"Backup manifest items are malformed: {backup_path}")
+            return False
+
+        expected_sources = dict(self._items_to_backup)
+        for name, info in items.items():
+            expected = expected_sources.get(name)
+            if expected is None:
+                logger.error(
+                    f"Backup carries an unknown item '{name}'; refusing the restore "
+                    f"(expected one of: {', '.join(sorted(expected_sources))})"
+                )
+                return False
+            manifest_source = info.get("source") if isinstance(info, dict) else None
+            if manifest_source is None or Path(manifest_source) != Path(expected):
+                logger.error(
+                    f"Backup item '{name}' names '{manifest_source}' but this build restores "
+                    f"'{expected}'; refusing the restore"
+                )
+                return False
+
         # Verify backup integrity
         if verify:
-            for name, info in manifest.get("items", {}).items():
-                if not self._verify_backup_item(backup_path / name, info["checksum"]):
+            for name, info in items.items():
+                if not self._verify_backup_item(backup_path / name, info.get("checksum", "")):
                     logger.error(f"Backup verification failed for {name}")
                     return False
 
         # Perform restore
-        for name, info in manifest.get("items", {}).items():
+        for name in items:
             source = backup_path / name
-            dest = Path(info["source"])
+            dest = Path(expected_sources[name])
 
             # Remove existing
             if dest.exists():

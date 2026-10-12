@@ -445,6 +445,88 @@ class TestBackupManager:
 
         assert manager.restore_backup(backup_path, verify=True) is False
 
+    def test_restore_refuses_a_manifest_path_outside_the_expected_set(self, backup_env):
+        """A manifest naming a foreign file is refused and the file is untouched
+        (issue #11)."""
+        manager, tmp_path = backup_env
+        backup_path = manager.create_backup(reason="test")
+
+        victim = tmp_path / "victim.txt"
+        victim.write_text("original content\n")
+
+        manifest_path = backup_path / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["items"]["config"]["source"] = str(victim)
+        manifest_path.write_text(json.dumps(manifest))
+
+        assert manager.restore_backup(backup_path) is False
+        assert victim.read_text() == "original content\n"
+
+    def test_restore_refuses_a_foreign_directory_before_removing_it(self, backup_env):
+        """A directory entry pointed outside the backup is refused before any
+        removal (issue #11)."""
+        manager, tmp_path = backup_env
+        backup_path = manager.create_backup(reason="test")
+
+        victim_dir = tmp_path / "victim-dir"
+        (victim_dir / "nested").mkdir(parents=True)
+        (victim_dir / "nested" / "keep.txt").write_text("keep me\n")
+
+        manifest_path = backup_path / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["items"]["cache"]["source"] = str(victim_dir)
+        manifest_path.write_text(json.dumps(manifest))
+
+        assert manager.restore_backup(backup_path) is False
+        assert (victim_dir / "nested" / "keep.txt").read_text() == "keep me\n"
+
+    def test_restore_refuses_an_unknown_item_name(self, backup_env):
+        """An item name this build never wrote is refused, including a
+        path-traversal name (issue #11)."""
+        import traktor.resilience as res
+
+        manager, tmp_path = backup_env
+        backup_path = manager.create_backup(reason="test")
+
+        manifest_path = backup_path / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["items"]["../../../etc/passwd"] = {
+            "source": str(res.CONFIG_FILE),
+            "checksum": "0" * 64,
+            "compressed": False,
+        }
+        manifest_path.write_text(json.dumps(manifest))
+
+        assert manager.restore_backup(backup_path) is False
+        assert res.CONFIG_FILE.read_text() == '{"key": "value"}'
+
+    def test_restore_refuses_an_item_without_a_source(self, backup_env):
+        """A manifest entry that names no source is refused, not trusted."""
+        manager, tmp_path = backup_env
+        backup_path = manager.create_backup(reason="test")
+
+        manifest_path = backup_path / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        del manifest["items"]["config"]["source"]
+        manifest_path.write_text(json.dumps(manifest))
+
+        assert manager.restore_backup(backup_path) is False
+
+    def test_restore_roundtrip_still_restores_the_expected_paths(self, backup_env):
+        """A manifest this build wrote still restores normally (issue #11)."""
+        import traktor.resilience as res
+
+        manager, tmp_path = backup_env
+        backup_path = manager.create_backup(reason="test")
+
+        res.CONFIG_FILE.write_text('{"changed": true}')
+        res.ENV_FILE.write_text("TRAKT_ACCESS_TOKEN=gone\n")
+
+        assert manager.restore_backup(backup_path) is True
+        assert res.CONFIG_FILE.read_text() == '{"key": "value"}'
+        assert "TRAKT_CLIENT_ID" in res.ENV_FILE.read_text()
+        assert (res.ENV_FILE.stat().st_mode & 0o777) == 0o600
+
     def test_list_backups(self, backup_env):
         """list_backups returns metadata from manifests."""
         manager, _ = backup_env
