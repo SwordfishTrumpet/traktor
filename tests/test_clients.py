@@ -267,6 +267,23 @@ class TestTraktAuth:
         assert result is True
         # Should log message about tokens being in memory
         assert "tokens obtained" in caplog.text.lower() or "memory" in caplog.text.lower()
+        # The token store must not be readable by other accounts (issue #12)
+        assert (fake_env.stat().st_mode & 0o777) == 0o600
+
+    def test_save_tokens_restricts_env_permissions(self, tmp_path, monkeypatch):
+        """A wide-open .env is tightened to owner-only when tokens are saved
+        (issue #12)."""
+        monkeypatch.chdir(tmp_path)
+        fake_env = tmp_path / ".env"
+        fake_env.write_text("TRAKT_ACCESS_TOKEN=old\nTRAKT_REFRESH_TOKEN=old\n")
+        fake_env.chmod(0o644)
+
+        auth = clients.TraktAuth()
+        auth.access_token = "a" * 32
+        auth.refresh_token = "b" * 32
+
+        assert auth.save_tokens() is True
+        assert (fake_env.stat().st_mode & 0o777) == 0o600
 
     def test_save_tokens_refuses_placeholders(self, caplog, tmp_path, monkeypatch):
         """Test that save_tokens refuses to write placeholder/short tokens."""

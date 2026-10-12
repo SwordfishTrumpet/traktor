@@ -1,6 +1,8 @@
 """Shared utility functions for traktor."""
 
 import importlib.util
+import os
+import stat
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -25,6 +27,28 @@ def normalize_tmdb_id(tmdb_id):
     if tmdb_id is None:
         return None
     return str(tmdb_id) if tmdb_id else None
+
+
+def restrict_to_owner(path) -> bool:
+    """Set a file's permissions to owner read/write only (0600).
+
+    Files that can hold a credential - the config file and the .env token
+    store - must not be readable by other accounts on the machine (issue
+    #12). Windows and some network file systems ignore the mode, so the
+    result is verified rather than assumed.
+
+    Args:
+        path: File whose permissions should be restricted
+
+    Returns:
+        True when the file ends up mode 0600, False when the file system
+        refused the change
+    """
+    try:
+        os.chmod(path, 0o600)
+        return stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    except OSError:
+        return False
 
 
 def _get_zoneinfo(tz_name: str):

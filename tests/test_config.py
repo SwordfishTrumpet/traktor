@@ -201,3 +201,29 @@ class TestConfigCredentialsEdgeCases:
 
         monkeypatch.setattr(_builtins, "open", deny_write)
         config_module.save_config({"key": "value"})  # should not raise
+
+
+class TestSaveConfigPermissions:
+    """The config file can hold the Plex credential (issue #12)."""
+
+    def test_save_config_restricts_permissions(self, monkeypatch, tmp_path):
+        import traktor.config as config_module
+
+        target = tmp_path / "config.json"
+        monkeypatch.setattr(config_module, "CONFIG_FILE", target)
+
+        config_module.save_config({"plex_url": "http://plex:32400", "plex_token": "fixture-value"})
+
+        assert (target.stat().st_mode & 0o777) == 0o600
+
+    def test_save_config_tightens_an_existing_wide_open_file(self, monkeypatch, tmp_path):
+        import traktor.config as config_module
+
+        target = tmp_path / "config.json"
+        target.write_text("{}")
+        target.chmod(0o644)
+        monkeypatch.setattr(config_module, "CONFIG_FILE", target)
+
+        config_module.save_config({"managed_playlists": ["x"]})
+
+        assert (target.stat().st_mode & 0o777) == 0o600

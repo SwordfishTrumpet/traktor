@@ -6,6 +6,7 @@ import sys
 
 from .log import logger
 from .settings import CONFIG_FILE
+from .utils import restrict_to_owner
 
 
 def _is_valid_plex_url(url):
@@ -45,12 +46,23 @@ def load_config():
 
 
 def save_config(config):
-    """Save configuration to file."""
+    """Save configuration to file.
+
+    The config file can hold the Plex credential, so it is restricted to the
+    owner (issue #12).
+
+    Args:
+        config: Configuration dict to persist
+    """
     logger.info(f"Saving config to: {CONFIG_FILE}")
     try:
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_FILE, "w") as f:
             json.dump(config, f, indent=2)
+        if not restrict_to_owner(CONFIG_FILE):
+            logger.warning(
+                f"Could not restrict permissions on {CONFIG_FILE}; it can hold the Plex credential"
+            )
         logger.info("Configuration saved successfully")
         logger.info(f"Saved config keys: {list(config.keys())}")
     except (PermissionError, FileNotFoundError, OSError) as e:
