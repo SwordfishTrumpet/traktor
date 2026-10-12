@@ -36,16 +36,16 @@ class TestIsInteractive:
 class TestConfirmChanges:
     """Tests for confirm_changes function."""
 
-    def test_confirm_changes_non_interactive_returns_true(self, caplog):
-        """Test that non-interactive mode returns True without prompting."""
+    def test_confirm_changes_non_interactive_returns_false(self, caplog):
+        """Without a terminal the confirmation fails closed (issue #14)."""
         import logging
 
         with patch("traktor.interactive.is_interactive", return_value=False):
-            with caplog.at_level(logging.WARNING):
+            with caplog.at_level(logging.ERROR):
                 result = interactive.confirm_changes("test operation")
 
-        assert result is True
-        assert "Non-interactive mode" in caplog.text
+        assert result is False
+        assert "Refusing to auto-confirm" in caplog.text
 
     def test_confirm_changes_yes_input(self):
         """Test confirm_changes with 'y' input."""
@@ -121,16 +121,16 @@ class TestConfirmChanges:
 class TestPreviewChanges:
     """Tests for preview_changes function."""
 
-    def test_preview_changes_non_interactive_returns_true(self, caplog):
-        """Test that non-interactive mode returns True without preview."""
+    def test_preview_changes_non_interactive_returns_false(self, caplog):
+        """Without a terminal the preview fails closed (issue #14)."""
         import logging
 
         with patch("traktor.interactive.is_interactive", return_value=False):
-            with caplog.at_level(logging.WARNING):
+            with caplog.at_level(logging.ERROR):
                 result = interactive.preview_changes({})
 
-        assert result is True
-        assert "Non-interactive mode" in caplog.text
+        assert result is False
+        assert "Refusing to auto-confirm" in caplog.text
 
     def test_preview_changes_watch_sync_empty(self):
         """Test preview_changes with no watch sync changes."""

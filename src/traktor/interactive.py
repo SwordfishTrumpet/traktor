@@ -35,11 +35,16 @@ def confirm_changes(
         default: Default choice if user just presses Enter.
 
     Returns:
-        True if user confirms, False otherwise.
+        True if user confirms, False otherwise (including when there is no
+        terminal to ask: the confirmation fails closed, issue #14).
     """
     if not is_interactive():
-        logger.warning(f"Non-interactive mode: skipping confirmation for '{description}'")
-        return True
+        # Fail closed (issue #14): auto-confirming a change the user asked to
+        # be asked about is worse than not applying it.
+        logger.error(
+            f"Refusing to auto-confirm '{description}': no terminal is available for a prompt"
+        )
+        return False
 
     print(f"\n{'=' * 60}")
     print(f"Confirmation Required: {description}")
@@ -76,11 +81,15 @@ def preview_changes(
         change_type: Type of changes being previewed.
 
     Returns:
-        True if user confirms, False otherwise.
+        True if user confirms, False otherwise (including when there is no
+        terminal to ask: the confirmation fails closed, issue #14).
     """
     if not is_interactive():
-        logger.warning(f"Non-interactive mode: skipping preview for '{change_type}'")
-        return True
+        # Fail closed (issue #14): see confirm_changes().
+        logger.error(
+            f"Refusing to auto-confirm '{change_type}': no terminal is available for a prompt"
+        )
+        return False
 
     print(f"\n{'=' * 60}")
     print(f"Preview: {change_type.replace('_', ' ').title()}")
