@@ -1030,7 +1030,7 @@ class TestCollectAuthCode:
         monkeypatch.setattr(sync, "time", self._AdvancingTime(step=100))
         auth_url = "https://trakt.tv/oauth/authorize" "?redirect_uri=https%3A%2F%2Fexample.com%2Fcb"
 
-        result = sync._collect_auth_code(auth_url)
+        result = sync._collect_auth_code(auth_url, None)
 
         assert result is None
         assert "paste the authorization code below" in capsys.readouterr().out
@@ -1047,9 +1047,21 @@ class TestCollectAuthCode:
             "https://trakt.tv/oauth/authorize" "?redirect_uri=http%3A%2F%2F127.0.0.1%3A32451%2Fcb"
         )
 
-        result = sync._collect_auth_code(auth_url)
+        result = sync._collect_auth_code(auth_url, None)
 
         assert result is None
+
+    @staticmethod
+    def _deliver(port: int, query: str, timeout: float = 5.0):
+        """Send one callback request, retrying until the listener is up."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                resp = _requests.get(f"http://127.0.0.1:{port}/cb?{query}", timeout=1)
+                return resp.status_code
+            except _requests.exceptions.RequestException:
+                time.sleep(0.05)
+        return None
 
     def test_code_capture_via_callback(self, monkeypatch):
         """Browser redirect with a code is captured by the local listener."""
@@ -1061,7 +1073,9 @@ class TestCollectAuthCode:
         )
         result_box: dict = {}
         thread = threading.Thread(
-            target=lambda: result_box.setdefault("code", sync._collect_auth_code(auth_url)),
+            target=lambda: result_box.setdefault(
+                "code", sync._collect_auth_code(auth_url, "st-callback")
+            ),
             daemon=True,
         )
         thread.start()
@@ -1070,7 +1084,9 @@ class TestCollectAuthCode:
         delivered = False
         while time.time() < deadline:
             try:
-                resp = _requests.get(f"http://127.0.0.1:{port}/cb?code=abc123", timeout=1)
+                resp = _requests.get(
+                    f"http://127.0.0.1:{port}/cb?code=abc123&state=st-callback", timeout=1
+                )
                 if resp.status_code == 200:
                     delivered = True
                     break
@@ -1092,7 +1108,7 @@ class TestCollectAuthCode:
         )
         result_box: dict = {}
         thread = threading.Thread(
-            target=lambda: result_box.setdefault("code", sync._collect_auth_code(auth_url)),
+            target=lambda: result_box.setdefault("code", sync._collect_auth_code(auth_url, None)),
             daemon=True,
         )
         thread.start()
@@ -1112,6 +1128,64 @@ class TestCollectAuthCode:
 
         assert delivered is True
         assert result_box.get("code") is None
+
+    def test_callback_refuses_a_state_this_login_never_issued(self):
+        """An injected redirect with a different state is refused, and the
+        legitimate redirect still completes the login (issue #10)."""
+        import threading
+
+        port = 47157
+        auth_url = (
+            "https://trakt.tv/oauth/authorize" f"?redirect_uri=http%3A%2F%2F127.0.0.1%3A{port}%2Fcb"
+        )
+        result_box: dict = {}
+        thread = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "code", sync._collect_auth_code(auth_url, "st-expected")
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+        refused = self._deliver(port, "code=attacker-chosen&state=st-somebody-else")
+        accepted = self._deliver(port, "code=real-code&state=st-expected")
+        thread.join(timeout=10)
+
+        assert refused == 400
+        assert accepted == 200
+        assert result_box.get("code") == "real-code"
+
+    def test_callback_refuses_a_redirect_without_a_state(self):
+        """A redirect carrying no state is refused (issue #10)."""
+        import threading
+
+        port = 47158
+        auth_url = (
+            "https://trakt.tv/oauth/authorize" f"?redirect_uri=http%3A%2F%2F127.0.0.1%3A{port}%2Fcb"
+        )
+        result_box: dict = {}
+        thread = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "code", sync._collect_auth_code(auth_url, "st-expected")
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+        refused = self._deliver(port, "code=attacker-chosen")
+        accepted = self._deliver(port, "code=real-code&state=st-expected")
+        thread.join(timeout=10)
+
+        assert refused == 400
+        assert accepted == 200
+        assert result_box.get("code") == "real-code"
+
+    def test_extract_auth_state(self):
+        """_extract_auth_state reads the state out of pasted input."""
+        assert sync._extract_auth_state("abc123") is None
+        assert sync._extract_auth_state("code=abc123") is None
+        assert sync._extract_auth_state("state=xyz") == "xyz"
+        assert sync._extract_auth_state("http://127.0.0.1:7001/cb?code=a&state=xyz") == "xyz"
 
 
 class TestProcessItemErrorPaths:

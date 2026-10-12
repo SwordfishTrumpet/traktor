@@ -321,6 +321,23 @@ class TestTraktAuth:
         assert "trakt.tv" in url
         assert "oauth" in url
         assert "client_id" in url
+        # A fresh anti-CSRF state rides along (issue #10)
+        assert "state=" in url
+        assert auth.oauth_state
+        assert auth.oauth_state in url
+
+    def test_get_auth_url_uses_a_new_state_per_login(self):
+        """Every login attempt gets its own state value (issue #10)."""
+        auth = clients.TraktAuth()
+
+        first_url = auth.get_auth_url()
+        first_state = auth.oauth_state
+        second_url = auth.get_auth_url()
+
+        assert first_state
+        assert auth.oauth_state != first_state
+        assert first_state in first_url
+        assert auth.oauth_state in second_url
 
 
 class TestTraktClient:
