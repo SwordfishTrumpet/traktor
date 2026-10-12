@@ -1,6 +1,7 @@
 """Tests for utils module."""
 
-from traktor.utils import normalize_tmdb_id, parse_timestamp
+import traktor.utils as utils
+from traktor.utils import normalize_tmdb_id, parse_timestamp, restrict_to_owner
 
 
 class TestNormalizeTmdbId:
@@ -143,3 +144,25 @@ class TestParseTimestamp:
         result = parse_timestamp(dt, tz_name="Invalid/Zone")
         assert result.tzinfo == timezone.utc
         assert result == dt.astimezone(timezone.utc)
+
+
+class TestRestrictToOwnerPermissions:
+    """A credential file must end up readable by its owner only (issue #12)."""
+
+    def test_restrict_to_owner_sets_owner_only_permissions(self, tmp_path):
+        target = tmp_path / "secret.json"
+        target.write_text("data")
+        target.chmod(0o644)
+
+        assert restrict_to_owner(target) is True
+        assert (target.stat().st_mode & 0o777) == 0o600
+
+    def test_restrict_to_owner_reports_a_refusal(self, tmp_path, monkeypatch):
+        target = tmp_path / "secret.json"
+        target.write_text("data")
+
+        def deny_chmod(path, mode):
+            raise OSError("not permitted")
+
+        monkeypatch.setattr(utils.os, "chmod", deny_chmod)
+        assert restrict_to_owner(target) is False

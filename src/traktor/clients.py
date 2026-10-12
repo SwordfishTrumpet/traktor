@@ -29,7 +29,7 @@ from .settings import (
     TRAKT_REDIRECT_URI,
     TRAKT_REFRESH_TOKEN,
 )
-from .utils import normalize_tmdb_id, parse_timestamp
+from .utils import normalize_tmdb_id, parse_timestamp, restrict_to_owner
 
 # Constants for API pagination and safety limits
 MAX_HISTORY_PAGES = 1000  # Safety limit to prevent infinite loops in pagination
@@ -735,6 +735,13 @@ class TraktAuth:
 
                     with open(env_path, "w", encoding="utf-8") as f:
                         f.writelines(lines)
+
+                    # The file holds the Trakt tokens, so keep it owner-only
+                    # (issue #12).
+                    if not restrict_to_owner(env_path):
+                        logger.warning(
+                            f"Could not restrict permissions on {env_path}; it holds the Trakt tokens"
+                        )
 
                     logger.info(f"Tokens saved to {env_path}")
                     logger.info("You can now run traktor without --force-auth")
