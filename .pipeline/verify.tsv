@@ -1,0 +1,2 @@
+# issue<TAB>command<TAB>expected-exit<TAB>area
+10	uv run pytest -q tests/test_sync.py -k callback_refuses	0	security

@@ -991,7 +991,27 @@ def _extract_auth_code(value: str) -> Optional[str]:
     return v
 
 
-def _collect_auth_code(auth_url: str) -> Optional[str]:
+def _extract_auth_state(value: str) -> Optional[str]:
+    """Extract the OAuth ``state`` value from pasted input, if present.
+
+    Args:
+        value: Raw pasted text
+
+    Returns:
+        The state string, or None when the input carries no state parameter
+        (the out-of-band flow shows only the authorization code).
+    """
+    v = value.strip()
+    if "state=" not in v:
+        return None
+    query = v.split("?", 1)[1] if "?" in v else v
+    states = parse_qs(query).get("state")
+    if states:
+        return states[0]
+    return None
+
+
+def _collect_auth_code(auth_url: str, expected_state: Optional[str]) -> Optional[str]:
     """Collect the Trakt authorization code from a local callback or stdin.
 
     Two input paths run concurrently so either one works:
@@ -1006,6 +1026,10 @@ def _collect_auth_code(auth_url: str) -> Optional[str]:
 
     Args:
         auth_url: The full authorization URL that was printed for the user
+        expected_state: The state value this login issued (issue #10). A
+            callback whose state is missing or different is refused instead of
+            being exchanged for tokens. None disables the check and is only for
+            callers that never issued a state.
 
     Returns:
         Authorization code string, or None on error/timeout
@@ -1017,7 +1041,7 @@ def _collect_auth_code(auth_url: str) -> Optional[str]:
 
     server = None
     thread = None
-    captured: Dict[str, Optional[str]] = {"code": None, "error": None}
+    captured: Dict[str, Optional[str]] = {"code": None, "error": None, "state_error": None}
 
     if cb and cb.hostname in ("127.0.0.1", "localhost", "::1"):
         port = cb.port or 80
@@ -1025,6 +1049,25 @@ def _collect_auth_code(auth_url: str) -> Optional[str]:
         class CallbackHandler(BaseHTTPRequestHandler):
             def do_GET(self):
                 query = parse_qs(urlparse(self.path).query)
+                received_state = query.get("state", [None])[0]
+                if expected_state is not None and received_state != expected_state:
+                    # A code that does not belong to this login (issue #10).
+                    # Refuse it and keep waiting rather than exchanging it for
+                    # tokens bound to somebody else's Trakt account.
+                    captured["state_error"] = received_state
+                    logger.error(
+                        "Refused OAuth redirect: state is missing or does not match this login"
+                    )
+                    self.send_response(400)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.end_headers()
+                    self.wfile.write(
+                        b"<html><body><h1>Authentication refused</h1>"
+                        b"<p>This redirect does not belong to the login you started. "
+                        b"Close this window and paste the code from Trakt instead.</p>"
+                        b"</body></html>"
+                    )
+                    return
                 captured["code"] = query.get("code", [None])[0]
                 if "error" in query:
                     captured["error"] = query.get("error", [None])[0]
@@ -1079,6 +1122,18 @@ def _collect_auth_code(auth_url: str) -> Optional[str]:
         if ready:
             line = sys.stdin.readline()
             if line:
+                pasted_state = _extract_auth_state(line)
+                if (
+                    pasted_state is not None
+                    and expected_state is not None
+                    and pasted_state != expected_state
+                ):
+                    logger.error("Refused pasted callback: state does not match this login")
+                    print(
+                        "   That callback does not belong to this login "
+                        "(state mismatch) - keep waiting or paste again."
+                    )
+                    continue
                 code = _extract_auth_code(line)
                 if code:
                     break
@@ -1130,7 +1185,7 @@ def authenticate_trakt(auth, force=False):
     print("   reach this machine it is captured automatically.")
     print()
 
-    auth_code = _collect_auth_code(auth_url)
+    auth_code = _collect_auth_code(auth_url, auth.oauth_state)
 
     if auth_code is None:
         print("Authentication cancelled or timed out.")

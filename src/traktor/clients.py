@@ -3,6 +3,7 @@
 import gzip
 import hashlib
 import json
+import secrets
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -633,6 +634,9 @@ class TraktAuth:
         # Load tokens from environment if available
         self.access_token = TRAKT_ACCESS_TOKEN
         self.refresh_token = TRAKT_REFRESH_TOKEN
+        # Anti-CSRF value for the current login attempt (issue #10). It is set
+        # by get_auth_url() and must come back with the authorization code.
+        self.oauth_state: Optional[str] = None
 
     def has_valid_tokens(self) -> bool:
         """Check whether loaded tokens look like real Trakt tokens.
@@ -742,10 +746,21 @@ class TraktAuth:
         return True
 
     def get_auth_url(self) -> str:
+        """Build the Trakt authorization URL for this login attempt.
+
+        A fresh random ``state`` value is generated and kept on the instance
+        (issue #10). The authorization server echoes it back on the redirect,
+        and the callback refuses a code whose state is missing or different.
+
+        Returns:
+            The full authorization URL to open in a browser
+        """
+        self.oauth_state = secrets.token_urlsafe(32)
         params = {
             "response_type": "code",
             "client_id": TRAKT_CLIENT_ID,
             "redirect_uri": TRAKT_REDIRECT_URI,
+            "state": self.oauth_state,
         }
         url = f"{TRAKT_API_URL}/oauth/authorize?{urlencode(params)}"
         logger.debug("Generated Trakt auth URL")
