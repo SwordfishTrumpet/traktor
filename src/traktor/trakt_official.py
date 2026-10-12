@@ -10,7 +10,17 @@ import requests
 
 from .clients import RateLimiter
 from .log import logger
-from .settings import TRAKT_API_URL, TRAKT_CLIENT_ID
+from .settings import (
+    TRAKT_API_URL,
+    TRAKT_CLIENT_ID,
+    TRAKTOR_OFFICIAL_CACHE_TTL_ANTICIPATED,
+    TRAKTOR_OFFICIAL_CACHE_TTL_BOXOFFICE,
+    TRAKTOR_OFFICIAL_CACHE_TTL_COLLECTED,
+    TRAKTOR_OFFICIAL_CACHE_TTL_PLAYED,
+    TRAKTOR_OFFICIAL_CACHE_TTL_POPULAR,
+    TRAKTOR_OFFICIAL_CACHE_TTL_TRENDING,
+    TRAKTOR_OFFICIAL_CACHE_TTL_WATCHED,
+)
 
 # Rate limiting: 60 requests per minute for public endpoints
 MAX_REQUESTS_PER_MINUTE = 60
@@ -485,7 +495,12 @@ class TraktOfficialClient:
 
     @staticmethod
     def get_cache_ttl(endpoint_name: str) -> int:
-        """Get the recommended cache TTL for an endpoint.
+        """Get the cache TTL for an endpoint.
+
+        The configured setting for that endpoint type wins over the built-in
+        default, so an operator can tune how fresh each list is (issue #15).
+        The setting is read at call time, so a test or an operator can change
+        it without reloading the module.
 
         Args:
             endpoint_name: Name of the endpoint
@@ -494,4 +509,15 @@ class TraktOfficialClient:
             Cache TTL in hours
         """
         endpoint_type = endpoint_name.split(".")[-1]
+        configured = {
+            "trending": TRAKTOR_OFFICIAL_CACHE_TTL_TRENDING,
+            "popular": TRAKTOR_OFFICIAL_CACHE_TTL_POPULAR,
+            "played": TRAKTOR_OFFICIAL_CACHE_TTL_PLAYED,
+            "watched": TRAKTOR_OFFICIAL_CACHE_TTL_WATCHED,
+            "collected": TRAKTOR_OFFICIAL_CACHE_TTL_COLLECTED,
+            "anticipated": TRAKTOR_OFFICIAL_CACHE_TTL_ANTICIPATED,
+            "boxoffice": TRAKTOR_OFFICIAL_CACHE_TTL_BOXOFFICE,
+        }
+        if endpoint_type in configured:
+            return configured[endpoint_type]
         return DEFAULT_CACHE_TTLS.get(endpoint_type, 6)
