@@ -2,3 +2,4 @@
 10	uv run pytest -q tests/test_sync.py -k callback_refuses	0	security
 11	uv run pytest -q tests/test_resilience.py -k restore_refuses	0	security
 12	uv run pytest -q tests/test_config.py tests/test_clients.py tests/test_utils.py -k permissions	0	security
+14	uv run pytest -q tests/test_sync.py tests/test_interactive.py -k "without_a_terminal or non_interactive"	0	reliability

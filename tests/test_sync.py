@@ -999,6 +999,67 @@ class TestSyncListsOrchestration:
         # cleanup called twice: preview (dry_run=True) then real
         assert mocks["plex_client"].cleanup_orphaned_playlists.call_count == 2
 
+    def test_interactive_cleanup_without_a_terminal_aborts(self, monkeypatch, tmp_path):
+        """--interactive with no terminal aborts instead of deleting orphaned
+        playlists (issue #14)."""
+        mocks = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--interactive", "--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+        monkeypatch.setattr(sync, "preview_changes", lambda *a, **k: False)
+        monkeypatch.setattr(sync, "is_interactive", lambda: False)
+
+        mocks["plex_client"].cleanup_orphaned_playlists.side_effect = [
+            [{"name": "Old Playlist"}],  # dry_run preview only
+        ]
+
+        with pytest.raises(SystemExit) as exc_info:
+            sync.sync_lists(args)
+
+        assert exc_info.value.code == 1
+        # Only the read-only preview ran; nothing was deleted
+        assert mocks["plex_client"].cleanup_orphaned_playlists.call_count == 1
+
+    def test_interactive_watch_sync_without_a_terminal_aborts(self, monkeypatch, tmp_path):
+        """--interactive watch sync with no terminal aborts before applying the
+        changes (issue #14)."""
+        from unittest.mock import MagicMock
+
+        self._setup(monkeypatch, tmp_path)
+        args = self._args(
+            monkeypatch, ["--interactive", "--sync-watched", "--list-source", "official"]
+        )
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: True)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+        monkeypatch.setattr(sync, "is_interactive", lambda: False)
+        monkeypatch.setattr(sync, "preview_changes", lambda *a, **k: False)
+
+        engine = MagicMock()
+        engine.sync_watched_status.return_value = {
+            "plex_watched": 1,
+            "plex_unwatched": 0,
+            "trakt_watched": 0,
+            "trakt_unwatched": 0,
+            "errors": 0,
+            "changes": {
+                "plex": {"mark_watched": [{"title": "Some Movie"}], "mark_unwatched": []},
+                "trakt": {"mark_watched": [], "mark_unwatched": []},
+            },
+        }
+        monkeypatch.setattr(sync, "WatchHistoryManager", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(sync, "ConflictResolver", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(sync, "WatchSyncEngine", lambda *a, **k: engine)
+
+        with pytest.raises(SystemExit) as exc_info:
+            sync.sync_lists(args)
+
+        assert exc_info.value.code == 1
+        # The dry-run preview ran; the real apply never did
+        assert engine.sync_watched_status.call_count == 1
+        assert engine.sync_watched_status.call_args.kwargs.get("dry_run") is True
+
     def test_watch_sync_skipped_without_auth(self, monkeypatch, tmp_path):
         """--sync-watched without auth prints a warning and continues."""
         self._setup(monkeypatch, tmp_path, trakt_authed=False)

@@ -23,6 +23,7 @@ from .config import get_plex_credentials, load_config
 from .conflict_resolver import ConflictResolver
 from .history_manager import WatchHistoryManager
 from .interactive import (
+    is_interactive,
     preview_changes,
     save_undo_snapshot,
 )
@@ -1257,6 +1258,21 @@ def _confirm_continue(prompt: str) -> bool:
     return response.lower() == "y"
 
 
+def _abort_without_confirmation(what: str) -> None:
+    """Abort when a confirmation was required but no terminal can give one.
+
+    The interactive flag promises a prompt before a destructive change. With
+    no terminal the shared helpers refuse to confirm (issue #14), so the run
+    stops with a clear reason instead of applying the change unasked.
+
+    Args:
+        what: The change that needed confirmation
+    """
+    logger.error(f"Confirmation required for {what} but no terminal is available; aborting")
+    print(f"Error: --interactive needs a terminal to confirm {what}. Aborting.")
+    sys.exit(1)
+
+
 def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = None) -> int:
     """Main sync function with parallel processing."""
     # Initialize resource manager if not provided but memory limits are configured
@@ -1569,6 +1585,8 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
                     stats["playlists_deleted"] = len(orphaned)
                     print(f"   Deleted {len(orphaned)} orphaned playlist(s)")
                 else:
+                    if not is_interactive():
+                        _abort_without_confirmation("orphaned playlist cleanup")
                     print("Orphaned playlist cleanup cancelled by user.")
                     logger.info("Orphaned playlist cleanup cancelled by user")
                     stats["playlists_deleted"] = 0
@@ -1641,6 +1659,8 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
                         confirmed = True
 
                     if not confirmed:
+                        if not is_interactive():
+                            _abort_without_confirmation("the watch sync changes")
                         print("Watch sync cancelled by user.")
                         logger.info("Watch sync cancelled by user")
                     else:
