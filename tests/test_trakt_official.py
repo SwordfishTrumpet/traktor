@@ -297,6 +297,24 @@ class TestTraktOfficialClient:
         assert TraktOfficialClient.get_cache_ttl("movies.popular") == 6
         assert TraktOfficialClient.get_cache_ttl("movies.anticipated") == 24
 
+    def test_get_cache_ttl_honours_every_documented_setting(self, monkeypatch):
+        """Each documented TTL setting changes the value used (issue #15)."""
+        import traktor.trakt_official as official
+
+        cases = [
+            ("TRAKTOR_OFFICIAL_CACHE_TTL_TRENDING", "movies.trending", 41),
+            ("TRAKTOR_OFFICIAL_CACHE_TTL_POPULAR", "shows.popular", 42),
+            ("TRAKTOR_OFFICIAL_CACHE_TTL_PLAYED", "movies.played", 43),
+            ("TRAKTOR_OFFICIAL_CACHE_TTL_WATCHED", "shows.watched", 44),
+            ("TRAKTOR_OFFICIAL_CACHE_TTL_COLLECTED", "movies.collected", 45),
+            ("TRAKTOR_OFFICIAL_CACHE_TTL_ANTICIPATED", "shows.anticipated", 46),
+            ("TRAKTOR_OFFICIAL_CACHE_TTL_BOXOFFICE", "movies.boxoffice", 47),
+        ]
+
+        for setting, endpoint, value in cases:
+            monkeypatch.setattr(official, setting, value)
+            assert official.TraktOfficialClient.get_cache_ttl(endpoint) == value, setting
+
 
 class TestTraktOfficialClientConstants:
     """Tests for constants and configuration."""
