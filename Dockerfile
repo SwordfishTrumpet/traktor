@@ -32,16 +32,18 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV UV_SYSTEM_PYTHON=1
 ENV DOCKER_MODE=true
 
-# Install Python dependencies using uv as traktor user
+# Install Python dependencies using uv as traktor user.
+# `--no-dev`: the runtime image has no use for pytest/mypy/stub packages.
 USER traktor
-RUN uv sync
+RUN uv sync --no-dev --frozen
 
-# Ensure certifi can find the CA bundle (run as root)
+# certifi is a declared dependency, so `uv sync` already put a CA bundle in the
+# venv. The image previously re-installed certifi and symlinked the distro bundle
+# over its cacert.pem by hand, which silently broke whenever certifi changed its
+# layout or the interpreter path moved. Keep the distro bundle authoritative via
+# the env vars above instead.
 USER root
-RUN uv pip install --system certifi && \
-    mkdir -p /app/.venv/lib/python3.12/site-packages/certifi && \
-    ln -sf /etc/ssl/certs/ca-certificates.crt /app/.venv/lib/python3.12/site-packages/certifi/cacert.pem && \
-    chown -R traktor:traktor /app/.venv
+RUN chown -R traktor:traktor /app/.venv
 USER traktor
 
 # Set the entrypoint
