@@ -59,7 +59,7 @@ convention = "google"
 dev = [
     "pytest>=9.0",
     "black>=26.10.1",
-    "ruff>=0.16.0",
+    "ruff>=0.17.3",
     "mypy>=2.1",
     # Type stubs are a development-only concern; they used to sit in
     # [project].dependencies and were therefore installed in the runtime image.
