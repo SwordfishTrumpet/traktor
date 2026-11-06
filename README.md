@@ -1,10 +1,11 @@
 # traktor
 
-**Turn Trakt lists into Plex playlists, and keep watch status in step on both sides.**
+**Turn Trakt lists into Plex playlists, and sync watch status in both directions.**
 
-traktor is for people who keep their watchlist on Trakt but watch in Plex. It copies the lists you
-follow into Plex playlists, and keeps watched state and resume points in agreement between the two
-services. Run it from cron and it keeps itself up to date.
+traktor is for people who keep their watchlist on Trakt but watch in Plex. Watch a film in Plex and
+Trakt records it; watch it in Trakt and Plex marks it watched. It also copies the lists you follow
+into Plex playlists, and keeps resume points in agreement on the way back. Run it from cron and it
+keeps itself up to date.
 
 ## Install in 30 seconds
 
@@ -82,6 +83,31 @@ uv run traktor --refresh-cache       # After adding new media to Plex
 
 See all options: `uv run traktor --help`
 
+## Watch status, both ways
+
+Watch a film in Plex and Trakt records it; watch it in Trakt and Plex marks it watched. The same
+goes for episodes, and for un-watching. Check what a run would change before it changes anything:
+
+```bash
+uv run traktor --sync-watched-only --dry-run   # list the planned changes, apply nothing
+uv run traktor --sync-watched-only             # apply them
+```
+
+`--sync-watched` does this alongside the playlist work. `--sync-watched-only` does nothing else,
+which is what you want on a short interval:
+
+```bash
+*/15 * * * * cd /path/to/traktor && uv run traktor --sync-watched-only
+```
+
+`--watch-direction={both,plex-to-trakt,trakt-to-plex}` limits which way state may travel, and
+`--watch-conflict={newest,plex,trakt}` decides which side wins when the two disagree. Movies are
+reconciled against Trakt's full watched list, so a film watched years ago still arrives; episodes
+are matched per season and episode number.
+
+Two things this does not do: playback resume points travel Trakt to Plex only (`--sync-progress`),
+and ratings are not synced at all.
+
 ## The ideas you need
 
 ### Official lists and liked lists
@@ -116,8 +142,8 @@ is watched", so an outage cannot wipe your history.
 | Trakt collection | "Trakt Collection - Movies/Shows" playlists | yes |
 | Trakt watchlist | "Trakt Watchlist" playlist | yes |
 
-Un-like a list and its playlist disappears on the next run. Watch status, resume points and
-conflicts between them travel through `--sync-watched`, `--sync-watched-only` and `--sync-progress`.
+Un-like a list and its playlist disappears on the next run. This table is about playlists only:
+watch status is the section above, and resume points travel through `--sync-progress`.
 
 ## Documentation
 
