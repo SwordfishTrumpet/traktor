@@ -2,5 +2,9 @@
 10	uv run pytest -q tests/test_sync.py -k callback_refuses	0	security
 11	uv run pytest -q tests/test_resilience.py -k restore_refuses	0	security
 12	uv run pytest -q tests/test_config.py tests/test_clients.py tests/test_utils.py -k permissions	0	security
+13	uv run pytest -q tests/test_run_status.py tests/test_health_server.py -k "record or status"	0	observability
 14	uv run pytest -q tests/test_sync.py tests/test_interactive.py -k "without_a_terminal or non_interactive"	0	reliability
 15	uv run pytest -q tests/test_trakt_official.py -k cache_ttl	0	dead-code
+16	uv run pytest -q tests/test_resource_manager.py -k "threshold or exceeds_limit"	0	reliability
+19	uv run pytest -q tests/test_watch_sync.py -k "watch_recorded_during_a_run or trakt_is_pulled_before_plex"	0	correctness
+20	uv run pytest -q tests/test_conflict_resolver.py -k "serialized_timestamps or mixed_string_and_datetime or compare_by_instant"	0	correctness

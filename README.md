@@ -1,10 +1,10 @@
 # traktor
 
-**Sync your Trakt curation to Plex playlists — automatically.**
+**Sync your Trakt curation to Plex playlists, automatically.**
 
 ---
 
-Turn your liked Trakt lists into Plex playlists. Sync your watched status between platforms. Resume movies on Plex exactly where you left off on Trakt. Run it once and forget it — traktor handles the rest with smart caching, parallel processing, and delta sync.
+Turn your liked Trakt lists into Plex playlists. Sync your watched status between platforms. Resume movies on Plex exactly where you left off on Trakt. Run it once and forget it. traktor handles the rest with smart caching, parallel processing, and delta sync.
 
 ## Install in 30 seconds
 
@@ -26,7 +26,7 @@ cp .env.example .env  # Then edit .env with your credentials
 uv run traktor
 ```
 
-By default, traktor syncs Trakt's official curated lists (trending, popular movies/shows) to Plex — **no OAuth required**, just your Trakt Client ID.
+By default, traktor syncs Trakt's official curated lists (trending, popular movies/shows) to Plex with **no OAuth required**: just your Trakt Client ID.
 
 To sync your personal liked lists from Trakt, either set `TRAKTOR_LIST_SOURCE=both` in your `.env` file, or run with `--list-source=both` and complete the one-time OAuth prompt.
 
@@ -50,10 +50,10 @@ See all options: `uv run traktor --help`
 | **⚡ Fast** | Parallel processing + delta sync means subsequent runs complete in seconds, not minutes |
 | **🔁 Bidirectional sync** | Watch a movie on Plex → marked watched on Trakt. Watch on Trakt → marked watched on Plex |
 | **📺 Episode-aware** | Shows in Trakt lists resolve to S01E01 episodes so playlists contain playable items |
-| **🧠 Smart matching** | Matches by IMDb/TMDb IDs, not fuzzy titles — accurate even with renaming |
+| **🧠 Smart matching** | Matches by IMDb/TMDb IDs, not fuzzy titles, so a rename does not break the match |
 | **📦 Official lists** | Sync Trakt's algorithmic lists (trending, popular, box office) without extra OAuth |
 | **🐳 Docker ready** | One `docker compose up` and you're scheduled |
-| **🧹 Self-cleaning** | Unlike a list? Un-like it on Trakt — the playlist disappears automatically |
+| **🧹 Self-cleaning** | Unlike a list? Un-like it on Trakt and the playlist disappears automatically |
 | **🎯 Smart fallback** | Shows without S01E01 automatically fall back to the first available episode |
 | **📊 Actionable reports** | `missing.txt` includes reasons (not just IDs) so you know why items weren't found |
 | **🔍 Smart suggestions** | Missing items include fuzzy title matches and naming mismatch detection |
@@ -62,15 +62,15 @@ See all options: `uv run traktor --help`
 | **🔒 Auth failure detection** | Auto-detects stale Trakt tokens and prompts for re-authentication |
 | **📝 Structured logging** | Optional JSON logs with correlation IDs for machine parsing |
 | **📈 Performance monitoring** | Built-in API timing, cache hit rates, and bottleneck detection |
-| **🏥 Health endpoints** | HTTP `/health`, `/metrics`, and `/status` for container monitoring |
+| **🏥 Health endpoints** | HTTP `/health`, `/metrics`, and `/status` for container monitoring; `/status` reports the last run's outcome and success time, and fails until a run has recorded one |
 | **🔄 Auto-update checks** | Check for new versions via GitHub API with safe rollback capability |
-| **⚙️ Resource management** | Configurable memory limits and CPU throttling for multi-tenant operation |
+| **⚙️ Resource management** | Memory warning threshold and CPU throttling for multi-tenant operation |
 
 ## Everything it does
 
 **Playlist Sync (No OAuth Required)**
 - Trakt Official Lists → Trending, popular, most played, box office, anticipated movies/shows
-  - Works with just `TRAKT_CLIENT_ID` — no authentication needed
+  - Works with just `TRAKT_CLIENT_ID`: no authentication needed
   - Great for new users to get curated playlists immediately
 
 **Playlist Sync (OAuth Required)**
@@ -80,25 +80,25 @@ See all options: `uv run traktor --help`
 
 **Watch Status & Progress (OAuth Required)**
 - Bidirectional watched/unwatched sync (movies & episodes)
-- Movies always pull Trakt's **full watched list** — movies watched on other services are
+- Movies always pull Trakt's **full watched list**: movies watched on other services are
   marked watched in Plex regardless of how long ago they were watched (no delta window loss)
 - Playback progress sync (resume points) from Trakt → Plex
 - Conflict resolution strategies when states disagree
 
 **Performance & Reliability**
 - In-memory cache with 24-hour TTL and hash-based invalidation
-- Incremental cache updates — only scan new items since last sync
+- Incremental cache updates: only scan new items since last sync
 - Batch API operations (100 items per call)
 - Delta sync skips unchanged items after first run
-- Smart playlist updates — only add/remove changed items instead of recreating entire playlists
+- Smart playlist updates: only add/remove changed items instead of recreating entire playlists
 - Parallel workers (default 8, configurable)
 - Detailed `missing.txt` report with reasons for missing items
 
 ## Documentation
 
-- **[QUICKSTART.md](QUICKSTART.md)** — 3-step install, common commands, file locations
-- **[DOCKER.md](DOCKER.md)** — Docker setup, scheduling with cron, troubleshooting
-- **[CONTRIBUTING.md](CONTRIBUTING.md)** — Dev setup, running tests, PR guidelines
+- **[QUICKSTART.md](QUICKSTART.md)**: 3-step install, common commands, file locations
+- **[DOCKER.md](DOCKER.md)**: Docker setup, scheduling with cron, troubleshooting
+- **[CONTRIBUTING.md](CONTRIBUTING.md)**: Dev setup, running tests, PR guidelines
 
 ## Docker (alternative to uv)
 
@@ -130,43 +130,43 @@ See [DOCKER.md](DOCKER.md) for scheduling and volume mounts.
 | `TRAKTOR_HEALTH_PORT` | `8080` | Port for HTTP health endpoints |
 | `TRAKTOR_HEALTH_HOST` | all interfaces | Bind address for the health server (set `127.0.0.1` for local-only) |
 | `TRAKTOR_HISTORY_RETENTION_DAYS` | `180` | Days to keep watch-history entries (`0` disables pruning) |
-| `TRAKTOR_MAX_MEMORY_MB` | `512` | Maximum memory usage in MB (CLI: `--max-memory-mb`) |
+| `TRAKTOR_MAX_MEMORY_MB` | `512` | Logs a warning once memory use passes this many MB (CLI: `--max-memory-mb`). It is a threshold, not a hard limit |
 | `WATCH_SYNC_DIRECTION` | `both` | Default watch sync direction (`both`, `plex-to-trakt`, `trakt-to-plex`) |
 | `WATCH_SYNC_CONFLICT_RESOLUTION` | `newest_wins` | Default conflict strategy (`newest_wins`, `plex_wins`, `trakt_wins`) |
 
 **CLI flags:**
-- `--verbose, -v` — Enable debug logging to console
-- `--plex-url URL, -u URL` — Override `PLEX_URL` env var
-- `--plex-token TOKEN, -t TOKEN` — Override `PLEX_TOKEN` env var
-- `--force-auth` — Force re-authentication with Trakt (skip stored tokens)
-- `--list-source={official,liked,both}` — Override `TRAKTOR_LIST_SOURCE` env var
-- `--sync-watched`, `--sync-watched-only` — Watch status sync (OAuth required)
-- `--watch-direction={both,plex-to-trakt,trakt-to-plex}` — Direction for watch sync (default: both)
-- `--watch-conflict={newest,plex,trakt}` — Conflict resolution strategy (default: newest)
-- `--sync-progress` — Resume point sync Trakt → Plex (OAuth required)
-- `--sync-collection`, `--sync-watchlist` — Personal Trakt data (OAuth required)
-- `--sync-movies-only`, `--sync-shows-only` — Filter watch sync by media type
-- `--backfill-history` — Full history sync (initial setup)
-- `--interactive` — Prompt for confirmation before significant changes
-- `--undo` — Show the most recent sync snapshot (inspection only; nothing is restored)
-- `--structured-logging` — Output JSON logs with correlation IDs
-- `--performance-report` — Print detailed performance metrics after sync
-- `--refresh-cache`, `--diagnose`, `--dry-run`, `--workers N` — Utility flags
+- `--verbose, -v`: Enable debug logging to console
+- `--plex-url URL, -u URL`: Override `PLEX_URL` env var
+- `--plex-token TOKEN, -t TOKEN`: Override `PLEX_TOKEN` env var
+- `--force-auth`: Force re-authentication with Trakt (skip stored tokens)
+- `--list-source={official,liked,both}`: Override `TRAKTOR_LIST_SOURCE` env var
+- `--sync-watched`, `--sync-watched-only`: Watch status sync (OAuth required)
+- `--watch-direction={both,plex-to-trakt,trakt-to-plex}`: Direction for watch sync (default: both)
+- `--watch-conflict={newest,plex,trakt}`: Conflict resolution strategy (default: newest)
+- `--sync-progress`: Resume point sync Trakt → Plex (OAuth required)
+- `--sync-collection`, `--sync-watchlist`: Personal Trakt data (OAuth required)
+- `--sync-movies-only`, `--sync-shows-only`: Filter watch sync by media type
+- `--backfill-history`: Full history sync (initial setup)
+- `--interactive`: Prompt for confirmation before significant changes
+- `--undo`: Show the most recent sync snapshot (inspection only; nothing is restored)
+- `--structured-logging`: Output JSON logs with correlation IDs
+- `--performance-report`: Print detailed performance metrics after sync
+- `--refresh-cache`, `--diagnose`, `--dry-run`, `--workers N`: Utility flags
 
 **Mission-critical commands:**
-- `--health-check` — Run health checks and report system status
-- `--serve-health` — Start HTTP health server for container monitoring
-- `--integrity-check` — Verify integrity of config, tokens, and cache files
-- `--backup`, `--backup-list`, `--backup-restore PATH` — Backup management
-- `--circuit-status` — Show circuit breaker status for API clients
-- `--check-update`, `--apply-update` — Check for and apply updates
+- `--health-check`: Run health checks and report system status
+- `--serve-health`: Start HTTP health server for container monitoring
+- `--integrity-check`: Verify integrity of config, tokens, and cache files
+- `--backup`, `--backup-list`, `--backup-restore PATH`: Backup management
+- `--circuit-status`: Show circuit breaker status for API clients
+- `--check-update`, `--apply-update`: Check for and apply updates
 
 **Official list options:**
-- `--official-lists`, `--no-official-lists` — Enable/disable official lists
-- `--official-endpoints` — Comma-separated endpoints (e.g., `movies.trending,shows.popular`)
-- `--official-period={daily,weekly,monthly,yearly}` — Time period for stats
-- `--official-periods` — Multiple periods (e.g., `weekly,monthly`)
-- `--official-playlist-mode={separate,merged}` — Per-endpoint or aggregated playlists
+- `--official-lists`, `--no-official-lists`: Enable/disable official lists
+- `--official-endpoints`: Comma-separated endpoints (e.g., `movies.trending,shows.popular`)
+- `--official-period={daily,weekly,monthly,yearly}`: Time period for stats
+- `--official-periods`: Multiple periods (e.g., `weekly,monthly`)
+- `--official-playlist-mode={separate,merged}`: Per-endpoint or aggregated playlists
 
 See `uv run traktor --help` for all options.
 
@@ -180,7 +180,7 @@ See `uv run traktor --help` for all options.
 - `TRAKT_REDIRECT_URI` in `.env` must **exactly match** the "Redirect URI" registered for your app
   at https://trakt.tv/oauth/applications (Trakt rejects mismatches with `invalid_redirect`).
 - During `uv run traktor --force-auth`, traktor accepts the authorization code two ways at once:
-  - **paste it** into the terminal (the bare code or the full callback URL) and press Enter — works
+  - **paste it** into the terminal (the bare code or the full callback URL) and press Enter. That works
     on remote/headless boxes where the browser redirect can't reach the server, and
   - if the redirect URI is a localhost URL, a local listener captures the browser redirect
     automatically (paste still wins if both happen).

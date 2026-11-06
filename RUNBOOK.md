@@ -1,10 +1,10 @@
 # Mission-Critical Runbook
 
-This runbook provides operational guidance for running traktor in production environments with high reliability requirements.
+This runbook is the operations guide for traktor in production. It says what to check, what each signal means, and what to do when a run fails.
 
 ## Overview
 
-traktor includes enterprise-grade resilience features for mission-critical deployments:
+traktor ships the resilience features a long-running cron deployment needs:
 
 - **Circuit Breakers**: Prevent cascading failures when APIs are down
 - **Health Monitoring**: Continuous health checks with status reporting
@@ -52,7 +52,7 @@ uv run traktor -v 2>&1 | tee traktor-$(date +%Y%m%d-%H%M%S).log
 
 ### Circuit Breakers
 
-Two circuit breakers protect API calls:
+Two circuit breakers protect API calls. They're independent, so a Trakt outage doesn't stop a Plex-only operation:
 
 | Circuit | Threshold | Cooldown | Purpose |
 |---------|-----------|----------|---------|
@@ -166,7 +166,7 @@ Verifies:
 
 #### Full State Recovery
 
-If traktor is completely broken:
+If traktor is completely broken, don't improvise. Work through this order:
 
 1. **Stop any running syncs** (Ctrl+C or kill process)
 
