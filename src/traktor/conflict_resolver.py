@@ -63,8 +63,8 @@ class ConflictResolver:
         self,
         plex_watched: bool,
         trakt_watched: bool,
-        plex_last_watched: datetime | None = None,
-        trakt_last_watched: datetime | None = None,
+        plex_last_watched: datetime | str | int | float | None = None,
+        trakt_last_watched: datetime | str | int | float | None = None,
     ) -> str:
         """Resolve conflict between Plex and Trakt watch states.
 
@@ -77,14 +77,22 @@ class ConflictResolver:
         Returns:
             Action to take: 'push_to_trakt', 'push_to_plex', or 'no_action'
         """
+        # Callers pass the platform's own serialized timestamps: an ISO-8601
+        # string from the Plex cache and from the Trakt API response. The
+        # both-watched branch below subtracts the two values, so normalize them
+        # here first - the same two lines resolve_with_context() already runs
+        # (issue #20).
+        plex_ts = self._normalize_timestamp(plex_last_watched)
+        trakt_ts = self._normalize_timestamp(trakt_last_watched)
+
         # If states match, no action needed
         if plex_watched == trakt_watched:
             # But we might want to update timestamps
             if plex_watched and trakt_watched:
                 # Both watched - check if timestamps differ significantly
-                if self._should_update_timestamp(plex_last_watched, trakt_last_watched):
+                if self._should_update_timestamp(plex_ts, trakt_ts):
                     # Update the older one to match the newer timestamp
-                    if self._is_newer(plex_last_watched, trakt_last_watched):
+                    if self._is_newer(plex_ts, trakt_ts):
                         return "push_to_plex"  # Update Plex timestamp
                     return "push_to_trakt"  # Update Trakt timestamp
             return "no_action"
@@ -94,8 +102,8 @@ class ConflictResolver:
             return self._resolve_newest_wins(
                 plex_watched,
                 trakt_watched,
-                plex_last_watched,
-                trakt_last_watched,
+                plex_ts,
+                trakt_ts,
             )
         if self.strategy == "plex_wins":
             return self._resolve_plex_wins(plex_watched, trakt_watched)
@@ -598,7 +606,7 @@ class ConflictResolver:
 
     def _normalize_timestamp(
         self,
-        dt: datetime | None,
+        dt: datetime | str | int | float | None,
         tz_name: str | None = None,
     ) -> datetime | None:
         """Normalize timestamp to UTC for comparison.

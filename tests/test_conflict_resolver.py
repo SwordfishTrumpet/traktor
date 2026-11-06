@@ -693,6 +693,55 @@ class TestConfidenceScoring:
         )
         assert action == "no_action"
 
+    def test_resolve_accepts_serialized_timestamps(self, resolver):
+        """resolve() must accept the ISO strings its callers actually pass.
+
+        Regression (#20): the both-watched branch subtracts the two timestamps,
+        and callers forward Plex's lastViewedAt from the cache and Trakt's
+        watched_at from the API, both plain strings. That raised TypeError and
+        aborted the whole watch sync.
+        """
+        plex_ts = "2026-10-01T10:00:00.000Z"
+        trakt_ts = "2026-10-02T10:00:00.000Z"
+
+        action = resolver.resolve(True, True, plex_ts, trakt_ts)
+
+        assert action == resolver.resolve(
+            True,
+            True,
+            datetime(2026, 10, 1, 10, tzinfo=timezone.utc),
+            datetime(2026, 10, 2, 10, tzinfo=timezone.utc),
+        )
+        assert action == "push_to_trakt"  # Trakt is newer
+
+    def test_resolve_mixed_string_and_datetime(self, resolver):
+        """A naive Plex string and an aware Trakt string compare by instant."""
+        # 2026-10-01T10:00:00 naive (system local) vs 2026-10-01T12:00:00Z.
+        action = resolver.resolve(
+            plex_watched=False,
+            trakt_watched=True,
+            plex_last_watched="2026-10-01T10:00:00",
+            trakt_last_watched=datetime(2026, 10, 1, 12, tzinfo=timezone.utc),
+        )
+        assert action == "push_to_plex"  # Trakt is newer
+
+    def test_resolve_strings_compare_by_instant_not_text(self, resolver):
+        """Two ISO strings must be compared as instants, not lexicographically."""
+        # Lexicographically "2026-10-01T10:00:00+05:00" > "2026-10-01T12:00:00Z",
+        # but as instants the first is 05:00Z and the second is 12:00Z.
+        action = resolver.resolve(
+            plex_watched=False,
+            trakt_watched=True,
+            plex_last_watched="2026-10-01T10:00:00+05:00",
+            trakt_last_watched="2026-10-01T12:00:00Z",
+        )
+        assert action == "push_to_plex"
+
+    def test_resolve_serialized_none_timestamps(self, resolver):
+        """None stays None after normalization, keeping the tie-breakers intact."""
+        assert resolver.resolve(True, True, None, None) == "no_action"
+        assert resolver.resolve(True, False, "", None) == "push_to_trakt"
+
 
 class TestResolveWithContextBranches:
     """Tests for resolve_with_context confidence-scoring branches.
