@@ -413,6 +413,28 @@ class TestTraktClient:
             with pytest.raises(requests.exceptions.RequestException):
                 trakt_client.get_own_lists()
 
+    def test_get_list_items_reads_a_private_list_through_the_owner_route(self, trakt_client):
+        """A private list answers 403 by username, so it is read as the owner (#26)."""
+        forbidden = requests.exceptions.HTTPError(response=MagicMock(status_code=403))
+        movie = {"type": "movie", "movie": {"title": "Private Pick"}}
+        with patch.object(
+            trakt_client, "_paginated_get", side_effect=[forbidden, [movie]]
+        ) as paginated:
+            items = trakt_client.get_list_items("swordfishtrumpet", "36982406")
+
+        assert items == [movie]
+        assert [call.args[0] for call in paginated.call_args_list] == [
+            "users/swordfishtrumpet/lists/36982406/items",
+            "users/me/lists/36982406/items",
+        ]
+
+    def test_get_list_items_does_not_hide_other_failures(self, trakt_client):
+        """Only a permission answer falls back; a 500 still raises (#26)."""
+        server_error = requests.exceptions.HTTPError(response=MagicMock(status_code=500))
+        with patch.object(trakt_client, "_paginated_get", side_effect=server_error):
+            with pytest.raises(requests.exceptions.HTTPError):
+                trakt_client.get_list_items("swordfishtrumpet", "42")
+
     def test_request_token_refresh_on_401(self, trakt_client, mock_auth):
         """Test that 401 triggers token refresh."""
         # First call returns 401, second returns 200

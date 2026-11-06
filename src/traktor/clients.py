@@ -1151,11 +1151,29 @@ class TraktClient:
             logger.error(f"Failed to fetch own lists: Data parsing error - {e}", exc_info=True)
             raise
 
+    def _list_items_pages(self, username: str, list_id: str) -> List[Dict[str, Any]]:
+        """Fetch a list's items, falling back to the account-owner route.
+
+        A private list is only readable through ``users/me/lists/{id}/items``;
+        naming the owner's username in the path answers 403 instead (#26).
+        """
+        try:
+            return self._paginated_get(f"users/{username}/lists/{list_id}/items")
+        except requests.exceptions.HTTPError as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status not in (403, 404):
+                raise
+            logger.info(
+                f"List {list_id} is not readable as '{username}' (HTTP {status}) - "
+                "retrying as the account owner"
+            )
+            return self._paginated_get(f"users/me/lists/{list_id}/items")
+
     def get_list_items(self, username: str, list_id: str) -> List[Dict[str, Any]]:
         logger.info(f"Fetching items from list: {list_id} (user: {username})")
 
         try:
-            all_items = self._paginated_get(f"users/{username}/lists/{list_id}/items")
+            all_items = self._list_items_pages(username, list_id)
 
             logger.info(f"Retrieved {len(all_items)} item(s) from list")
 
