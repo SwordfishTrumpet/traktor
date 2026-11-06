@@ -88,7 +88,8 @@ See all options: `uv run traktor --help`
 Trakt publishes algorithmic lists (trending, popular, most played, box office, anticipated) that
 anyone can read with just a client ID. Your liked lists are your own curation and need the OAuth
 login. `TRAKTOR_LIST_SOURCE` picks which of the two traktor syncs: `official` (the default),
-`liked`, or `both`.
+`liked`, or `both`. This choice decides which playlists get built and nothing else: watch status
+sync reads your Trakt history and your Plex library, and works the same whichever source you pick.
 
 ### Matching is by ID, not by title
 traktor looks each item up in your library by IMDb ID first, then by TMDb ID. A retitled file still
@@ -201,7 +202,9 @@ See `uv run traktor --help` for all options.
 
 **Authentication notes:**
 - **No OAuth required for:** Official lists (trending, popular, box office), basic playlist sync
-- **OAuth required for:** Liked lists, collection, watchlist, watch status sync, progress sync
+- **OAuth required for:** your liked lists, collection, watchlist, watch status sync, and progress
+  sync. One login covers all of them, and each works on its own: `--sync-watched-only` needs the
+  token but no liked lists
 - On first run with OAuth-required features, you'll get a one-time browser prompt to authorize
 - Set `TRAKTOR_LIST_SOURCE=both` in `.env` to always sync liked lists without adding the CLI flag
 
