@@ -57,7 +57,7 @@ convention = "google"
 
 [dependency-groups]
 dev = [
-    "pytest>=9.0",
+    "pytest>=9.2.0",
     "black>=26.10.1",
     "ruff>=0.16.0",
     "mypy>=2.1",
