@@ -1830,10 +1830,11 @@ class PlexClient:
             logger.info(f"Created playlist with {len(items)} items")
             return playlist
 
-        logger.debug("Creating empty playlist...")
-        playlist = self.server.createPlaylist(name)
-        logger.info("Created empty playlist")
-        return playlist
+        # Plex refuses to create a playlist with no items (a list with nothing
+        # matched, or an empty Trakt list). Say so instead of retrying a request
+        # that can only fail, and let the caller carry on (#26).
+        logger.info(f"No playlist '{name}' exists and there is nothing to add - skipping creation")
+        return None
 
     def _update_playlist_description(self, playlist, description, action="set"):
         if not description:
@@ -1904,7 +1905,8 @@ class PlexClient:
                     logger.info("Deleted old playlist")
 
                     playlist = self._create_playlist(name, items)
-                    self._update_playlist_description(playlist, description, action="set")
+                    if playlist is not None:
+                        self._update_playlist_description(playlist, description, action="set")
                 else:
                     # Compute delta: only remove items that are no longer in the list
                     # and add items that are new. This preserves playlist metadata and
@@ -1948,7 +1950,8 @@ class PlexClient:
             except NotFound:
                 logger.info(f"Creating new playlist: {name}")
                 playlist = self._create_playlist(name, items)
-                self._update_playlist_description(playlist, description, action="set")
+                if playlist is not None:
+                    self._update_playlist_description(playlist, description, action="set")
 
             return playlist
 

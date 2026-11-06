@@ -1362,6 +1362,38 @@ class TestProcessListParallel:
         assert len(missing_items) == 1
         assert "worker exploded" in missing_items[0]["reason"]
 
+    def test_an_unexpected_playlist_failure_costs_only_that_list(self, tmp_path):
+        """A Plex refusal must not escape and kill the run (#26)."""
+        from plexapi.exceptions import BadRequest
+
+        plex = MagicMock()
+        plex.create_or_update_playlist.side_effect = BadRequest("no items to add")
+        trakt = MagicMock()
+        trakt.get_list_items.return_value = [
+            {"type": "movie", "movie": {"title": "A", "ids": {"imdb": "tt1"}}}
+        ]
+        stats = {
+            "items_total": 0,
+            "items_matched": 0,
+            "items_not_found": 0,
+            "playlists_updated": 0,
+            "lists_failed": 0,
+        }
+
+        result = sync.process_list_parallel(
+            {"list": {"name": "L", "user": {"username": "u"}, "ids": {"trakt": 1}}},
+            plex,
+            trakt,
+            1,
+            stats,
+            set(),
+            [],
+        )
+
+        assert result["success"] is False
+        assert "no items to add" in result["error"]
+        assert stats["lists_failed"] == 1
+
 
 class TestSyncListsFeatureSections:
     """Coverage for official/collection/watchlist sections of sync_lists (TODO audit D1)."""

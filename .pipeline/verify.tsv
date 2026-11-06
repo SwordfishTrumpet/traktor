@@ -10,4 +10,4 @@
 20	uv run pytest -q tests/test_conflict_resolver.py -k "serialized_timestamps or mixed_string_and_datetime or compare_by_instant"	0	correctness
 24	uv run pytest -q tests/test_clients.py -k "retried_create or collapsed_to_one"	0	correctness
 25	uv run pytest -q tests/test_sync.py -k "official_lists_survive_auth_failure or auth_failure_still_exits"	0	reliability
-26	uv run pytest -q tests/test_sync.py tests/test_clients.py -k "own_lists or liked_source or owner_route or other_failures"	0	correctness
+26	uv run pytest -q tests/test_sync.py tests/test_clients.py -k "own_lists or liked_source or owner_route or other_failures or nothing_to_add or costs_only_that_list or empty_items"	0	correctness

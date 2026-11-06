@@ -13,6 +13,11 @@ The format is based on Keep a Changelog and this project currently uses a simple
     created (private ones included) through the new `TraktClient.get_own_lists()`
   - `--list-source=all` syncs own lists, liked lists and the official ones in one run;
     `liked`, `both` and `official` keep their meaning
+  - A private list is read through `users/me/lists/{id}/items` when the owner-named path
+    answers 403, so private lists sync too
+  - A list that matches nothing (or is empty) no longer crashes the run: creating a playlist
+    with no items is skipped with a log line, and one list's unexpected failure is reported
+    for that list instead of aborting the sync
 
 ### Changed
 

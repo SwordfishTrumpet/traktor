@@ -746,18 +746,27 @@ class TestPlexClient:
         assert sorted_items[2].TYPE == "episode"
 
     def test_create_or_update_playlist_empty_items(self, plex_client):
-        """Test create_or_update_playlist with empty items list."""
-        # Mock playlist creation
-        mock_playlist = MagicMock()
-        mock_playlist.items.return_value = []
+        """An empty list with no playlist yet creates nothing instead of crashing (#26)."""
         plex_client.server.playlists.return_value = []
-        plex_client.server.createPlaylist.return_value = mock_playlist
 
-        # Call with empty list
-        plex_client.create_or_update_playlist("Test Playlist", [])
+        playlist = plex_client.create_or_update_playlist("Test Playlist", [])
 
-        # Should still work
-        plex_client.server.createPlaylist.assert_called_once()
+        assert playlist is None
+        plex_client.server.createPlaylist.assert_not_called()
+
+    def test_recreating_an_oversized_playlist_with_nothing_to_add_skips_the_create(
+        self, plex_client
+    ):
+        """Deleting an oversized playlist with no new items must not raise (#26)."""
+        oversized = MagicMock()
+        oversized.items.return_value = [MagicMock() for _ in range(1500)]
+        plex_client.server.playlists.side_effect = [[oversized], []]
+
+        playlist = plex_client.create_or_update_playlist("Large Playlist", [])
+
+        assert playlist is None
+        oversized.delete.assert_called_once()
+        plex_client.server.createPlaylist.assert_not_called()
 
     def test_create_or_update_playlist_existing_playlist(self, plex_client):
         """Test updating an existing playlist."""

@@ -712,6 +712,12 @@ def process_list_parallel(
         logger.error(f"Data processing failed for list '{list_name}': {e}")
         stats["lists_failed"] += 1
         return {"list_name": list_name, "success": False, "error": f"Data error: {e}"}
+    except Exception as e:
+        # One list going wrong must not abort the run: a Plex refusal or an
+        # unexpected response should cost this list only (#26).
+        logger.error(f"Unexpected failure for list '{list_name}': {e}", exc_info=True)
+        stats["lists_failed"] += 1
+        return {"list_name": list_name, "success": False, "error": str(e)}
     finally:
         list_elapsed = time.time() - list_start_time
         performance_monitor.record_api_call(f"list:{list_name}", list_elapsed)
