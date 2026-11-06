@@ -2098,8 +2098,8 @@ def _print_summary(stats, elapsed, show_performance=False):
     logger.info("=" * 80)
     lines = [
         f"Total time: {elapsed:.2f} seconds",
-        f"Liked lists found: {stats['lists_found']}",
-        f"Liked lists processed: {stats['lists_processed']}",
+        f"Personal lists found: {stats['lists_found']}",
+        f"Personal lists processed: {stats['lists_processed']}",
         f"Official playlists found: {stats['official_playlists_found']}",
         f"Official playlists processed: {stats['official_playlists_processed']}",
         f"Lists failed: {stats['lists_failed']}",
