@@ -1,5 +1,6 @@
 """Tests for resource_manager module."""
 
+import logging
 import sys
 import time
 from unittest.mock import MagicMock, patch
@@ -34,62 +35,36 @@ class TestResourceManagerInit:
         assert manager._cpu_throttle_thread is None
 
 
-class TestSetMemoryLimit:
-    """Tests for set_memory_limit method."""
+class TestSetMemoryThreshold:
+    """Tests for set_memory_threshold method (issue #16)."""
 
-    def test_set_memory_limit_linux_success(self):
-        """Test memory limit set on Linux."""
+    def test_threshold_is_recorded_and_logged_honestly(self, caplog):
+        """Setting the threshold must not claim a limit the kernel applies."""
         manager = ResourceManager()
-        with patch.object(sys, "platform", "linux"):
-            with patch("resource.setrlimit") as mock_setrlimit:
-                with patch("resource.RLIMIT_RSS", 5):
-                    result = manager.set_memory_limit(256)
-                    assert result is True
-                    mock_setrlimit.assert_called_once()
-                    args = mock_setrlimit.call_args[0]
-                    assert args[0] == 5  # resource.RLIMIT_RSS
-                    assert args[1][0] == 256 * KB_PER_MB * BYTES_PER_KB
-                    assert args[1][1] == 256 * KB_PER_MB * BYTES_PER_KB * 2
 
-    def test_set_memory_limit_macos_success(self):
-        """Test memory limit set on macOS."""
+        with caplog.at_level(logging.INFO):
+            result = manager.set_memory_threshold(256)
+
+        assert result is True
+        assert manager.max_memory_mb == 256
+        assert "warning threshold set to 256 MB" in caplog.text
+        assert "not enforced by the kernel" in caplog.text
+        # The old log line promised a ceiling that RLIMIT_RSS never applied.
+        assert "Memory limit set to 256 MB" not in caplog.text
+
+    def test_threshold_sets_no_rlimit(self):
+        """RLIMIT_RSS has no effect on Linux, so it is never claimed as one."""
         manager = ResourceManager()
-        with patch.object(sys, "platform", "darwin"):
-            with patch("resource.setrlimit") as mock_setrlimit:
-                result = manager.set_memory_limit(256)
-                assert result is True
-                mock_setrlimit.assert_called_once()
+        with patch("resource.setrlimit") as mock_setrlimit:
+            assert manager.set_memory_threshold(256) is True
+        mock_setrlimit.assert_not_called()
 
-    def test_set_memory_limit_windows_not_supported(self):
-        """Test memory limit returns False on Windows."""
+    def test_threshold_applies_on_every_platform(self):
+        """The warning works wherever usage can be measured, Windows included."""
         manager = ResourceManager()
         with patch.object(sys, "platform", "win32"):
-            result = manager.set_memory_limit(256)
-            assert result is False
-
-    def test_set_memory_limit_value_error(self):
-        """Test memory limit handles ValueError."""
-        manager = ResourceManager()
-        with patch.object(sys, "platform", "linux"):
-            with patch("resource.setrlimit", side_effect=ValueError("Invalid limit")):
-                result = manager.set_memory_limit(256)
-                assert result is False
-
-    def test_set_memory_limit_os_error(self):
-        """Test memory limit handles OSError."""
-        manager = ResourceManager()
-        with patch.object(sys, "platform", "linux"):
-            with patch("resource.setrlimit", side_effect=OSError("Permission denied")):
-                result = manager.set_memory_limit(256)
-                assert result is False
-
-    def test_set_memory_limit_attribute_error(self):
-        """Test memory limit handles AttributeError (no resource module)."""
-        manager = ResourceManager()
-        with patch.object(sys, "platform", "linux"):
-            with patch("resource.setrlimit", side_effect=AttributeError("No such attribute")):
-                result = manager.set_memory_limit(256)
-                assert result is False
+            assert manager.set_memory_threshold(128) is True
+        assert manager.max_memory_mb == 128
 
 
 class TestGetCurrentMemoryUsage:
@@ -152,12 +127,14 @@ class TestCheckMemoryUsage:
             result = manager.check_memory_usage()
             assert result is True
 
-    def test_check_memory_usage_exceeds_limit(self):
-        """Test check_memory_usage returns False when exceeded."""
+    def test_check_memory_usage_exceeds_limit(self, caplog):
+        """Usage above the threshold warns with the threshold, not a limit."""
         manager = ResourceManager(max_memory_mb=256)
         with patch.object(manager, "get_current_memory_usage_mb", return_value=512.0):
-            result = manager.check_memory_usage()
-            assert result is False
+            with caplog.at_level(logging.WARNING):
+                result = manager.check_memory_usage()
+        assert result is False
+        assert "above the warning threshold (256 MB)" in caplog.text
 
 
 class TestCpuThrottle:

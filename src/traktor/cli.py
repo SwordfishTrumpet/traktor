@@ -243,7 +243,10 @@ def parse_args():
         "--max-memory-mb",
         type=int,
         default=None,
-        help="Maximum memory usage in MB (default: 512)",
+        help=(
+            "Log a warning once memory use passes this many MB (default: 512); "
+            "this is a threshold, not a hard limit"
+        ),
     )
     parser.add_argument(
         "--cpu-throttle",
@@ -526,7 +529,7 @@ def main():
     if args and (args.max_memory_mb is not None or args.cpu_throttle is not None):
         resource_manager = ResourceManager(max_memory_mb=args.max_memory_mb)
         if args.max_memory_mb is not None:
-            resource_manager.set_memory_limit(args.max_memory_mb)
+            resource_manager.set_memory_threshold(args.max_memory_mb)
         if args.cpu_throttle is not None:
             resource_manager.start_cpu_throttle(target_cpu_percent=args.cpu_throttle)
 

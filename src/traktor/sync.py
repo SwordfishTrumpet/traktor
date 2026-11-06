@@ -31,6 +31,7 @@ from .log import logger
 from .official_lists import OfficialListsService
 from .performance import performance_monitor
 from .resilience import SyncProgress, backup_manager, integrity_checker
+from .run_status import record_run_failed, record_run_started, record_run_succeeded
 from .settings import (
     LOG_FILE,
     SYNC_PROGRESS_FILE,
@@ -1274,13 +1275,40 @@ def _abort_without_confirmation(what: str) -> None:
 
 
 def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = None) -> int:
+    """Run a sync and record its outcome for the status endpoint (issue #13).
+
+    Every exit path leaves a record behind. A run that raises, that is
+    interrupted, or that calls ``sys.exit()`` when a credential is missing or
+    Trakt refuses the login is recorded as failed instead of looking like a run
+    that is still going, which is how a twenty-day outage stayed invisible.
+    """
+    record_run_started(SYNC_PROGRESS_FILE)
+    try:
+        exit_code = _sync_lists(args, resource_manager=resource_manager)
+    except SystemExit as exc:
+        record_run_failed(SYNC_PROGRESS_FILE, f"run exited with code {exc.code}")
+        raise
+    except KeyboardInterrupt:
+        record_run_failed(SYNC_PROGRESS_FILE, "run was interrupted")
+        raise
+    except Exception as exc:
+        record_run_failed(SYNC_PROGRESS_FILE, f"run stopped with {type(exc).__name__}")
+        raise
+    if exit_code == 0:
+        record_run_succeeded(SYNC_PROGRESS_FILE)
+    else:
+        record_run_failed(SYNC_PROGRESS_FILE, f"sync finished with exit code {exit_code}")
+    return exit_code
+
+
+def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = None) -> int:
     """Main sync function with parallel processing."""
     # Initialize resource manager if not provided but memory limits are configured
     if resource_manager is None and TRAKTOR_MAX_MEMORY_MB > 0:
         from .resource_manager import ResourceManager
 
         resource_manager = ResourceManager(max_memory_mb=TRAKTOR_MAX_MEMORY_MB)
-        resource_manager.set_memory_limit(TRAKTOR_MAX_MEMORY_MB)
+        resource_manager.set_memory_threshold(TRAKTOR_MAX_MEMORY_MB)
 
     if not TRAKT_CLIENT_ID or not TRAKT_CLIENT_SECRET:
         logger.error("TRAKT_CLIENT_ID and TRAKT_CLIENT_SECRET must be set in environment/.env file")
