@@ -14,6 +14,13 @@ from typing import Any
 
 from .log import logger
 from .resilience import health_checker
+from .run_status import (
+    RUN_STATUS_RUNNING,
+    RUN_STATUS_SUCCESS,
+    RUN_STATUS_UNKNOWN,
+    read_run_status,
+)
+from .settings import SYNC_PROGRESS_FILE
 
 DEFAULT_HEALTH_PORT = 8080
 # Empty bind host = all interfaces (INADDR_ANY), i.e. what containers need for
@@ -56,8 +63,25 @@ class HealthHandler(BaseHTTPRequestHandler):
         self._send_text("\n".join(metrics))
 
     def _send_status(self) -> None:
-        """Send sync status."""
-        self._send_json({"sync_status": "idle", "last_sync": None})
+        """Send the outcome of the most recent sync run.
+
+        The run records its own outcome (run_status.record_run_*), so this
+        reports a real pass or failure. Until a run has recorded something the
+        answer is ``unknown`` with a failing status: an endpoint that cannot
+        tell is not a health signal.
+        """
+        run = read_run_status(SYNC_PROGRESS_FILE)
+        status = run.get("status") or RUN_STATUS_UNKNOWN
+        code = HEALTH_OK if status in (RUN_STATUS_RUNNING, RUN_STATUS_SUCCESS) else HEALTH_DEGRADED
+        self._send_json(
+            {
+                "sync_status": status,
+                "last_sync": run.get("last_success_at"),
+                "last_run_started": run.get("started_at"),
+                "last_error": run.get("error"),
+            },
+            code,
+        )
 
     def _send_404(self) -> None:
         """Send 404 response."""
