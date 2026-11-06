@@ -8,3 +8,6 @@
 16	uv run pytest -q tests/test_resource_manager.py -k "threshold or exceeds_limit"	0	reliability
 19	uv run pytest -q tests/test_watch_sync.py -k "watch_recorded_during_a_run or trakt_is_pulled_before_plex"	0	correctness
 20	uv run pytest -q tests/test_conflict_resolver.py -k "serialized_timestamps or mixed_string_and_datetime or compare_by_instant"	0	correctness
+24	uv run pytest -q tests/test_clients.py -k "retried_create or collapsed_to_one"	0	correctness
+25	uv run pytest -q tests/test_sync.py -k "official_lists_survive_auth_failure or auth_failure_still_exits"	0	reliability
+26	uv run pytest -q tests/test_sync.py tests/test_clients.py -k "own_lists or liked_source"	0	correctness

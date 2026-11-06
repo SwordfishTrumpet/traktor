@@ -80,6 +80,7 @@ Playlists, by source:
 |--------|---------|--------------|
 | Trakt official lists (trending, popular, most played, box office, anticipated, collected) | one Plex playlist per endpoint and period, or one merged playlist | no |
 | Your liked Trakt lists | one Plex playlist per list | yes |
+| The Trakt lists your own account created | one Plex playlist per list | yes |
 | Trakt collection | "Trakt Collection - Movies/Shows" playlists | yes |
 | Trakt watchlist | "Trakt Watchlist" playlist | yes |
 
@@ -222,6 +223,13 @@ uv run traktor --list-source=both
 
 That needs the Trakt login. To make it the default, set `TRAKTOR_LIST_SOURCE=both` in `.env` instead of passing the flag each time.
 
+If the lists you keep up to date are ones you created on your own Trakt account, sync those instead:
+
+```bash
+uv run traktor --list-source=own      # your own lists, plus the official ones
+uv run traktor --list-source=all      # your own lists, your liked lists, and the official ones
+```
+
 ## 10. First run: watch status
 
 Look before you leap: `--dry-run` prints the changes it would make and applies nothing.
@@ -280,9 +288,19 @@ Scheduling inside Docker, the health server port and the volume layout are cover
 
 ## 13. Lists: official and liked
 
-Trakt publishes algorithmic lists (trending, popular, most played, box office, anticipated, collected) that anyone can read with a client ID. Your liked lists are your own curation and need the OAuth login.
+Trakt publishes algorithmic lists (trending, popular, most played, box office, anticipated, collected) that anyone can read with a client ID. The lists on your own account are your curation, and reading them needs the OAuth login.
 
-`TRAKTOR_LIST_SOURCE` picks which of the two traktor syncs: `official` (the default), `liked`, or `both`. This choice decides which playlists get built and nothing else: watch status reads your Trakt history and your Plex library, and works the same whichever source you pick.
+`TRAKTOR_LIST_SOURCE` picks which of the sources traktor syncs:
+
+| Value | What it syncs | Login needed |
+|-------|---------------|--------------|
+| `official` (the default) | Trakt's curated lists | no |
+| `liked` | The lists you liked, whoever wrote them | yes |
+| `own` | The lists your account created, private ones included | yes |
+| `both` | Liked lists plus the official ones | yes |
+| `all` | Own lists, liked lists, and the official ones | yes |
+
+This choice decides which playlists get built and nothing else: watch status reads your Trakt history and your Plex library, and works the same whichever source you pick. A list whose name is in `blacklisted_lists` is skipped from every source, and `own` needs the lists to carry a Trakt list ID, which lists created on trakt.tv always do.
 
 Official lists can be narrowed with `--official-endpoints` and widened across periods with `--official-periods`. `--official-playlist-mode=separate` (the default) writes one playlist per endpoint and period; `merged` combines them by media type, which keeps the playlist count down.
 
@@ -343,7 +361,7 @@ Playlists are updated in place up to 1000 items: traktor diffs the current playl
 | `--verbose`, `-v` | Debug logging to the console |
 | `--refresh-cache` | Rebuild the Plex library cache |
 | `--force-auth` | Re-run the Trakt login |
-| `--list-source {official,liked,both}` | Which list sources to sync |
+| `--list-source {official,liked,own,both,all}` | Which list sources to sync |
 | `--official-lists`, `--no-official-lists` | Enable or disable official lists |
 | `--official-endpoints LIST` | Which official endpoints, comma separated |
 | `--official-period {daily,weekly,monthly,yearly}` | Period for statistics endpoints |
@@ -415,7 +433,7 @@ Everything here can live in `.env`.
 | `TRAKT_REFRESH_TOKEN` | empty | Written by the login; leave it alone |
 | `PLEX_URL` | required | Plex server URL |
 | `PLEX_TOKEN` | required | Plex token |
-| `TRAKTOR_LIST_SOURCE` | `official` | `official`, `liked` or `both` |
+| `TRAKTOR_LIST_SOURCE` | `official` | `official`, `liked`, `own`, `both` or `all` |
 | `TRAKTOR_OFFICIAL_LISTS_ENABLED` | `true` | Sync official lists at all |
 | `TRAKTOR_OFFICIAL_ENDPOINTS` | empty | Comma-separated endpoints |
 | `TRAKTOR_OFFICIAL_PERIOD` | `weekly` | Period for statistics endpoints |

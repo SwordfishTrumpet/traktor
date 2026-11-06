@@ -393,6 +393,26 @@ class TestTraktClient:
         assert len(result) == 1
         assert result[0]["list"]["name"] == "Test List"
 
+    def test_get_own_lists_wraps_each_list_like_a_liked_list(self, trakt_client):
+        """Owned lists come back in the same shape the processing path expects (#26)."""
+        owned = [
+            {"name": "My List", "ids": {"trakt": 1}, "user": {"username": "me"}},
+            {"name": "Other List", "ids": {"trakt": 2}, "user": {"username": "me"}},
+        ]
+        with patch.object(trakt_client, "_paginated_get", return_value=owned) as paginated:
+            result = trakt_client.get_own_lists()
+
+        paginated.assert_called_once_with("users/me/lists")
+        assert result == [{"list": owned[0]}, {"list": owned[1]}]
+
+    def test_get_own_lists_propagates_request_failure(self, trakt_client):
+        """A failing fetch raises so the caller can report the source as skipped."""
+        with patch.object(
+            trakt_client, "_paginated_get", side_effect=requests.exceptions.ConnectionError("x")
+        ):
+            with pytest.raises(requests.exceptions.RequestException):
+                trakt_client.get_own_lists()
+
     def test_request_token_refresh_on_401(self, trakt_client, mock_auth):
         """Test that 401 triggers token refresh."""
         # First call returns 401, second returns 200
@@ -686,7 +706,7 @@ class TestPlexClient:
         # Mock playlist creation
         mock_playlist = MagicMock()
         mock_playlist.items.return_value = []
-        plex_client.server.playlist.side_effect = clients.NotFound
+        plex_client.server.playlists.return_value = []
         plex_client.server.createPlaylist.return_value = mock_playlist
 
         # Call the method
@@ -708,7 +728,7 @@ class TestPlexClient:
         # Mock playlist creation
         mock_playlist = MagicMock()
         mock_playlist.items.return_value = []
-        plex_client.server.playlist.side_effect = clients.NotFound
+        plex_client.server.playlists.return_value = []
         plex_client.server.createPlaylist.return_value = mock_playlist
 
         # Call with empty list
@@ -734,7 +754,7 @@ class TestPlexClient:
         mock_playlist.removeItems.return_value = None
         mock_playlist.addItems.return_value = None
 
-        plex_client.server.playlist.return_value = mock_playlist
+        plex_client.server.playlists.return_value = [mock_playlist]
 
         # Call the method
         plex_client.create_or_update_playlist("Test Playlist", items)
@@ -759,7 +779,9 @@ class TestPlexClient:
         # Return 1500 items (more than MAX_PLAYLIST_SIZE_FOR_INCREMENTAL)
         mock_playlist.items.return_value = [MagicMock() for _ in range(1500)]
         mock_playlist.delete.return_value = None
-        plex_client.server.playlist.return_value = mock_playlist
+        # First lookup finds the oversized playlist; once deleted Plex no longer
+        # lists it, so the recreate lookup must come back empty.
+        plex_client.server.playlists.side_effect = [[mock_playlist], []]
         plex_client.server.createPlaylist.return_value = mock_playlist
 
         plex_client.create_or_update_playlist("Large Playlist", items)
@@ -767,6 +789,49 @@ class TestPlexClient:
         # Should have deleted old playlist and created new one
         mock_playlist.delete.assert_called_once()
         plex_client.server.createPlaylist.assert_called_once()
+
+    def test_a_retried_create_reuses_the_playlist_the_failed_attempt_made(
+        self, plex_client, monkeypatch
+    ):
+        """A 500 that already created the playlist must not produce a twin (#24)."""
+        monkeypatch.setattr(clients.time, "sleep", lambda _seconds: None)
+
+        movie = MagicMock()
+        movie.TYPE = "movie"
+        movie.ratingKey = "1"
+
+        created = MagicMock()
+        created.items.return_value = []
+
+        # Lookup 1: absent before the create. Lookup 2: still absent when the
+        # create is attempted. The attempt then raises 500 although Plex stored
+        # the playlist, so the retry's lookup (3) finds it.
+        plex_client.server.playlists.side_effect = [[], [], [created]]
+        plex_client.server.createPlaylist.side_effect = clients.BadRequest(
+            "(500) internal_server_error; http://plex/playlists?title=Test"
+        )
+
+        playlist = plex_client.create_or_update_playlist("Test Playlist", [movie])
+
+        assert playlist is created
+        assert plex_client.server.createPlaylist.call_count == 1
+
+    def test_a_title_with_two_playlists_is_collapsed_to_one(self, plex_client):
+        """A title that already resolves twice is cleaned up on the next sync (#24)."""
+        kept = MagicMock()
+        kept.ratingKey = "100"
+        kept.items.return_value = []
+        stale = MagicMock()
+        stale.ratingKey = "101"
+        stale.items.return_value = []
+
+        plex_client.server.playlists.return_value = [kept, stale]
+
+        playlist = plex_client.create_or_update_playlist("Trakt Shows - Popular", [])
+
+        assert playlist is kept
+        kept.delete.assert_not_called()
+        stale.delete.assert_called_once()
 
     def test_create_or_update_playlist_batch_adding(self, plex_client):
         """Test that items are added in batches when exceeding batch size."""
@@ -781,7 +846,7 @@ class TestPlexClient:
         mock_playlist = MagicMock()
         mock_playlist.items.return_value = []  # Empty playlist
         mock_playlist.addItems.return_value = None
-        plex_client.server.playlist.return_value = mock_playlist
+        plex_client.server.playlists.return_value = [mock_playlist]
 
         plex_client.create_or_update_playlist("Batch Playlist", items)
 
@@ -800,7 +865,7 @@ class TestPlexClient:
 
         items = [mock_movie1, mock_movie2]
 
-        plex_client.server.playlist.side_effect = clients.NotFound
+        plex_client.server.playlists.return_value = []
         mock_playlist = MagicMock()
         mock_playlist.items.return_value = []
         plex_client.server.createPlaylist.return_value = mock_playlist
@@ -826,7 +891,7 @@ class TestPlexClient:
 
         items = [mock_ep1, mock_ep2]
 
-        plex_client.server.playlist.side_effect = clients.NotFound
+        plex_client.server.playlists.return_value = []
         mock_playlist = MagicMock()
         mock_playlist.items.return_value = []
         plex_client.server.createPlaylist.return_value = mock_playlist
@@ -851,7 +916,7 @@ class TestPlexClient:
         mock_playlist.items.return_value = [MagicMock() for _ in range(5)]
         mock_playlist.removeItems.return_value = None
         mock_playlist.addItems.return_value = None
-        plex_client.server.playlist.return_value = mock_playlist
+        plex_client.server.playlists.return_value = [mock_playlist]
 
         plex_client.create_or_update_playlist("Existing Playlist", items)
 
@@ -867,7 +932,7 @@ class TestPlexClient:
         items = [mock_movie]
 
         # Simulate server error during playlist access
-        plex_client.server.playlist.side_effect = Exception("Server unavailable")
+        plex_client.server.playlists.side_effect = Exception("Server unavailable")
 
         with pytest.raises(Exception, match="Server unavailable"):
             plex_client.create_or_update_playlist("Error Playlist", items)

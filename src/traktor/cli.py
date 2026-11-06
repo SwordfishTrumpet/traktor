@@ -201,9 +201,13 @@ def parse_args():
     )
     parser.add_argument(
         "--list-source",
-        choices=["liked", "official", "both"],
+        choices=["liked", "own", "official", "both", "all"],
         default=None,  # Will use TRAKTOR_LIST_SOURCE env var or fall back to "official"
-        help="Which list sources to sync (default: from TRAKTOR_LIST_SOURCE env var, or 'official')",
+        help=(
+            "Which list sources to sync: liked (lists you liked), own (lists you created), "
+            "official, both (liked + official) or all (default: from TRAKTOR_LIST_SOURCE "
+            "env var, or 'official')"
+        ),
     )
     parser.add_argument(
         "--interactive",
