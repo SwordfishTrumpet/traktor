@@ -201,9 +201,13 @@ def parse_args():
     )
     parser.add_argument(
         "--list-source",
-        choices=["liked", "official", "both"],
+        choices=["liked", "own", "official", "both", "all"],
         default=None,  # Will use TRAKTOR_LIST_SOURCE env var or fall back to "official"
-        help="Which list sources to sync (default: from TRAKTOR_LIST_SOURCE env var, or 'official')",
+        help=(
+            "Which list sources to sync: liked (lists you liked), own (lists you created), "
+            "official, both (liked + official) or all (default: from TRAKTOR_LIST_SOURCE "
+            "env var, or 'official')"
+        ),
     )
     parser.add_argument(
         "--interactive",
@@ -243,7 +247,10 @@ def parse_args():
         "--max-memory-mb",
         type=int,
         default=None,
-        help="Maximum memory usage in MB (default: 512)",
+        help=(
+            "Log a warning once memory use passes this many MB (default: 512); "
+            "this is a threshold, not a hard limit"
+        ),
     )
     parser.add_argument(
         "--cpu-throttle",
@@ -526,7 +533,7 @@ def main():
     if args and (args.max_memory_mb is not None or args.cpu_throttle is not None):
         resource_manager = ResourceManager(max_memory_mb=args.max_memory_mb)
         if args.max_memory_mb is not None:
-            resource_manager.set_memory_limit(args.max_memory_mb)
+            resource_manager.set_memory_threshold(args.max_memory_mb)
         if args.cpu_throttle is not None:
             resource_manager.start_cpu_throttle(target_cpu_percent=args.cpu_throttle)
 

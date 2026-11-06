@@ -795,6 +795,7 @@ class TestSyncListsOrchestration:
 
         trakt_client = MagicMock()
         trakt_client.get_liked_lists.return_value = []
+        trakt_client.get_own_lists.return_value = []
         trakt_client.get_watched_movies.return_value = []
         trakt_client.get_watched_shows.return_value = []
 
@@ -1374,7 +1375,7 @@ class TestSyncListsFeatureSections:
         monkeypatch.setattr(sys, "argv", ["traktor", *(argv or [])])
         return cli.parse_args()
 
-    def _setup(self, monkeypatch, tmp_path):
+    def _setup(self, monkeypatch, tmp_path, trakt_authed=True):
         from unittest.mock import MagicMock
 
         monkeypatch.setattr(sync, "TRAKT_CLIENT_ID", "client-id")
@@ -1395,7 +1396,7 @@ class TestSyncListsFeatureSections:
         monkeypatch.setattr(sync, "_check_memory", lambda *a, **k: None)
         monkeypatch.setattr(sync, "_print_summary", lambda *a, **k: None)
         monkeypatch.setattr(sync, "_save_playlist_snapshot", lambda *a, **k: {})
-        monkeypatch.setattr(sync, "authenticate_trakt", lambda auth, force=False: True)
+        monkeypatch.setattr(sync, "authenticate_trakt", lambda auth, force=False: trakt_authed)
 
         server = MagicMock()
         server.machineIdentifier = "server-abc"
@@ -1405,6 +1406,7 @@ class TestSyncListsFeatureSections:
         plex_client.cleanup_orphaned_playlists.return_value = []
         trakt_client = MagicMock()
         trakt_client.get_liked_lists.return_value = []
+        trakt_client.get_own_lists.return_value = []
 
         monkeypatch.setattr(sync, "PlexServer", lambda *a, **k: server)
         monkeypatch.setattr(sync, "CacheManager", lambda *a, **k: cache_mgr)
@@ -1523,6 +1525,71 @@ class TestSyncListsFeatureSections:
         result = sync.sync_lists(args)
 
         assert result == 0
+
+    def test_official_lists_survive_auth_failure(self, monkeypatch, tmp_path, capsys):
+        """An unusable token costs the OAuth features, not the official lists (#25)."""
+        mocks = self._setup(monkeypatch, tmp_path, trakt_authed=False)
+        args = self._args(monkeypatch, ["--list-source", "both"])
+
+        official_service = MagicMock()
+        official_service.get_playlists_from_endpoints.return_value = []
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.trending"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        result = sync.sync_lists(args)
+
+        assert result == 0
+        official_service.get_playlists_from_endpoints.assert_called_once()
+        mocks["trakt_client"].get_liked_lists.assert_not_called()
+        assert "Continuing with official lists only" in capsys.readouterr().out
+
+    def test_auth_failure_still_exits_when_only_oauth_work_is_left(self, monkeypatch, tmp_path):
+        """Without official lists there is nothing left to do, so the run aborts (#25)."""
+        self._setup(monkeypatch, tmp_path, trakt_authed=False)
+        args = self._args(monkeypatch, ["--list-source", "liked", "--no-official-lists"])
+
+        with pytest.raises(SystemExit) as exc_info:
+            sync.sync_lists(args)
+
+        assert exc_info.value.code == 1
+
+    def test_owned_lists_become_playlists(self, monkeypatch, tmp_path):
+        """--list-source own syncs the lists the account created (#26)."""
+        mocks = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "own"])
+
+        own_entry = {
+            "list": {
+                "name": "My Own List",
+                "user": {"username": "me"},
+                "ids": {"trakt": "777"},
+            }
+        }
+        mocks["trakt_client"].get_own_lists.return_value = [own_entry]
+        processed = []
+        monkeypatch.setattr(
+            sync,
+            "process_list_parallel",
+            lambda list_data, *a, **k: processed.append(list_data)
+            or {"success": True, "matched": 2, "not_found": 0},
+        )
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+
+        assert sync.sync_lists(args) == 0
+        mocks["trakt_client"].get_own_lists.assert_called_once()
+        mocks["trakt_client"].get_liked_lists.assert_not_called()
+        assert processed == [own_entry]
+
+    def test_liked_source_does_not_fetch_owned_lists(self, monkeypatch, tmp_path):
+        """--list-source liked stays liked-only (#26)."""
+        mocks = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "liked"])
+
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+
+        assert sync.sync_lists(args) == 0
+        mocks["trakt_client"].get_own_lists.assert_not_called()
 
 
 class TestProcessOfficialList:

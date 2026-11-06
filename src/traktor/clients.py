@@ -1121,6 +1121,36 @@ class TraktClient:
             logger.error(f"Failed to fetch liked lists: Data parsing error - {e}", exc_info=True)
             raise
 
+    def get_own_lists(self) -> List[Dict[str, Any]]:
+        """Fetch the lists the authenticated account created, private ones included.
+
+        Returns:
+            Entries shaped like ``get_liked_lists()`` (``{"list": {...}}``) so both
+            personal sources share one processing path (#26).
+        """
+        logger.info("Fetching own lists from Trakt...")
+
+        try:
+            data = self._paginated_get("users/me/lists")
+
+            logger.info(f"Successfully fetched {len(data)} own list(s)")
+            for i, list_info in enumerate(data, 1):
+                logger.debug(
+                    f"List {i}: '{list_info.get('name', 'Unknown')}' "
+                    f"({list_info.get('item_count', 0)} items, "
+                    f"privacy={list_info.get('privacy', 'unknown')})"
+                )
+
+            return [{"list": list_info} for list_info in data]
+
+        except requests.exceptions.RequestException as e:
+            # Traceback already logged by _request(); log context only here.
+            logger.error(f"Failed to fetch own lists: API request failed - {e}")
+            raise
+        except (KeyError, ValueError, TypeError) as e:
+            logger.error(f"Failed to fetch own lists: Data parsing error - {e}", exc_info=True)
+            raise
+
     def get_list_items(self, username: str, list_id: str) -> List[Dict[str, Any]]:
         logger.info(f"Fetching items from list: {list_id} (user: {username})")
 
@@ -1727,6 +1757,37 @@ class PlexClient:
             )
             return None
 
+    def _playlists_titled(self, name):
+        """Return every playlist on the server whose title matches ``name``.
+
+        Plex allows two playlists to share a title, and a create request that
+        reports a failure may still have created one, so callers need the whole
+        set rather than the single match ``server.playlist()`` returns (#24).
+        Errors propagate: treating a failed listing as "no playlist" is what
+        turns a transient 5xx into a duplicate.
+        """
+        try:
+            return list(self.server.playlists(title=name, title__iexact=name))
+        except NotFound:
+            return []
+
+    def _delete_duplicate_playlists(self, name, duplicates):
+        """Delete extra playlists that share ``name``, keeping the caller's one."""
+        logger.warning(
+            f"Found {len(duplicates) + 1} playlists titled '{name}' - "
+            f"keeping one and deleting the other {len(duplicates)}"
+        )
+        for duplicate in duplicates:
+            rating_key = getattr(duplicate, "ratingKey", "unknown")
+            try:
+                duplicate.delete()
+                logger.info(f"Deleted duplicate playlist '{name}' (ratingKey {rating_key})")
+            except Exception as e:
+                logger.warning(
+                    f"Could not delete duplicate playlist '{name}' "
+                    f"(ratingKey {rating_key}): {e}"
+                )
+
     @retry_with_backoff(
         max_retries=3,
         base_delay=2.0,
@@ -1735,6 +1796,16 @@ class PlexClient:
         name="plex_create_playlist",
     )
     def _create_playlist(self, name, items):
+        # A retried create must not add a second playlist: Plex can answer 500
+        # after it already stored the playlist, and the retry would otherwise
+        # create a twin that never gets updated again (#24).
+        existing = self._playlists_titled(name)
+        if existing:
+            logger.warning(
+                f"Playlist '{name}' already exists - reusing it instead of creating a duplicate"
+            )
+            return existing[0]
+
         if items:
             logger.debug(f"Creating playlist with {len(items)} items...")
             playlist = self.server.createPlaylist(name, items=items)
@@ -1795,7 +1866,12 @@ class PlexClient:
 
         try:
             try:
-                playlist = self.server.playlist(name)
+                matches = self._playlists_titled(name)
+                if not matches:
+                    raise NotFound(f'Unable to find playlist with title "{name}".')
+                playlist = matches[0]
+                if len(matches) > 1:
+                    self._delete_duplicate_playlists(name, matches[1:])
                 logger.info(f"Found existing playlist: {name}")
 
                 current_items = playlist.items()

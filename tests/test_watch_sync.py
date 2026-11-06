@@ -906,8 +906,21 @@ class TestDeltaSyncRegression:
         sync_engine.plex.cache.show_key_to_imdb = {}
         sync_engine.stats["items_skipped_due_to_delta"] = 0
 
+        # Trakt already holds the old watch, with the same timestamp, so no
+        # change is possible for it and the delta filter may drop it.
+        known_state = {
+            ("movie", "tt1111111", None): {
+                "watched": True,
+                "last_watched_at": "2023-02-06T21:30:39",
+                "title": "Old Watched",
+            }
+        }
+
         plex_state = sync_engine._pull_from_plex(
-            movies_only=False, shows_only=False, since=now - timedelta(days=7)
+            movies_only=False,
+            shows_only=False,
+            since=now - timedelta(days=7),
+            known_state=known_state,
         )
 
         # No crash, and the unwatched movie is present with its rating key
@@ -915,7 +928,7 @@ class TestDeltaSyncRegression:
             "movie",
             "tt1111111",
             None,
-        ) not in plex_state  # old watched: delta-skipped
+        ) not in plex_state  # already watched in Trakt: delta-skipped
         assert ("movie", "tt2222222", None) in plex_state  # unwatched: present
         assert ("movie", "tt3333333", None) in plex_state  # recent watched: present
         assert sync_engine.stats["items_skipped_due_to_delta"] >= 1
@@ -923,9 +936,120 @@ class TestDeltaSyncRegression:
         assert unwatched["watched"] is False
         assert unwatched["rating_key"] == 222
 
+    def _movie_cache(self, last_viewed: str, rating_key: int = 111):
+        return {
+            "movies_by_imdb": {"tt1111111": {"ratingKey": rating_key}},
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+            "movies_list": [
+                {
+                    "ratingKey": rating_key,
+                    "title": "Phone Booth",
+                    "isWatched": True,
+                    "lastViewedAt": last_viewed,
+                }
+            ],
+            "shows_list": [],
+        }
+
+    def test_watch_recorded_during_a_run_is_pulled(self, sync_engine):
+        """A watch recorded after the cache snapshot must not be delta-skipped.
+
+        Regression (#19): the sync window starts when the previous run ended,
+        but the Plex state it filters came from the cache snapshot taken when
+        that run started. A watch recorded inside the run therefore sits behind
+        the window, and skipping it lost the change on every later run too.
+        """
+        watched_at = datetime(2026, 10, 26, 18, 30, 34, tzinfo=timezone.utc)
+        run_end = watched_at + timedelta(minutes=20)  # the run finished later
+
+        sync_engine.plex.cache.memory_cache = self._movie_cache(
+            watched_at.strftime("%Y-%m-%dT%H:%M:%S")
+        )
+        sync_engine.plex.cache.movie_key_to_ids = {111: ("tt1111111", None)}
+        sync_engine.plex.cache.show_key_to_imdb = {}
+        sync_engine.stats["items_skipped_due_to_delta"] = 0
+
+        # Trakt has no record of the movie, so a change is needed and the
+        # delta filter must not drop it. Before the fix this returned {}.
+        plex_state = sync_engine._pull_from_plex(
+            movies_only=True, shows_only=False, since=run_end, known_state={}
+        )
+
+        key = ("movie", "tt1111111", None)
+        assert key in plex_state
+        assert plex_state[key]["watched"] is True
+        assert sync_engine.stats["items_skipped_due_to_delta"] == 0
+
+        changes = sync_engine._calculate_changes(plex_state, {}, "both")
+        assert [item["title"] for item in changes["trakt"]["mark_watched"]] == ["Phone Booth"]
+
+    def test_episode_watch_recorded_during_a_run_is_pulled(self, sync_engine):
+        """Episodes share the movie path's delta defect (#19 class sweep)."""
+        watched_at = datetime(2026, 10, 26, 18, 30, 34, tzinfo=timezone.utc)
+        run_end = watched_at + timedelta(minutes=20)
+        episode = MagicMock()
+        episode.ratingKey = 900
+        episode.isWatched = True
+        episode.lastViewedAt = watched_at
+        episode.episodeNumber = 3
+        plex_state = {}
+
+        sync_engine._process_episode_batch(
+            [episode],
+            {"title": "Some Show"},
+            "tt5555555",
+            1,
+            plex_state,
+            since=run_end,
+            known_state={},
+        )
+
+        key = ("episode", "tt5555555", 1, 3)
+        assert key in plex_state
+        assert plex_state[key]["watched"] is True
+
+        # The delta filter still applies when Trakt already agrees.
+        plex_state_skipped = {}
+        sync_engine._process_episode_batch(
+            [episode],
+            {"title": "Some Show"},
+            "tt5555555",
+            1,
+            plex_state_skipped,
+            since=run_end,
+            known_state={
+                key: {"watched": True, "last_watched_at": watched_at.isoformat()},
+            },
+        )
+        assert plex_state_skipped == {}
+
 
 class TestSyncWatchedStatusOrchestration:
     """Coverage for sync_watched_status branches (TODO audit D4)."""
+
+    def test_trakt_is_pulled_before_plex(self, sync_engine):
+        """The Plex pull needs the Trakt state to filter safely (#19)."""
+        trakt_state = {("movie", "tt1111111", None): {"watched": True}}
+        order = []
+        sync_engine._pull_from_trakt = MagicMock(
+            side_effect=lambda **kwargs: order.append("trakt") or trakt_state
+        )
+        sync_engine._pull_from_plex = MagicMock(
+            side_effect=lambda **kwargs: order.append("plex") or {}
+        )
+        sync_engine._calculate_changes = MagicMock(
+            return_value={
+                "plex": {"mark_watched": [], "mark_unwatched": []},
+                "trakt": {"mark_watched": [], "mark_unwatched": []},
+            }
+        )
+        sync_engine._apply_changes = MagicMock()
+
+        sync_engine.sync_watched_status()
+
+        assert order == ["trakt", "plex"]
+        assert sync_engine._pull_from_plex.call_args.kwargs["known_state"] == trakt_state
 
     def test_delta_mode(self, sync_engine):
         """History timestamp present -> delta mode is enabled."""
@@ -1242,8 +1366,9 @@ class TestPullFailurePropagation:
         with pytest.raises(watch_sync.WatchStatePullError):
             sync_engine.sync_watched_status()
 
-        # The real _pull_from_trakt was never reached (Plex pull is stage 1)
-        sync_engine._pull_from_trakt.assert_not_called()
+        # Pull order is Trakt then Plex (#19), so the Trakt pull has already
+        # run; the Plex failure still aborts before any change is applied.
+        sync_engine._pull_from_trakt.assert_called_once()
         sync_engine._apply_changes.assert_not_called()
         assert sync_engine.stats["errors"] > 0
         assert sync_engine.history.get_last_sync_timestamp() is None

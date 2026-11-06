@@ -114,9 +114,16 @@ class TestHealthEndpoints:
         finally:
             server.stop()
 
-    def test_status_endpoint(self):
-        """Test /status returns JSON with sync status."""
+    def test_status_endpoint_reports_success(self, tmp_path, monkeypatch):
+        """A recorded successful run is served with its timestamp (issue #13)."""
+        from traktor import health_server
         from traktor.health_server import HealthServer
+        from traktor.run_status import record_run_started, record_run_succeeded
+
+        status_file = tmp_path / "sync_progress.json"
+        monkeypatch.setattr(health_server, "SYNC_PROGRESS_FILE", status_file)
+        record_run_started(status_file)
+        record_run_succeeded(status_file)
 
         port = self._get_free_port()
         server = HealthServer(port=port)
@@ -130,8 +137,63 @@ class TestHealthEndpoints:
             data = json.loads(response.read().decode())
 
             assert response.status == 200
-            assert "sync_status" in data
-            assert data["sync_status"] == "idle"
+            assert data["sync_status"] == "success"
+            assert data["last_sync"] is not None
+            assert data["last_error"] is None
+            conn.close()
+        finally:
+            server.stop()
+
+    def test_status_endpoint_reports_failure(self, tmp_path, monkeypatch):
+        """A recorded failed run is served as a failure, not as idle (issue #13)."""
+        from traktor import health_server
+        from traktor.health_server import HealthServer
+        from traktor.run_status import record_run_failed, record_run_started
+
+        status_file = tmp_path / "sync_progress.json"
+        monkeypatch.setattr(health_server, "SYNC_PROGRESS_FILE", status_file)
+        record_run_started(status_file)
+        record_run_failed(status_file, "run exited with code 1")
+
+        port = self._get_free_port()
+        server = HealthServer(port=port)
+        server.start()
+        time.sleep(0.1)
+
+        try:
+            conn = HTTPConnection("127.0.0.1", port)
+            conn.request("GET", "/status")
+            response = conn.getresponse()
+            data = json.loads(response.read().decode())
+
+            assert response.status == 503
+            assert data["sync_status"] == "failed"
+            assert data["last_error"] == "run exited with code 1"
+            conn.close()
+        finally:
+            server.stop()
+
+    def test_status_endpoint_unknown_without_a_run(self, tmp_path, monkeypatch):
+        """No recorded run yet means unknown with a failing status (issue #13)."""
+        from traktor import health_server
+        from traktor.health_server import HealthServer
+
+        monkeypatch.setattr(health_server, "SYNC_PROGRESS_FILE", tmp_path / "absent.json")
+
+        port = self._get_free_port()
+        server = HealthServer(port=port)
+        server.start()
+        time.sleep(0.1)
+
+        try:
+            conn = HTTPConnection("127.0.0.1", port)
+            conn.request("GET", "/status")
+            response = conn.getresponse()
+            data = json.loads(response.read().decode())
+
+            assert response.status == 503
+            assert data["sync_status"] == "unknown"
+            assert data["last_sync"] is None
             conn.close()
         finally:
             server.stop()

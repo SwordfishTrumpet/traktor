@@ -23,7 +23,7 @@ resource = __import__("resource") if importlib.util.find_spec("resource") else N
 # Constants
 BYTES_PER_KB = 1024
 KB_PER_MB = 1024
-DEFAULT_MAX_MEMORY_MB = 512  # 512 MB default limit
+DEFAULT_MAX_MEMORY_MB = 512  # 512 MB default warning threshold
 CPU_THROTTLE_INTERVAL_MS = 100  # Sleep interval for CPU throttling in milliseconds
 
 
@@ -31,7 +31,7 @@ class ResourceManager:
     """Manages resource limits for traktor process.
 
     Supports:
-    - Memory limits (soft RSS limit)
+    - Memory warning threshold (logged, not kernel-enforced)
     - CPU throttling (via sleep intervals)
     - Network bandwidth control (placeholder)
     """
@@ -42,28 +42,28 @@ class ResourceManager:
         self._cpu_throttle_thread: threading.Thread | None = None
         self._stop_throttle = threading.Event()
 
-    def set_memory_limit(self, max_memory_mb: int) -> bool:
-        """Set soft memory limit for the process.
+    def set_memory_threshold(self, max_memory_mb: int) -> bool:
+        """Record the memory threshold that check_memory_usage() warns about.
+
+        The kernel does not enforce this value. RLIMIT_RSS has had no effect on
+        Linux since kernel 2.4.30, so setting it promised a ceiling the process
+        never had; an address-space limit is not a substitute, because it makes
+        allocation fail instead of warning the operator. The setting is
+        therefore a warning threshold: usage above it is logged, and the run
+        continues (issue #16).
 
         Args:
-            max_memory_mb: Maximum memory in MB
+            max_memory_mb: Threshold in MB
 
         Returns:
-            True if successful, False if not supported
+            True, always: the threshold applies wherever usage can be measured
         """
-        if sys.platform not in ("linux", "darwin") or resource is None:
-            logger.warning(f"Memory limits not supported on {sys.platform}")
-            return False
-
-        try:
-            max_bytes = max_memory_mb * KB_PER_MB * BYTES_PER_KB
-            resource.setrlimit(resource.RLIMIT_RSS, (max_bytes, max_bytes * 2))
-            logger.info(f"Memory limit set to {max_memory_mb} MB")
-        except (ValueError, OSError, AttributeError) as e:
-            logger.warning(f"Could not set memory limit: {e}")
-            return False
-        else:
-            return True
+        self.max_memory_mb = max_memory_mb
+        logger.info(
+            f"Memory warning threshold set to {max_memory_mb} MB "
+            "(warns in the log; not enforced by the kernel)"
+        )
+        return True
 
     def start_cpu_throttle(self, target_cpu_percent: float = 50.0) -> None:
         """Start CPU throttling to limit CPU usage.
@@ -128,7 +128,8 @@ class ResourceManager:
         current = self.get_current_memory_usage_mb()
         if current > self.max_memory_mb:
             logger.warning(
-                f"Memory usage ({current:.1f} MB) exceeds limit ({self.max_memory_mb} MB)",
+                f"Memory usage ({current:.1f} MB) is above the warning threshold "
+                f"({self.max_memory_mb} MB)",
             )
             return False
         return True

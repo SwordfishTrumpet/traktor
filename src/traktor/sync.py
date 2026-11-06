@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -31,6 +31,7 @@ from .log import logger
 from .official_lists import OfficialListsService
 from .performance import performance_monitor
 from .resilience import SyncProgress, backup_manager, integrity_checker
+from .run_status import record_run_failed, record_run_started, record_run_succeeded
 from .settings import (
     LOG_FILE,
     SYNC_PROGRESS_FILE,
@@ -46,6 +47,13 @@ from .settings import (
     WATCH_SYNC_DIRECTION,
 )
 from .watch_sync import WatchSyncEngine
+
+# Personal list sources: what TRAKTOR_LIST_SOURCE picks besides the official lists.
+# "liked" lists are other people's lists you liked; "own" lists are the ones your
+# account created, which need OAuth just like liked lists (#26).
+LIKED_LIST_SOURCES = ("liked", "both", "all")
+OWN_LIST_SOURCES = ("own", "all")
+PERSONAL_LIST_SOURCES = ("liked", "both", "own", "all")
 
 # Constants for batch processing
 DEFAULT_CHUNK_SIZE = 500  # Number of items to process per chunk for memory efficiency
@@ -1274,13 +1282,40 @@ def _abort_without_confirmation(what: str) -> None:
 
 
 def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = None) -> int:
+    """Run a sync and record its outcome for the status endpoint (issue #13).
+
+    Every exit path leaves a record behind. A run that raises, that is
+    interrupted, or that calls ``sys.exit()`` when a credential is missing or
+    Trakt refuses the login is recorded as failed instead of looking like a run
+    that is still going, which is how a twenty-day outage stayed invisible.
+    """
+    record_run_started(SYNC_PROGRESS_FILE)
+    try:
+        exit_code = _sync_lists(args, resource_manager=resource_manager)
+    except SystemExit as exc:
+        record_run_failed(SYNC_PROGRESS_FILE, f"run exited with code {exc.code}")
+        raise
+    except KeyboardInterrupt:
+        record_run_failed(SYNC_PROGRESS_FILE, "run was interrupted")
+        raise
+    except Exception as exc:
+        record_run_failed(SYNC_PROGRESS_FILE, f"run stopped with {type(exc).__name__}")
+        raise
+    if exit_code == 0:
+        record_run_succeeded(SYNC_PROGRESS_FILE)
+    else:
+        record_run_failed(SYNC_PROGRESS_FILE, f"sync finished with exit code {exit_code}")
+    return exit_code
+
+
+def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = None) -> int:
     """Main sync function with parallel processing."""
     # Initialize resource manager if not provided but memory limits are configured
     if resource_manager is None and TRAKTOR_MAX_MEMORY_MB > 0:
         from .resource_manager import ResourceManager
 
         resource_manager = ResourceManager(max_memory_mb=TRAKTOR_MAX_MEMORY_MB)
-        resource_manager.set_memory_limit(TRAKTOR_MAX_MEMORY_MB)
+        resource_manager.set_memory_threshold(TRAKTOR_MAX_MEMORY_MB)
 
     if not TRAKT_CLIENT_ID or not TRAKT_CLIENT_SECRET:
         logger.error("TRAKT_CLIENT_ID and TRAKT_CLIENT_SECRET must be set in environment/.env file")
@@ -1368,10 +1403,17 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
     if needs_auth:
         logger.info("Authentication required for liked lists/watch sync features")
         if not authenticate_trakt(auth, force=args.force_auth if args else False):
-            logger.error("Trakt authentication failed, exiting")
-            print("Failed to authenticate with Trakt. Exiting.")
-            sys.exit(1)
-        logger.info("Trakt authentication successful")
+            if not _can_sync_without_oauth(args):
+                logger.error("Trakt authentication failed and nothing is left to sync without it")
+                print("Failed to authenticate with Trakt. Exiting.")
+                sys.exit(1)
+            # Official lists need only the client ID, so an unusable token costs
+            # the OAuth-backed features and not the whole run (#25).
+            logger.error("Trakt authentication failed - continuing with official lists only")
+            print("Failed to authenticate with Trakt. Continuing with official lists only...")
+            needs_auth = False
+        else:
+            logger.info("Trakt authentication successful")
     else:
         logger.info("No authentication required - syncing official lists only (no OAuth needed)")
 
@@ -1404,30 +1446,18 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
         print(f"Failed to connect to Plex: {e}")
         sys.exit(1)
 
-    # Fetch liked lists only if authenticated and needed
-    liked_lists = []
-    if (
-        needs_auth
-        and trakt
-        and list_source in ("liked", "both")
-        and not (args and args.sync_watched_only)
-    ):
-        logger.info("Fetching liked lists from Trakt...")
-        try:
-            liked_lists = trakt.get_liked_lists()
-            stats["lists_found"] = len(liked_lists)
-            logger.info(f"Found {len(liked_lists)} liked list(s)")
-            print(f"Found {len(liked_lists)} liked list(s)")
-        except Exception as e:
-            # Traceback already logged by the Trakt client layer; avoid triple-logging.
-            logger.error(f"Failed to fetch liked lists: {e}")
-            print(f"Failed to fetch liked lists: {e}")
-            # Don't exit - we can still sync official lists
-            print("Continuing with official lists only...")
+    # Fetch the personal list sources this run asks for (liked lists, own lists)
+    personal_list_sets: List[Tuple[str, List[Dict[str, Any]]]] = []
+    if needs_auth and trakt and not (args and args.sync_watched_only):
+        if list_source in LIKED_LIST_SOURCES:
+            personal_list_sets.append(("liked", _fetch_personal_lists(trakt, "liked")))
+        if list_source in OWN_LIST_SOURCES:
+            personal_list_sets.append(("own", _fetch_personal_lists(trakt, "own")))
+    stats["lists_found"] = sum(len(lists) for _, lists in personal_list_sets)
 
-    if not liked_lists and list_source in ("liked", "both"):
-        logger.warning("No liked lists found on Trakt")
-        print("No liked lists found on Trakt.")
+    if personal_list_sets and not any(lists for _, lists in personal_list_sets):
+        logger.warning("No personal lists found on Trakt")
+        print("No personal lists found on Trakt.")
 
         # Only exit early if we're not syncing official lists
         sync_official = (
@@ -1436,59 +1466,47 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
         if not sync_official:
             return 0
 
-    # Process liked lists (only if authenticated and list_source permits)
-    if trakt and liked_lists and (not args or list_source in ("liked", "both")):
-        # Skip liked lists when in watch-only mode
+    # Process the personal lists (only if authenticated and a source permits)
+    if trakt and personal_list_sets:
+        # Skip liked/own lists when in watch-only mode
         if args and args.sync_watched_only:
-            logger.info("Skipping liked lists (--sync-watched-only mode)")
+            logger.info("Skipping personal lists (--sync-watched-only mode)")
         else:
-            blacklisted_lists = config.get("blacklisted_lists", [])
-            if blacklisted_lists:
-                logger.info(f"Filtering out {len(blacklisted_lists)} blacklisted list(s)")
-                for liked in liked_lists:
-                    list_name = liked.get("list", {}).get("name", "")
-                    if list_name in blacklisted_lists:
-                        logger.info(f"Skipping blacklisted list: '{list_name}'")
-                        print(f"   Skipping blacklisted list: {list_name}")
-                liked_lists = [
-                    liked
-                    for liked in liked_lists
-                    if liked.get("list", {}).get("name", "") not in blacklisted_lists
-                ]
-                stats["lists_found"] = len(liked_lists)
-                logger.info(f"After filtering: {len(liked_lists)} list(s) to process")
+            personal_list_sets = _filter_blacklisted_lists(personal_list_sets, config)
+            stats["lists_found"] = sum(len(lists) for _, lists in personal_list_sets)
 
-            for liked in liked_lists:
-                list_info = liked.get("list", {})
-                list_name = list_info.get("name", "Unnamed List")
-                username = list_info.get("user", {}).get("username", "")
-                list_id = list_info.get("ids", {}).get("trakt", "")
+            for source_label, source_lists in personal_list_sets:
+                for liked in source_lists:
+                    list_info = liked.get("list", {})
+                    list_name = list_info.get("name", "Unnamed List")
+                    username = list_info.get("user", {}).get("username", "")
+                    list_id = list_info.get("ids", {}).get("trakt", "")
 
-                logger.info(f"Processing list: '{list_name}' (ID: {list_id}, user: {username})")
-                print(f"\nProcessing list: {list_name}")
-                print(f"   From user: {username}")
+                    logger.info(f"Processing list: '{list_name}' (ID: {list_id}, user: {username})")
+                    print(f"\nProcessing list: {list_name}")
+                    print(f"   From user: {username}")
 
-                result = process_list_parallel(
-                    liked,
-                    plex,
-                    trakt,
-                    args.workers if args else 8,
-                    stats,
-                    updated_playlists,
-                    missing_items,
-                )
-                stats["lists_processed"] += 1
-                sync_progress.mark_completed(f"liked:{list_name}")
+                    result = process_list_parallel(
+                        liked,
+                        plex,
+                        trakt,
+                        args.workers if args else 8,
+                        stats,
+                        updated_playlists,
+                        missing_items,
+                    )
+                    stats["lists_processed"] += 1
+                    sync_progress.mark_completed(f"{source_label}:{list_name}")
 
-                if result.get("success", False):
-                    if result.get("warning", "") == "no_matches":
-                        print("   No matching items found in Plex library")
+                    if result.get("success", False):
+                        if result.get("warning", "") == "no_matches":
+                            print("   No matching items found in Plex library")
+                        else:
+                            print(f"   Playlist updated with {result.get('matched', 0)} item(s)")
+                        if result.get("not_found", 0) > 0:
+                            print(f"   {result.get('not_found', 0)} item(s) not found")
                     else:
-                        print(f"   Playlist updated with {result.get('matched', 0)} item(s)")
-                    if result.get("not_found", 0) > 0:
-                        print(f"   {result.get('not_found', 0)} item(s) not found")
-                else:
-                    print(f"   Failed to process list: {result.get('error', 'Unknown error')}")
+                        print(f"   Failed to process list: {result.get('error', 'Unknown error')}")
 
         _check_memory(resource_manager)
 
@@ -1860,19 +1878,106 @@ def _should_sync_official_lists(args):
     if args.official_lists:
         return True
 
-    # If --list-source is 'official' or 'both', sync
-    if args.list_source in ("official", "both"):
+    # If --list-source is anything but 'liked', sync: official lists stay on
+    # unless the user turned them off or picked the liked-only source.
+    if args.list_source in ("official", "both", "own", "all"):
         return True
 
     # Check environment variable
     return TRAKTOR_OFFICIAL_LISTS_ENABLED
 
 
+def _fetch_personal_lists(trakt: Any, source: str) -> List[Dict[str, Any]]:
+    """Fetch one personal list source, reporting a failure without aborting the run.
+
+    A failed fetch costs that source alone: the official lists need no login, so
+    the sync carries on with them (#25). The returned entries keep the
+    ``{"list": {...}}`` shape both Trakt endpoints are normalised to, so the
+    processing path is shared.
+
+    Args:
+        trakt: Authenticated Trakt client
+        source: ``"liked"`` or ``"own"``
+
+    Returns:
+        The lists, or an empty list when the fetch failed
+    """
+    logger.info(f"Fetching {source} lists from Trakt...")
+    try:
+        lists = trakt.get_liked_lists() if source == "liked" else trakt.get_own_lists()
+    except Exception as e:
+        # Traceback already logged by the Trakt client layer; avoid triple-logging.
+        logger.error(f"Failed to fetch {source} lists: {e}")
+        print(f"Failed to fetch {source} lists: {e}")
+        print("Continuing with the other list sources...")
+        return []
+
+    logger.info(f"Found {len(lists)} {source} list(s)")
+    print(f"Found {len(lists)} {source} list(s)")
+    return lists
+
+
+def _filter_blacklisted_lists(
+    personal_list_sets: List[Tuple[str, List[Dict[str, Any]]]], config: Dict[str, Any]
+) -> List[Tuple[str, List[Dict[str, Any]]]]:
+    """Drop blacklisted list names from every source, logging each skip once."""
+    blacklisted = config.get("blacklisted_lists", [])
+    if not blacklisted:
+        return personal_list_sets
+
+    logger.info(f"Filtering out {len(blacklisted)} blacklisted list(s)")
+    filtered_sets: List[Tuple[str, List[Dict[str, Any]]]] = []
+    for source_label, source_lists in personal_list_sets:
+        kept = []
+        for entry in source_lists:
+            list_name = entry.get("list", {}).get("name", "")
+            if list_name in blacklisted:
+                logger.info(f"Skipping blacklisted list: '{list_name}'")
+                print(f"   Skipping blacklisted list: {list_name}")
+                continue
+            kept.append(entry)
+        filtered_sets.append((source_label, kept))
+
+    remaining = sum(len(lists) for _, lists in filtered_sets)
+    logger.info(f"After filtering: {remaining} list(s) to process")
+    return filtered_sets
+
+
+def _can_sync_without_oauth(args: Any) -> bool:
+    """Check whether the run still has work it can do without a Trakt login.
+
+    Official lists only need the client ID, so an unusable token should cost the
+    OAuth-backed features and not the whole run (#25). A watch-only run, or one
+    that asked for nothing but OAuth-backed features, has nothing left to do.
+
+    Args:
+        args: Parsed CLI arguments
+
+    Returns:
+        True when at least the official lists can still be synced
+    """
+    if args is None:
+        return False
+
+    oauth_only = (
+        args.sync_watched
+        or args.sync_watched_only
+        or args.sync_progress
+        or args.sync_collection
+        or args.sync_watchlist
+    )
+    if oauth_only:
+        return False
+
+    return _should_sync_official_lists(args)
+
+
 def _needs_oauth_auth(args, list_source):
     """Determine if OAuth authentication is required.
 
     OAuth is only needed for features that require user-specific Trakt data:
-    - Liked lists (list_source is 'liked' or 'both')
+    - Personal lists: liked lists ('liked', 'both', 'all') and the lists your own
+      account created ('own', 'all')
     - Collection sync (--sync-collection)
     - Watchlist sync (--sync-watchlist)
     - Watch status sync (--sync-watched, --sync-watched-only)
@@ -1882,21 +1987,21 @@ def _needs_oauth_auth(args, list_source):
 
     Args:
         args: Parsed CLI arguments (may be None)
-        list_source: The list source setting ('liked', 'official', or 'both')
+        list_source: The list source setting ('liked', 'own', 'official', 'both' or 'all')
 
     Returns:
         True if OAuth authentication is required, False otherwise
     """
     if args is None:
-        # Default args case - check if liked lists would be synced
-        return list_source in ("liked", "both")
+        # Default args case - check if liked or own lists would be synced
+        return list_source in PERSONAL_LIST_SOURCES
 
     # Check watch-only mode first (takes precedence)
     if args.sync_watched_only:
         return True
 
     # Check list source (use resolved list_source, not raw CLI arg)
-    if list_source in ("liked", "both"):
+    if list_source in PERSONAL_LIST_SOURCES:
         return True
 
     # Check watch-related features

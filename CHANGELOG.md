@@ -6,6 +6,14 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ## [Unreleased]
 
+### Added
+
+- **Your own Trakt lists can be synced now (issue #26)**
+  - `--list-source=own` / `TRAKTOR_LIST_SOURCE=own` syncs the lists your Trakt account
+    created (private ones included) through the new `TraktClient.get_own_lists()`
+  - `--list-source=all` syncs own lists, liked lists and the official ones in one run;
+    `liked`, `both` and `official` keep their meaning
+
 ### Changed
 
 - **Watch history state growth is now bounded (issue #7 follow-up)**
@@ -16,6 +24,15 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **A retried playlist create no longer leaves a duplicate that stops updating (issue #24)**
+  - Plex can answer 500 after it already stored a playlist; the retry now looks the title up
+    first instead of creating a twin playlist
+  - A title that already resolves to several playlists keeps the first and deletes the rest
+    with a logged warning, so existing duplicates are cleaned up on the next sync
+- **An unusable Trakt token no longer stops the official lists (issue #25)**
+  - When authentication fails and official lists are enabled, the run logs the degradation and
+    continues with them; it exits non-zero only when nothing is left to sync or an OAuth-only
+    mode (`--sync-watched-only`, `--sync-watched`, collection/watchlist/progress) was requested
 - **Trakt batch history failures are now visible and tracked (issue #9)**
   - `_batch_history_operation()` swallowed per-batch RequestExceptions; the combined result
     now reports `failed` item counts (and failed payloads) alongside successes
