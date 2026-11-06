@@ -64,7 +64,7 @@ dev = [
     # Type stubs are a development-only concern; they used to sit in
     # [project].dependencies and were therefore installed in the runtime image.
     "types-psutil>=7.2.2.20260518",
-    "types-requests>=2.33.0.20260518",
+    "types-requests>=2.33.0.20261030",
     "pytest-cov>=7.1.0",
     "vulture>=2.16",
 ]
