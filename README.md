@@ -1,10 +1,10 @@
 # traktor
 
-**Sync your Trakt curation to Plex playlists, automatically.**
+**Turn Trakt lists into Plex playlists, and keep watch status in step on both sides.**
 
----
-
-Turn your liked Trakt lists into Plex playlists. Sync your watched status between platforms. Resume movies on Plex exactly where you left off on Trakt. Run it once and forget it. traktor handles the rest with smart caching, parallel processing, and delta sync.
+traktor is for people who keep their watchlist on Trakt but watch in Plex. It copies the lists you
+follow into Plex playlists, and keeps watched state and resume points in agreement between the two
+services. Run it from cron and it keeps itself up to date.
 
 ## Install in 30 seconds
 
@@ -20,11 +20,50 @@ cp .env.example .env  # Then edit .env with your credentials
 - [Trakt API app](https://trakt.tv/oauth/applications) (create one, copy Client ID/Secret)
 - [Plex token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/) (from Plex Web settings)
 
+## Check the install
+
+```bash
+uv run traktor --health-check
+```
+
+It answers with the state of its own files, which is what a broken install gets wrong first:
+
+```text
+Running health checks...
+
+Overall Status: ✅ HEALTHY
+Timestamp: 2026-11-06T14:01:00.445126+00:00
+
+Component Status:
+  ✅ cache: healthy
+  ✅ config: healthy
+```
+
+The timestamp is the moment you ran it. A line that is not healthy names the file traktor could
+not read.
+
 ## Run it
 
 ```bash
 uv run traktor
 ```
+
+Your first sync logs its progress, prints a summary of what it matched and what it could not find,
+and ends like this:
+
+```text
+============================================================
+Sync complete!
+Total time: ...
+============================================================
+
+Summary:
+  ...
+```
+
+The playlists are on your Plex server under Playlists. Anything traktor could not match is written
+to `~/.traktor/missing.txt` (or `/data/logs/missing.txt` in Docker) with the reason, so a short
+playlist has an explanation rather than a mystery.
 
 By default, traktor syncs Trakt's official curated lists (trending, popular movies/shows) to Plex with **no OAuth required**: just your Trakt Client ID.
 
@@ -43,56 +82,41 @@ uv run traktor --refresh-cache       # After adding new media to Plex
 
 See all options: `uv run traktor --help`
 
-## Why traktor?
+## The ideas you need
 
-| Feature | What it means for you |
-|---------|----------------------|
-| **⚡ Fast** | Parallel processing + delta sync means subsequent runs complete in seconds, not minutes |
-| **🔁 Bidirectional sync** | Watch a movie on Plex → marked watched on Trakt. Watch on Trakt → marked watched on Plex |
-| **📺 Episode-aware** | Shows in Trakt lists resolve to S01E01 episodes so playlists contain playable items |
-| **🧠 Smart matching** | Matches by IMDb/TMDb IDs, not fuzzy titles, so a rename does not break the match |
-| **📦 Official lists** | Sync Trakt's algorithmic lists (trending, popular, box office) without extra OAuth |
-| **🐳 Docker ready** | One `docker compose up` and you're scheduled |
-| **🧹 Self-cleaning** | Unlike a list? Un-like it on Trakt and the playlist disappears automatically |
-| **🎯 Smart fallback** | Shows without S01E01 automatically fall back to the first available episode |
-| **📊 Actionable reports** | `missing.txt` includes reasons (not just IDs) so you know why items weren't found |
-| **🔍 Smart suggestions** | Missing items include fuzzy title matches and naming mismatch detection |
-| **🖥️ Interactive mode** | Preview changes before applying, confirm deletions, inspect recent sync snapshots |
-| **🧠 Advanced conflict resolution** | Per-media-type rules, timezone-aware timestamps, and confidence scoring |
-| **🔒 Auth failure detection** | Auto-detects stale Trakt tokens and prompts for re-authentication |
-| **📝 Structured logging** | Optional JSON logs with correlation IDs for machine parsing |
-| **📈 Performance monitoring** | Built-in API timing, cache hit rates, and bottleneck detection |
-| **🏥 Health endpoints** | HTTP `/health`, `/metrics`, and `/status` for container monitoring; `/status` reports the last run's outcome and success time, and fails until a run has recorded one |
-| **🔄 Auto-update checks** | Check for new versions via GitHub API with safe rollback capability |
-| **⚙️ Resource management** | Memory warning threshold and CPU throttling for multi-tenant operation |
+### Official lists and liked lists
+Trakt publishes algorithmic lists (trending, popular, most played, box office, anticipated) that
+anyone can read with just a client ID. Your liked lists are your own curation and need the OAuth
+login. `TRAKTOR_LIST_SOURCE` picks which of the two traktor syncs: `official` (the default),
+`liked`, or `both`.
 
-## Everything it does
+### Matching is by ID, not by title
+traktor looks each item up in your library by IMDb ID first, then by TMDb ID. A retitled file still
+matches, and a similar title never decides which film you meant. When neither ID is in the library
+the item is reported missing with the reason, plus up to three near-matches so you can see why.
 
-**Playlist Sync (No OAuth Required)**
-- Trakt Official Lists → Trending, popular, most played, box office, anticipated movies/shows
-  - Works with just `TRAKT_CLIENT_ID`: no authentication needed
-  - Great for new users to get curated playlists immediately
+### A show in a list becomes an episode
+A Plex playlist holds playable items and a show is not one, so a listed show resolves to its S01E01
+episode. If S01E01 is not in the library it takes the first episode it can find in any season, and
+if there is none the show is reported missing.
 
-**Playlist Sync (OAuth Required)**
-- Liked Trakt lists → Plex playlists (your personal curation from Trakt users)
-- Trakt Collection → "Trakt Collection - Movies/Shows" playlists  
-- Trakt Watchlist → "Trakt Watchlist" playlist
+### Watch sync moves state, not history
+Watch status is compared per item, and only the difference is sent. `WATCH_SYNC_DIRECTION` limits
+which way it may travel and `WATCH_SYNC_CONFLICT_RESOLUTION` decides which side wins when the two
+disagree. A pull that fails stops the run and says so rather than reading the failure as "nothing
+is watched", so an outage cannot wipe your history.
 
-**Watch Status & Progress (OAuth Required)**
-- Bidirectional watched/unwatched sync (movies & episodes)
-- Movies always pull Trakt's **full watched list**: movies watched on other services are
-  marked watched in Plex regardless of how long ago they were watched (no delta window loss)
-- Playback progress sync (resume points) from Trakt → Plex
-- Conflict resolution strategies when states disagree
+## What it syncs
 
-**Performance & Reliability**
-- In-memory cache with 24-hour TTL and hash-based invalidation
-- Incremental cache updates: only scan new items since last sync
-- Batch API operations (100 items per call)
-- Delta sync skips unchanged items after first run
-- Smart playlist updates: only add/remove changed items instead of recreating entire playlists
-- Parallel workers (default 8, configurable)
-- Detailed `missing.txt` report with reasons for missing items
+| Source | Becomes | OAuth |
+|--------|---------|-------|
+| Trakt official lists (trending, popular, most played, box office, anticipated) | a Plex playlist per endpoint and period, or one merged playlist | no |
+| Your liked Trakt lists | a Plex playlist per list | yes |
+| Trakt collection | "Trakt Collection - Movies/Shows" playlists | yes |
+| Trakt watchlist | "Trakt Watchlist" playlist | yes |
+
+Un-like a list and its playlist disappears on the next run. Watch status, resume points and
+conflicts between them travel through `--sync-watched`, `--sync-watched-only` and `--sync-progress`.
 
 ## Documentation
 
@@ -161,6 +185,11 @@ See [DOCKER.md](DOCKER.md) for scheduling and volume mounts.
 - `--circuit-status`: Show circuit breaker status for API clients
 - `--check-update`, `--apply-update`: Check for and apply updates
 
+`--serve-health` answers on `TRAKTOR_HEALTH_PORT`: `/health` for component health, `/metrics` in
+Prometheus text format, and `/status` for the last run's outcome. `/status` reports `success`, `failed`
+with a short reason, `running` while a run is in progress, or `unknown` until a run has recorded one;
+it answers 503 for `failed` and `unknown`, so a monitor can tell a healthy sync from a broken one.
+
 **Official list options:**
 - `--official-lists`, `--no-official-lists`: Enable/disable official lists
 - `--official-endpoints`: Comma-separated endpoints (e.g., `movies.trending,shows.popular`)
@@ -211,6 +240,24 @@ Trakt.tv ──OAuth──► TraktAuth/Client ──API──┐
 ```
 
 Runtime files: `~/.traktor_config.json`, `~/.traktor_cache/`, `~/.traktor/traktor.log` (local mode) or `/data/config/`, `/data/logs/` (Docker mode).
+
+## Current status and limits
+
+- **A show in a playlist is one episode.** Lists resolve shows to S01E01, or to the first episode
+  that exists, so a playlist never mirrors a whole series.
+- **A playlist over 1000 items is rebuilt.** Above that size traktor deletes and recreates it
+  instead of updating it, so custom playlist metadata is lost.
+- **`--undo` restores nothing.** It prints the most recent snapshot for inspection; recovery is
+  manual, from the paths it names.
+- **`--apply-update` prints the update command.** It does not install anything.
+- **`TRAKTOR_MAX_MEMORY_MB` warns; it does not cap.** Linux does not enforce the resident-set
+  limit this setting used to apply, so traktor logs a warning once use passes the threshold and
+  keeps running.
+- **Trakt calls are serialized.** The rate limiter keeps at least 0.3 seconds between Trakt API
+  requests, and about a second between official-list calls, so a first sync of a large library takes
+  a while; the cache and the delta filter shorten later runs.
+- **A failed pull stops the run.** Watch sync leaves `last_sync` where it was and reports the
+  failure, rather than assuming either side is empty.
 
 ## License
 
