@@ -164,19 +164,10 @@ class WatchSyncEngine:
                 )
                 logger.info("Use --backfill-history for full history sync if needed")
 
-            # Stage 1: Pull from Plex
-            progress.start_stage(
-                name="pull_plex",
-                total=0,  # We don't know total items until we process them
-                desc="Pulling watch state from Plex",
-                unit="items",
-            )
-            plex_state = self._pull_from_plex(
-                movies_only=movies_only, shows_only=shows_only, since=last_sync
-            )
-            progress.complete_stage()
-
-            # Stage 2: Pull from Trakt
+            # Stage 1: Pull from Trakt. This runs first because the Plex pull
+            # needs the Trakt state to decide which items the delta filter may
+            # skip - an item is skipped only when both sides already agree, so a
+            # watch the previous run never observed cannot be dropped (#19).
             progress.start_stage(
                 name="pull_trakt",
                 total=0,  # We don't know total items until we process them
@@ -185,6 +176,21 @@ class WatchSyncEngine:
             )
             trakt_state = self._pull_from_trakt(
                 movies_only=movies_only, shows_only=shows_only, since=last_sync
+            )
+            progress.complete_stage()
+
+            # Stage 2: Pull from Plex
+            progress.start_stage(
+                name="pull_plex",
+                total=0,  # We don't know total items until we process them
+                desc="Pulling watch state from Plex",
+                unit="items",
+            )
+            plex_state = self._pull_from_plex(
+                movies_only=movies_only,
+                shows_only=shows_only,
+                since=last_sync,
+                known_state=trakt_state,
             )
             progress.complete_stage()
 
@@ -256,13 +262,63 @@ class WatchSyncEngine:
             self.stats["errors"] += 1
             raise
 
-    def _pull_from_plex(self, movies_only=False, shows_only=False, since=None) -> Dict:
+    def _delta_skip_allowed(
+        self,
+        key,
+        is_watched,
+        last_viewed_dt,
+        known_state,
+        since,
+    ):
+        """Decide whether the delta filter may drop an item before comparison.
+
+        The delta filter is an optimisation, so it may only drop an item whose
+        outcome the resolver would ignore anyway. Dropping an item just because
+        it fell outside the window loses every change the previous run failed to
+        observe: the Plex state comes from the library cache snapshot taken when
+        that run started, while the window advanced to when it ended, so a watch
+        recorded inside the run falls behind the window and is skipped on every
+        later run too (issue #19).
+
+        Skipping is therefore allowed only when the other platform already holds
+        the same state, which is exactly the case where no change is possible.
+
+        Args:
+            key: Media key (3-tuple for movies, 4-tuple for episodes)
+            is_watched: Watch state read from Plex
+            last_viewed_dt: Plex last-viewed timestamp, aware UTC or None
+            known_state: Watch state already pulled from the other platform
+            since: Delta window start, or None for a full sync
+
+        Returns:
+            True when the item can be skipped without losing a change
+        """
+        since_dt = self._parse_plex_timestamp(since)
+        if since_dt is None or last_viewed_dt is None:
+            return False
+        if last_viewed_dt >= since_dt:
+            return False
+
+        known = (known_state or {}).get(key) or {}
+        action = self.resolver.resolve(
+            plex_watched=is_watched,
+            trakt_watched=bool(known.get("watched")),
+            plex_last_watched=last_viewed_dt,
+            trakt_last_watched=known.get("last_watched_at"),
+        )
+        return action == "no_action"
+
+    def _pull_from_plex(
+        self, movies_only=False, shows_only=False, since=None, known_state=None
+    ) -> Dict:
         """Pull watch state from Plex.
 
         Args:
             movies_only: If True, only process movies
             shows_only: If True, only process shows/episodes
             since: Optional datetime to only fetch items changed since this time
+            known_state: Watch state already pulled from Trakt, used to decide
+                whether the delta filter may skip an item (issue #19)
 
         Returns:
             Dict mapping (media_type, imdb_id, tmdb_id) -> watch_info
@@ -293,19 +349,21 @@ class WatchSyncEngine:
                     # Use cached watch status (no API call)
                     is_watched = movie_data.get("isWatched", False)
                     last_viewed = movie_data.get("lastViewedAt")
-
-                    # Skip if we're in delta mode and item hasn't changed since last sync
-                    if since and last_viewed:
-                        last_viewed_dt = self._parse_plex_timestamp(last_viewed)
-                        if last_viewed_dt and last_viewed_dt < since:
-                            self.stats["items_skipped_due_to_delta"] += 1
-                            continue
+                    last_viewed_dt = self._parse_plex_timestamp(last_viewed)
 
                     # Get external IDs from pre-built lookup
                     imdb_id, tmdb_id = movie_key_to_ids.get(rating_key, (None, None))
+                    key = ("movie", imdb_id, tmdb_id)
+
+                    # Skip only when the other side already agrees (see
+                    # _delta_skip_allowed)
+                    if self._delta_skip_allowed(
+                        key, is_watched, last_viewed_dt, known_state, since
+                    ):
+                        self.stats["items_skipped_due_to_delta"] += 1
+                        continue
 
                     if imdb_id or tmdb_id:
-                        key = ("movie", imdb_id, tmdb_id)
                         plex_state[key] = {
                             "watched": is_watched,
                             "last_watched_at": last_viewed,
@@ -354,6 +412,7 @@ class WatchSyncEngine:
                                                 season_num,
                                                 plex_state,
                                                 since,
+                                                known_state,
                                             )
                                             episodes_processed += len(batch_episodes)
                                             batch_episodes = []
@@ -367,6 +426,7 @@ class WatchSyncEngine:
                                             season_num,
                                             plex_state,
                                             since,
+                                            known_state,
                                         )
                                         episodes_processed += len(batch_episodes)
 
@@ -404,6 +464,7 @@ class WatchSyncEngine:
         season_num,
         plex_state,
         since=None,
+        known_state=None,
     ):
         """Process a batch of episodes and add to plex_state.
 
@@ -424,13 +485,7 @@ class WatchSyncEngine:
             # carries viewCount/lastViewedAt for every episode.
             is_watched = getattr(episode, "isWatched", False)
             last_viewed = getattr(episode, "lastViewedAt", None)
-
-            # Skip if we're in delta mode and item hasn't changed since last sync
-            if since and last_viewed:
-                last_viewed_dt = self._parse_plex_timestamp(last_viewed)
-                if last_viewed_dt and last_viewed_dt < since:
-                    self.stats["items_skipped_due_to_delta"] += 1
-                    continue
+            last_viewed_dt = self._parse_plex_timestamp(last_viewed)
 
             # Get episode number
             episode_num = getattr(episode, "episodeNumber", None)
@@ -439,6 +494,14 @@ class WatchSyncEngine:
 
             # Build unique key using show, season, and episode numbers
             key = ("episode", show_imdb, season_num, episode_num)
+
+            # Skip only when the other side already agrees (see
+            # _delta_skip_allowed); episodes share the movie path's defect
+            # class, so they take the same guard (issue #19).
+            if self._delta_skip_allowed(key, is_watched, last_viewed_dt, known_state, since):
+                self.stats["items_skipped_due_to_delta"] += 1
+                continue
+
             plex_state[key] = {
                 "watched": is_watched,
                 "last_watched_at": last_viewed,
