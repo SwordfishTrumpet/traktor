@@ -1974,3 +1974,84 @@ class TestPlexBatchFailedKeys:
 
         assert results["success"] == 1
         assert results["failed_rating_keys"] == ["rk-bad"]
+
+
+class TestTraktResponseCounting:
+    """Trakt answers with counts for writes and payload lists for misses (#38)."""
+
+    @pytest.fixture
+    def mock_auth(self):
+        auth = MagicMock()
+        auth.get_headers.return_value = {"Authorization": "Bearer test"}
+        return auth
+
+    def test_count_trakt_items_handles_both_shapes(self):
+        """Counts, payload lists and missing values all count correctly."""
+        assert clients.count_trakt_items(3) == 3
+        assert clients.count_trakt_items(0) == 0
+        assert clients.count_trakt_items([{"ids": {}}, {"ids": {}}]) == 2
+        assert clients.count_trakt_items([]) == 0
+        assert clients.count_trakt_items(None) == 0
+        assert clients.count_trakt_items("unexpected") == 0
+
+    def test_not_found_payload_lists_are_counted(self, mock_auth):
+        """A not_found response with payload lists must not raise on sum()."""
+        client = clients.TraktClient(mock_auth)
+        movies = [{"ids": {"imdb": "tt1"}}, {"ids": {"imdb": "tt2"}}]
+
+        def make_response(*args, **kwargs):
+            r = MagicMock()
+            r.status_code = 201
+            r.json.return_value = {
+                "added": {"movies": 1, "episodes": 0},
+                "not_found": {"movies": [{"ids": {"imdb": "tt2"}}], "episodes": []},
+            }
+            return r
+
+        with patch.object(client._session, "post", side_effect=make_response):
+            result = client.add_to_history(movies=movies)
+
+        assert result is not None
+        assert result["added"]["movies"] == 1
+        assert result["not_found"] == {"movies": 1, "episodes": 0}
+
+    def test_per_item_watched_at_reaches_the_request(self, mock_auth):
+        """Per-item watched_at survives batching into the POST payload."""
+        client = clients.TraktClient(mock_auth)
+        movies = [
+            {"ids": {"imdb": "tt1"}, "watched_at": "2024-06-15T12:00:00.000Z"},
+        ]
+        captured = {}
+
+        def make_response(*args, **kwargs):
+            captured.update(kwargs.get("json") or {})
+            r = MagicMock()
+            r.status_code = 201
+            r.json.return_value = {"added": {"movies": 1, "episodes": 0}}
+            return r
+
+        with patch.object(client._session, "post", side_effect=make_response):
+            client.add_to_history(movies=movies)
+
+        assert captured["movies"][0]["watched_at"] == "2024-06-15T12:00:00.000Z"
+
+    def test_section_arriving_as_a_list_does_not_raise(self, mock_auth):
+        """A bare list in place of a section block counts 0, never crashes."""
+        client = clients.TraktClient(mock_auth)
+        movies = [{"ids": {"imdb": "tt1"}}]
+
+        def make_response(*args, **kwargs):
+            r = MagicMock()
+            r.status_code = 201
+            r.json.return_value = {
+                "added": [{"ids": {"imdb": "tt1"}}],
+                "not_found": {"movies": [{"ids": {"imdb": "tt2"}}], "episodes": []},
+            }
+            return r
+
+        with patch.object(client._session, "post", side_effect=make_response):
+            result = client.add_to_history(movies=movies)
+
+        # A bare list has no per-media split, so it is not counted twice
+        assert result["added"] == {"movies": 0, "episodes": 0}
+        assert result["not_found"] == {"movies": 1, "episodes": 0}

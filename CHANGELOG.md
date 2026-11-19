@@ -21,6 +21,15 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Changed
 
+- **Watch sync only reconciles watch state, never watch dates (issue #37)**
+  - When both platforms already agree an item is watched, the sync now reports `no_action`
+    instead of pushing the newer timestamp to the older side. Both pushes restamped the
+    winner with "now", so the difference never closed: every run re-marked the same ~500
+    movies in Plex and re-added ~100 plays to Trakt, inflating play counts and overwriting
+    real watch dates with the run time
+  - `ConflictResolver._is_newer()`, `_should_update_timestamp()` and
+    `DEFAULT_TIMESTAMP_THRESHOLD_SECONDS` are gone with the behavior they enabled
+
 - **Watch history state growth is now bounded (issue #7 follow-up)**
   - Synced-item entries carry an `updated_at` stamp; `_apply_changes()` prunes entries older
     than the retention window before each batch persist
@@ -28,6 +37,18 @@ The format is based on Keep a Changelog and this project currently uses a simple
     pruning is safe because reconciliation resolves from live platform data, not history state
 
 ### Fixed
+
+- **A Plex→Trakt push keeps the Plex watch date (issue #37)**
+  - `_apply_changes()` dropped the `watched_at` value the resolver had already attached to
+    the change, so Trakt stamped every pushed play with the moment of the request. Movie and
+    episode payloads now carry it (rendered by the new `utils.format_trakt_timestamp()`),
+    which also lets a sync converge instead of re-pushing on every run
+- **A Trakt response with unresolved items no longer aborts the push accounting (issue #38)**
+  - `not_found` lists the offending payloads instead of counting them, so summing it raised
+    `TypeError: unsupported operand type(s) for +: 'int' and 'list'`. Every scheduled run
+    logged "Failed to add items to Trakt history" and counted all pushed items as errors
+    even though the batches had succeeded. Trakt response fields are now counted through
+    `clients.count_trakt_items()`, which accepts a number, a payload list or a missing field
 
 - **A retried playlist create no longer leaves a duplicate that stops updating (issue #24)**
   - Plex can answer 500 after it already stored a playlist; the retry now looks the title up

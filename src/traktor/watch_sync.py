@@ -8,7 +8,7 @@ from plexapi.exceptions import NotFound
 
 from .log import logger
 from .progress import SyncProgress
-from .utils import normalize_tmdb_id, parse_timestamp
+from .utils import format_trakt_timestamp, normalize_tmdb_id, parse_timestamp
 
 # Constants for progress sync
 DEFAULT_PROGRESS_THRESHOLD_MS = (
@@ -808,28 +808,35 @@ class WatchSyncEngine:
         episodes_to_add = []
 
         for item in changes["trakt"]["mark_watched"]:
+            # Carry the watch date across: Trakt stamps a play with "now" when
+            # watched_at is omitted, so dropping it turns a sync into a
+            # fabricated date (and a fresh duplicate play) on every push.
+            watched_at = format_trakt_timestamp(item.get("watched_at"))
+
             if item["media_type"] == "movie":
-                movies_to_add.append(
-                    {
-                        "ids": (
-                            {"imdb": item["imdb_id"], "tmdb": item["tmdb_id"]}
-                            if item["imdb_id"] or item["tmdb_id"]
-                            else {}
-                        ),
-                    }
-                )
+                movie: Dict[str, Any] = {
+                    "ids": (
+                        {"imdb": item["imdb_id"], "tmdb": item["tmdb_id"]}
+                        if item["imdb_id"] or item["tmdb_id"]
+                        else {}
+                    ),
+                }
+                if watched_at:
+                    movie["watched_at"] = watched_at
+                movies_to_add.append(movie)
             else:
                 # Episode keys are ("episode", show_imdb, season, episode_num)
                 key = item["key"]
                 season = key[2] if len(key) > 2 else None
                 episode_num = key[3] if len(key) > 3 else None
-                episodes_to_add.append(
-                    {
-                        "ids": {"imdb": item["imdb_id"]} if item["imdb_id"] else {},
-                        "season": season,
-                        "number": episode_num,
-                    }
-                )
+                episode: Dict[str, Any] = {
+                    "ids": {"imdb": item["imdb_id"]} if item["imdb_id"] else {},
+                    "season": season,
+                    "number": episode_num,
+                }
+                if watched_at:
+                    episode["watched_at"] = watched_at
+                episodes_to_add.append(episode)
 
         if movies_to_add or episodes_to_add:
             try:

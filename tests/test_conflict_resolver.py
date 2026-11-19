@@ -376,68 +376,75 @@ class TestTraktWinsEdgeCases:
         assert action == "push_to_plex"
 
 
-class TestTimestampHelperMethods:
-    """Tests for timestamp helper methods."""
+class TestBothWatchedTimestampDivergence:
+    """Timestamp divergence between two watched records must not trigger a push.
+
+    Issue #37: the sync used to push the newer timestamp to the older platform
+    whenever both sides were watched. Both pushes restamp the winner with "now",
+    so the divergence never closed: every run re-marked the same items in Plex
+    and re-added plays to Trakt, inflating play counts and overwriting the real
+    watch date with the run time.
+    """
 
     @pytest.fixture
     def resolver(self):
         return conflict_resolver.ConflictResolver("newest_wins")
 
-    def test_is_newer_dt1_newer(self, resolver):
-        """Test _is_newer when dt1 is newer."""
-        dt1 = datetime(2024, 6, 15, 12, 0, 0)
-        dt2 = datetime(2024, 6, 15, 11, 0, 0)
-        assert resolver._is_newer(dt1, dt2) is True
+    def test_both_watched_plex_newer_is_no_action(self, resolver):
+        """A newer Plex date is not a change to push to Trakt."""
+        now = datetime.now(timezone.utc)
+        action = resolver.resolve(
+            plex_watched=True,
+            trakt_watched=True,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(days=400),
+        )
+        assert action == "no_action"
 
-    def test_is_newer_dt2_newer(self, resolver):
-        """Test _is_newer when dt2 is newer."""
-        dt1 = datetime(2024, 6, 15, 11, 0, 0)
-        dt2 = datetime(2024, 6, 15, 12, 0, 0)
-        assert resolver._is_newer(dt1, dt2) is False
+    def test_both_watched_trakt_newer_is_no_action(self, resolver):
+        """A newer Trakt date is not a change to push to Plex."""
+        now = datetime.now(timezone.utc)
+        action = resolver.resolve(
+            plex_watched=True,
+            trakt_watched=True,
+            plex_last_watched=now - timedelta(days=400),
+            trakt_last_watched=now,
+        )
+        assert action == "no_action"
 
-    def test_is_newer_equal_timestamps(self, resolver):
-        """Test _is_newer when timestamps are equal."""
-        dt = datetime(2024, 6, 15, 12, 0, 0)
-        assert resolver._is_newer(dt, dt) is False
+    def test_both_unwatched_is_no_action(self, resolver):
+        """Neither side watched - nothing to push."""
+        action = resolver.resolve(
+            plex_watched=False,
+            trakt_watched=False,
+            plex_last_watched=datetime.now(timezone.utc),
+            trakt_last_watched=None,
+        )
+        assert action == "no_action"
 
-    def test_is_newer_dt1_none(self, resolver):
-        """Test _is_newer when dt1 is None."""
-        dt2 = datetime(2024, 6, 15, 12, 0, 0)
-        assert resolver._is_newer(None, dt2) is False
+    def test_agreed_state_is_idempotent_across_repeated_calls(self, resolver):
+        """Repeating the resolution on the same state keeps returning no_action."""
+        now = datetime.now(timezone.utc)
+        for _ in range(3):
+            action = resolver.resolve(
+                plex_watched=True,
+                trakt_watched=True,
+                plex_last_watched=now,
+                trakt_last_watched=now - timedelta(hours=5),
+            )
+            assert action == "no_action"
 
-    def test_is_newer_dt2_none(self, resolver):
-        """Test _is_newer when dt2 is None."""
-        dt1 = datetime(2024, 6, 15, 12, 0, 0)
-        assert resolver._is_newer(dt1, None) is True
-
-    def test_is_newer_both_none(self, resolver):
-        """Test _is_newer when both are None."""
-        assert resolver._is_newer(None, None) is False
-
-    def test_should_update_timestamp_significant_diff(self, resolver):
-        """Test _should_update_timestamp with significant difference."""
-        dt1 = datetime(2024, 6, 15, 12, 0, 0)
-        dt2 = datetime(2024, 6, 15, 12, 5, 0)
-        assert resolver._should_update_timestamp(dt1, dt2) is True
-
-    def test_should_update_timestamp_small_diff(self, resolver):
-        """Test _should_update_timestamp with small difference."""
-        dt1 = datetime(2024, 6, 15, 12, 0, 0)
-        dt2 = datetime(2024, 6, 15, 12, 0, 30)
-        assert resolver._should_update_timestamp(dt1, dt2) is False
-
-    def test_should_update_timestamp_custom_threshold(self, resolver):
-        """Test _should_update_timestamp with custom threshold."""
-        dt1 = datetime(2024, 6, 15, 12, 0, 0)
-        dt2 = datetime(2024, 6, 15, 12, 0, 30)
-        assert resolver._should_update_timestamp(dt1, dt2, threshold_seconds=10) is True
-
-    def test_should_update_timestamp_none_values(self, resolver):
-        """Test _should_update_timestamp with None values."""
-        dt = datetime(2024, 6, 15, 12, 0, 0)
-        assert resolver._should_update_timestamp(None, dt) is False
-        assert resolver._should_update_timestamp(dt, None) is False
-        assert resolver._should_update_timestamp(None, None) is False
+    def test_resolve_with_context_both_watched_is_no_action(self, resolver):
+        """Context resolution agrees: no timestamp push for watched items."""
+        now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
+        action = resolver.resolve_with_context(
+            plex_watched=True,
+            trakt_watched=True,
+            plex_last_watched=now,
+            trakt_last_watched=now - timedelta(days=30),
+            media_type="movie",
+        )
+        assert action == "no_action"
 
 
 class TestResolveWithContext:
@@ -502,8 +509,8 @@ class TestResolveWithContext:
             plex_completion_pct=0.6,
             trakt_completion_pct=0.3,
         )
-        # Both effective watched=True, Plex is newer -> timestamp update pushes to Plex
-        assert action == "push_to_plex"
+        # Both effective watched=True: agreed state, so no timestamp push (#37)
+        assert action == "no_action"
 
     def test_resolve_with_context_confidence_play_count(self, resolver):
         """Test confidence scoring with play count."""
@@ -696,10 +703,9 @@ class TestConfidenceScoring:
     def test_resolve_accepts_serialized_timestamps(self, resolver):
         """resolve() must accept the ISO strings its callers actually pass.
 
-        Regression (#20): the both-watched branch subtracts the two timestamps,
-        and callers forward Plex's lastViewedAt from the cache and Trakt's
-        watched_at from the API, both plain strings. That raised TypeError and
-        aborted the whole watch sync.
+        Regression (#20): callers forward Plex's lastViewedAt from the cache and
+        Trakt's watched_at from the API, both plain strings. Comparing them
+        raised TypeError and aborted the whole watch sync.
         """
         plex_ts = "2026-10-01T10:00:00.000Z"
         trakt_ts = "2026-10-02T10:00:00.000Z"
@@ -712,7 +718,9 @@ class TestConfidenceScoring:
             datetime(2026, 10, 1, 10, tzinfo=timezone.utc),
             datetime(2026, 10, 2, 10, tzinfo=timezone.utc),
         )
-        assert action == "push_to_trakt"  # Trakt is newer
+        # Both watched, so there is no state to push (#37); the point here is
+        # that string timestamps resolve without raising.
+        assert action == "no_action"
 
     def test_resolve_mixed_string_and_datetime(self, resolver):
         """A naive Plex string and an aware Trakt string compare by instant."""
@@ -754,8 +762,8 @@ class TestResolveWithContextBranches:
     def resolver(self):
         return conflict_resolver.ConflictResolver("newest_wins")
 
-    def test_resolve_both_watched_plex_newer_updates_plex(self, resolver):
-        """Both watched, Plex timestamp newer -> update Plex timestamp."""
+    def test_resolve_both_watched_plex_newer_no_push(self, resolver):
+        """Both watched, Plex newer -> no push (issue #37)."""
         now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
         action = resolver.resolve(
             plex_watched=True,
@@ -763,10 +771,10 @@ class TestResolveWithContextBranches:
             plex_last_watched=now,
             trakt_last_watched=now - timedelta(hours=1),
         )
-        assert action == "push_to_plex"
+        assert action == "no_action"
 
-    def test_resolve_both_watched_trakt_newer_updates_trakt(self, resolver):
-        """Both watched, Trakt timestamp newer -> update Trakt timestamp."""
+    def test_resolve_both_watched_trakt_newer_no_push(self, resolver):
+        """Both watched, Trakt newer -> no push (issue #37)."""
         now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
         action = resolver.resolve(
             plex_watched=True,
@@ -774,9 +782,9 @@ class TestResolveWithContextBranches:
             plex_last_watched=now - timedelta(hours=1),
             trakt_last_watched=now,
         )
-        assert action == "push_to_trakt"
+        assert action == "no_action"
 
-    def test_resolve_with_context_both_watched_ts_update(self, resolver):
+    def test_resolve_with_context_both_watched_ts_no_push(self, resolver):
         """resolve_with_context with both watched and differing timestamps."""
         now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
         action = resolver.resolve_with_context(
@@ -786,7 +794,7 @@ class TestResolveWithContextBranches:
             trakt_last_watched=now - timedelta(hours=1),
             media_type="movie",
         )
-        assert action == "push_to_plex"
+        assert action == "no_action"
 
     def test_movie_only_plex_timestamp(self, resolver):
         """Movie: only Plex has a timestamp -> Plex confidence wins."""
@@ -892,8 +900,8 @@ class TestResolveWithContextBranches:
         )
         assert action == "no_action"
 
-    def test_season_effective_watched_timestamp_update(self, resolver):
-        """Season: both effective-watched, Plex newer -> timestamp update."""
+    def test_season_effective_watched_no_timestamp_update(self, resolver):
+        """Season: both effective-watched -> no push, whatever the timestamps say."""
         now = datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc)
         action = resolver.resolve_with_context(
             plex_watched=True,
@@ -902,7 +910,7 @@ class TestResolveWithContextBranches:
             trakt_last_watched=now - timedelta(hours=1),
             media_type="season",
         )
-        assert action == "push_to_plex"
+        assert action == "no_action"
 
     def test_season_effective_differs_trakt_wins(self, resolver):
         """Season: effective states differ, Trakt confidence higher -> push to Plex."""
