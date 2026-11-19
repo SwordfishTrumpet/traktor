@@ -1625,6 +1625,10 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
                 print("   No orphaned playlists found")
 
     # Watch sync (if enabled and authenticated, or in watch-only mode)
+    # A watch sync that fails must not leave the run looking successful (#22):
+    # _sync_lists() returns 1, which makes sync_lists() record the run failed.
+    watch_sync_error: Optional[str] = None
+
     if args and (args.sync_watched or args.sync_watched_only):
         if trakt is None:
             print("\n⚠️  Watch sync skipped: Trakt authentication required")
@@ -1745,6 +1749,7 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
                         print(f"  Errors: {watch_stats['errors']}")
 
             except Exception as e:
+                watch_sync_error = str(e)
                 logger.error(f"Watch sync failed: {e}", exc_info=True)
                 print(f"\nWatch sync failed: {e}")
 
@@ -1846,6 +1851,10 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
 
         _check_memory(resource_manager)
 
+    if watch_sync_error:
+        logger.error(f"Watch sync did not complete, so this run is a failure: {watch_sync_error}")
+        print(f"Watch sync did not complete: {watch_sync_error}")
+
     # Calculate total elapsed time for the sync operation
     elapsed = time.time() - sync_start_time
 
@@ -1857,7 +1866,7 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
         show_performance=args.performance_report if args else False,
     )
 
-    return 1 if stats["lists_failed"] > 0 else 0
+    return 1 if (stats["lists_failed"] > 0 or watch_sync_error) else 0
 
 
 def _check_memory(resource_manager):

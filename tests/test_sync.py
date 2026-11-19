@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import pytest
 import requests as _requests
 
-from traktor import sync
+from traktor import sync, watch_sync
 
 
 class FakePlex:
@@ -978,6 +978,56 @@ class TestSyncListsOrchestration:
         mocks["plex_client"].cleanup_orphaned_playlists.assert_not_called()
         # And must skip liked lists
         mocks["trakt_client"].get_liked_lists.assert_not_called()
+
+    def test_a_failed_watch_sync_fails_the_run(self, monkeypatch, tmp_path, capsys):
+        """A watch pull that cannot read a show must not leave a green run (#22)."""
+        self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--sync-watched-only"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: True)
+        monkeypatch.setattr(sync, "WatchHistoryManager", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(sync, "ConflictResolver", lambda *a, **k: MagicMock())
+
+        engine = MagicMock()
+        engine.sync_watched_status.side_effect = watch_sync.WatchStatePullError(
+            "Could not read watch state for show 'Broken Show' after 2 attempts: timed out"
+        )
+        monkeypatch.setattr(sync, "WatchSyncEngine", lambda *a, **k: engine)
+
+        result = sync.sync_lists(args)
+
+        assert result == 1
+        out = capsys.readouterr().out
+        assert "Broken Show" in out
+
+    def test_a_failed_watch_sync_is_recorded_as_a_failure(self, monkeypatch, tmp_path):
+        """The status record says failed, so a monitor sees the gap (#13, #22)."""
+        self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--sync-watched-only"])
+
+        recorded = {}
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: True)
+        monkeypatch.setattr(sync, "WatchHistoryManager", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(sync, "ConflictResolver", lambda *a, **k: MagicMock())
+        monkeypatch.setattr(sync, "record_run_started", lambda *a, **k: None)
+        monkeypatch.setattr(
+            sync, "record_run_failed", lambda path, reason="": recorded.update(failed=reason)
+        )
+        monkeypatch.setattr(
+            sync, "record_run_succeeded", lambda *a, **k: recorded.update(succeeded=True)
+        )
+
+        engine = MagicMock()
+        engine.sync_watched_status.side_effect = watch_sync.WatchStatePullError(
+            "Could not read watch state for show 'Broken Show'"
+        )
+        monkeypatch.setattr(sync, "WatchSyncEngine", lambda *a, **k: engine)
+
+        sync.sync_lists(args)
+
+        assert "failed" in recorded
+        assert "succeeded" not in recorded
+        assert "exit code 1" in recorded["failed"]
 
     def test_interactive_orphaned_cleanup_confirmed(self, monkeypatch, tmp_path):
         """Interactive mode previews orphaned cleanup and deletes on confirm."""
