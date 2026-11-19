@@ -1851,3 +1851,304 @@ class TestWatchSyncIdempotency:
             changes = sync_engine._calculate_changes(plex_state, trakt_state, "both")
             assert changes["plex"]["mark_watched"] == []
             assert changes["trakt"]["mark_watched"] == []
+
+
+class _FakeEpisodeStore:
+    """Stand-in for CacheManager's episode snapshot API, request-free."""
+
+    def __init__(self, snapshots=None, memory_cache=None):
+        self.snapshots = dict(snapshots or {})
+        self.memory_cache = memory_cache if memory_cache is not None else {}
+        self.flushes = 0
+        self.forgotten = []
+
+    def get_show_episodes(self, rating_key):
+        return self.snapshots.get(str(rating_key))
+
+    def record_show_episodes(self, rating_key, counters, episodes):
+        self.snapshots[str(rating_key)] = {
+            "viewedLeafCount": counters.get("viewedLeafCount"),
+            "leafCount": counters.get("leafCount"),
+            "lastViewedAt": counters.get("lastViewedAt"),
+            "episodes": episodes,
+        }
+
+    def forget_show_episodes(self, rating_key):
+        self.forgotten.append(str(rating_key))
+        self.snapshots.pop(str(rating_key), None)
+
+    def flush_show_episodes(self):
+        self.flushes += 1
+
+
+def _make_show(rating_key, watched_count, leaf_count, last_viewed=None, episodes=()):
+    """Stub Plex show that counts how often its seasons are read."""
+    show = MagicMock()
+    show.ratingKey = rating_key
+    show.viewedLeafCount = watched_count
+    show.leafCount = leaf_count
+    show.lastViewedAt = last_viewed
+    seasons = []
+    for season_num, season_episodes in episodes:
+        season = MagicMock()
+        season.seasonNumber = season_num
+        season.episodes.return_value = list(season_episodes)
+        seasons.append(season)
+    show.seasons.return_value = seasons
+    return show
+
+
+def _make_episode(rating_key, number, watched, last_viewed=None, view_count=None):
+    episode = MagicMock()
+    episode.ratingKey = rating_key
+    episode.episodeNumber = number
+    episode.isWatched = watched
+    episode.lastViewedAt = last_viewed
+    episode.viewCount = (1 if watched else 0) if view_count is None else view_count
+    return episode
+
+
+def _wiki_show(rating_key=700, watched=2, leaf=3, last_viewed="2024-05-01T20:00:00"):
+    """A show with three episodes: two watched, one not."""
+    episodes = {
+        1: [
+            _make_episode(rating_key * 10 + 1, 1, True, last_viewed),
+            _make_episode(rating_key * 10 + 2, 2, True, last_viewed),
+            _make_episode(rating_key * 10 + 3, 3, False, None),
+        ]
+    }
+    return _make_show(rating_key, watched, leaf, last_viewed, episodes.items())
+
+
+class TestDeltaEpisodeReuse:
+    """A delta pull reuses cached episode state instead of re-reading Plex (#21).
+
+    The slowest part of a run was one season request per show and one episode
+    request per season, for the whole library, on every delta run. A show's own
+    watch counters decide whether its episode rows are still accurate.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _real_show_counters(self, sync_engine):
+        """Use the real counter reader, not an auto-created MagicMock."""
+        sync_engine.plex.show_counters.side_effect = PlexClient.show_counters
+
+    def _cache(self, shows, imdb_by_key):
+        return (
+            {
+                "movies_by_imdb": {},
+                "movies_by_tmdb": {},
+                "shows_by_imdb": {},
+                "movies_list": [],
+                "shows_list": [{"ratingKey": rk, "title": f"Show {rk}"} for rk in shows],
+                "show_episodes": {},
+            },
+            {},
+            imdb_by_key,
+        )
+
+    def test_unchanged_shows_issue_no_season_or_episode_requests(self, sync_engine):
+        """The DoD: 50 unchanged shows, zero season requests, same state."""
+        shows = {1000 + i: _wiki_show(1000 + i) for i in range(50)}
+        imdb_by_key = {rk: f"tt{rk}" for rk in shows}
+        cache, mov_ids, show_ids = self._cache(shows, imdb_by_key)
+
+        # Full pull first: populates snapshots and gives the reference state
+        store = _FakeEpisodeStore(memory_cache=cache)
+        sync_engine.plex.cache = store
+        sync_engine.plex.cache.movie_key_to_ids = mov_ids
+        sync_engine.plex.cache.show_key_to_imdb = show_ids
+        sync_engine.plex._get_plex_item.side_effect = lambda rk: shows[rk]
+        sync_engine.plex.get_show_counters.side_effect = lambda: {
+            rk: PlexClient.show_counters(s) for rk, s in shows.items()
+        }
+
+        full_state = sync_engine._pull_from_plex(shows_only=True)
+        assert len(full_state) == 150  # every episode is represented
+        assert len(store.snapshots) == 50  # and every show is snapshotted
+
+        # Now a delta pull: no show may be read from Plex at all
+        store.flushes = 0
+        season_reads = {rk: s.seasons.call_count for rk, s in shows.items()}
+        sync_engine.plex._get_plex_item.side_effect = AssertionError(
+            "delta pull must not fetch shows whose counters are unchanged"
+        )
+        sync_engine.stats["items_skipped_due_to_delta"] = 0
+
+        delta_state = sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
+
+        assert delta_state == full_state
+        assert {rk: s.seasons.call_count for rk, s in shows.items()} == season_reads
+        assert sync_engine.stats["shows_reused_from_snapshot"] == 50
+        assert store.flushes == 1
+
+    def test_changed_show_is_read_again(self, sync_engine):
+        """A show whose counters moved is re-read; the others are not."""
+        unchanged = _wiki_show(2000)
+        changed = _wiki_show(2001, watched=3, leaf=3)
+        shows = {2000: unchanged, 2001: changed}
+        cache, mov_ids, show_ids = self._cache(shows, {2000: "tt2000", 2001: "tt2001"})
+        store = _FakeEpisodeStore(
+            memory_cache=cache,
+            snapshots={
+                # 2000: counters still describe the cached rows
+                "2000": {
+                    "viewedLeafCount": 2,
+                    "leafCount": 3,
+                    "lastViewedAt": "2024-05-01T20:00:00+00:00",
+                    "episodes": [[1, 1, 20001, 1, "2024-05-01T20:00:00+00:00"]],
+                },
+                # 2001: snapshot says 2 watched, Plex now says 3 -> changed
+                "2001": {
+                    "viewedLeafCount": 2,
+                    "leafCount": 3,
+                    "lastViewedAt": "2024-05-01T20:00:00+00:00",
+                    "episodes": [[1, 1, 20011, 1, "2024-05-01T20:00:00+00:00"]],
+                },
+            },
+        )
+        sync_engine.plex.cache = store
+        sync_engine.plex.cache.movie_key_to_ids = mov_ids
+        sync_engine.plex.cache.show_key_to_imdb = show_ids
+        sync_engine.plex._get_plex_item.side_effect = lambda rk: shows[rk]
+        sync_engine.plex.get_show_counters.side_effect = lambda: {
+            2000: {
+                "viewedLeafCount": 2,
+                "leafCount": 3,
+                "lastViewedAt": "2024-05-01T20:00:00+00:00",
+            },
+            2001: PlexClient.show_counters(changed),
+        }
+
+        state = sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
+
+        assert unchanged.seasons.call_count == 0
+        assert changed.seasons.call_count == 1
+        # The changed show's fresh rows replace its stale snapshot
+        assert len(store.snapshots["2001"]["episodes"]) == 3
+        assert state[("episode", "tt2001", 1, 3)]["watched"] is False
+
+    def test_show_without_snapshot_is_read(self, sync_engine):
+        """No snapshot means no evidence, so the show is read."""
+        show = _wiki_show(3000)
+        cache, mov_ids, show_ids = self._cache({3000: show}, {3000: "tt3000"})
+        store = _FakeEpisodeStore(memory_cache=cache)
+        sync_engine.plex.cache = store
+        sync_engine.plex.cache.movie_key_to_ids = mov_ids
+        sync_engine.plex.cache.show_key_to_imdb = show_ids
+        sync_engine.plex._get_plex_item.side_effect = lambda rk: show
+        sync_engine.plex.get_show_counters.side_effect = lambda: {
+            3000: PlexClient.show_counters(show)
+        }
+
+        sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
+
+        assert show.seasons.call_count == 1
+
+    def test_unreadable_counters_force_a_read(self, sync_engine):
+        """A show whose counters Plex did not report is read, never reused."""
+        show = _wiki_show(4000)
+        cache, mov_ids, show_ids = self._cache({4000: show}, {4000: "tt4000"})
+        store = _FakeEpisodeStore(
+            memory_cache=cache,
+            snapshots={
+                "4000": {
+                    "viewedLeafCount": 2,
+                    "leafCount": 3,
+                    "lastViewedAt": "2024-05-01T20:00:00+00:00",
+                    "episodes": [[1, 1, 40001, 1, "2024-05-01T20:00:00+00:00"]],
+                }
+            },
+        )
+        sync_engine.plex.cache = store
+        sync_engine.plex.cache.movie_key_to_ids = mov_ids
+        sync_engine.plex.cache.show_key_to_imdb = show_ids
+        sync_engine.plex._get_plex_item.side_effect = lambda rk: show
+        sync_engine.plex.get_show_counters.side_effect = lambda: {}
+
+        sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
+
+        assert show.seasons.call_count == 1
+
+    def test_backfill_reads_every_show(self, sync_engine):
+        """A full sync (since=None, as --backfill-history) ignores snapshots."""
+        show = _wiki_show(5000)
+        cache, mov_ids, show_ids = self._cache({5000: show}, {5000: "tt5000"})
+        store = _FakeEpisodeStore(
+            memory_cache=cache,
+            snapshots={
+                "5000": {
+                    "viewedLeafCount": 2,
+                    "leafCount": 3,
+                    "lastViewedAt": "2024-05-01T20:00:00+00:00",
+                    "episodes": [[1, 1, 50001, 1, "2024-05-01T20:00:00+00:00"]],
+                }
+            },
+        )
+        sync_engine.plex.cache = store
+        sync_engine.plex.cache.movie_key_to_ids = mov_ids
+        sync_engine.plex.cache.show_key_to_imdb = show_ids
+        sync_engine.plex._get_plex_item.side_effect = lambda rk: show
+        sync_engine.plex.get_show_counters.side_effect = lambda: {}
+
+        state = sync_engine._pull_from_plex(shows_only=True)
+
+        assert show.seasons.call_count == 1
+        assert len(state) == 3
+
+    def test_failed_show_read_drops_its_snapshot(self, sync_engine):
+        """A failed read must not leave a snapshot that hides future changes."""
+        show = _wiki_show(6000)
+        cache, mov_ids, show_ids = self._cache({6000: show}, {6000: "tt6000"})
+        store = _FakeEpisodeStore(
+            memory_cache=cache,
+            snapshots={
+                "6000": {
+                    "viewedLeafCount": 1,
+                    "leafCount": 3,
+                    "lastViewedAt": "2024-05-01T20:00:00+00:00",
+                    "episodes": [[1, 1, 60001, 1, "2024-05-01T20:00:00+00:00"]],
+                }
+            },
+        )
+        sync_engine.plex.cache = store
+        sync_engine.plex.cache.movie_key_to_ids = mov_ids
+        sync_engine.plex.cache.show_key_to_imdb = show_ids
+        sync_engine.plex._get_plex_item.side_effect = requests.exceptions.ReadTimeout("slow")
+        sync_engine.plex.get_show_counters.side_effect = lambda: {
+            6000: PlexClient.show_counters(show)
+        }
+
+        state = sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
+
+        assert "6000" in store.forgotten
+        assert "6000" not in store.snapshots
+        assert state == {}
+        assert store.flushes == 1
+
+    def test_replay_matches_a_live_read_for_inconsistent_counters(self, sync_engine):
+        """A replay must reproduce the live state even if Plex reports both.
+
+        The row stores the watched flag Plex reported, not the play count, so a
+        server that reports ``viewCount == 0`` next to ``isWatched == True``
+        cannot make a replayed run disagree with a live one.
+        """
+        episode = _make_episode(90001, 1, True, "2024-05-01T20:00:00", view_count=0)
+        show = _make_show(9000, 1, 1, "2024-05-01T20:00:00", [(1, [episode])])
+        cache, mov_ids, show_ids = self._cache({9000: show}, {9000: "tt9000"})
+        store = _FakeEpisodeStore(memory_cache=cache)
+        sync_engine.plex.cache = store
+        sync_engine.plex.cache.movie_key_to_ids = mov_ids
+        sync_engine.plex.cache.show_key_to_imdb = show_ids
+        sync_engine.plex._get_plex_item.side_effect = lambda rk: show
+        sync_engine.plex.get_show_counters.side_effect = lambda: {
+            9000: PlexClient.show_counters(show)
+        }
+
+        live = sync_engine._pull_from_plex(shows_only=True)
+
+        sync_engine.plex._get_plex_item.side_effect = AssertionError("must be replayed")
+        replayed = sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
+
+        assert replayed == live
+        assert replayed[("episode", "tt9000", 1, 1)]["watched"] is True

@@ -1,7 +1,7 @@
 """Watch status synchronization engine."""
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import requests
 from plexapi.exceptions import NotFound
@@ -17,6 +17,13 @@ DEFAULT_PROGRESS_THRESHOLD_MS = (
 
 # Default time window for first sync (days) - limits initial sync to recent items
 DEFAULT_FIRST_SYNC_WINDOW_DAYS = 7
+
+# Show-level Plex counters that move whenever any episode's watch state changes,
+# and therefore decide whether a cached episode snapshot is still accurate (#21)
+_SHOW_COUNTER_FIELDS = ("viewedLeafCount", "leafCount", "lastViewedAt")
+
+# A snapshot episode row is [season, number, rating_key, watched, lastViewedAt]
+_EPISODE_ROW_FIELDS = 5
 
 
 class WatchStatePullError(Exception):
@@ -88,6 +95,7 @@ class WatchSyncEngine:
             "conflicts_resolved": 0,
             "errors": 0,
             "items_skipped_due_to_delta": 0,
+            "shows_reused_from_snapshot": 0,
         }
 
     def sync_watched_status(
@@ -122,6 +130,7 @@ class WatchSyncEngine:
             "processed_episodes": 0,
             "delta_mode": False,
             "items_skipped_due_to_delta": 0,
+            "shows_reused_from_snapshot": 0,
             "plex_progress_updated": 0,
             "trakt_progress_updated": 0,
             "progress_conflicts": 0,
@@ -375,78 +384,134 @@ class WatchSyncEngine:
             if not movies_only:
                 shows_processed = 0
                 episodes_processed = 0
+                shows_reused = 0
 
-                for show_data in cache.get("shows_list", []):
-                    rating_key = show_data.get("ratingKey")
-                    if not rating_key:
-                        continue
+                # One cheap read of the show-level watch counters. A show's
+                # cached episodes may only be reused while these still match the
+                # counters they were read with; anything unread stays out of the
+                # mapping and is treated as changed (issue #21).
+                live_counters = self.plex.get_show_counters() if since else {}
 
-                    # Get show's external ID from pre-built lookup
-                    show_imdb = show_key_to_imdb.get(rating_key)
+                try:
+                    for show_data in cache.get("shows_list", []):
+                        rating_key = show_data.get("ratingKey")
+                        if not rating_key:
+                            continue
 
-                    # Use cached watch status for show (no API call needed for show level)
-                    # Episodes still need to be fetched from Plex as they're not cached
-                    try:
-                        show_item = self.plex._get_plex_item(rating_key)
-                        if show_item and hasattr(show_item, "seasons"):
+                        # Get show's external ID from pre-built lookup
+                        show_imdb = show_key_to_imdb.get(rating_key)
+
+                        # Delta runs reuse a show's cached episodes when Plex's
+                        # counters say nothing in it changed, which is where the
+                        # 100k+ season and episode requests used to go (#21).
+                        snapshot = (
+                            self.plex.cache.get_show_episodes(rating_key)
+                            if since and hasattr(self.plex.cache, "get_show_episodes")
+                            else None
+                        )
+                        if self._show_episodes_unchanged(snapshot, live_counters.get(rating_key)):
                             shows_processed += 1
-                            for season in show_item.seasons():
-                                season_num = getattr(season, "seasonNumber", None)
-                                if not season_num:
-                                    continue
+                            shows_reused += 1
+                            episodes_processed += self._replay_show_episodes(
+                                snapshot, show_data, show_imdb, plex_state, since, known_state
+                            )
+                            continue
 
-                                # Process episodes in batches to limit memory
-                                batch_episodes = []
-                                batch_size = 50
+                        # Read this show from Plex (full pull, changed show, or no
+                        # snapshot yet) and record what was read for later delta
+                        # runs.
+                        try:
+                            show_item = self.plex._get_plex_item(rating_key)
+                            if show_item and hasattr(show_item, "seasons"):
+                                shows_processed += 1
+                                show_rows: List[List[Any]] = []
+                                for season in show_item.seasons():
+                                    season_num = getattr(season, "seasonNumber", None)
+                                    if not season_num:
+                                        continue
 
-                                if hasattr(season, "episodes"):
-                                    for episode in season.episodes():
-                                        batch_episodes.append(episode)
+                                    # Process episodes in batches to limit memory
+                                    batch_episodes = []
+                                    batch_size = 50
 
-                                        # Process batch when it reaches batch_size
-                                        if len(batch_episodes) >= batch_size:
-                                            self._process_episode_batch(
-                                                batch_episodes,
-                                                show_data,
-                                                show_imdb,
-                                                season_num,
-                                                plex_state,
-                                                since,
-                                                known_state,
+                                    if hasattr(season, "episodes"):
+                                        for episode in season.episodes():
+                                            batch_episodes.append(episode)
+
+                                            # Process batch when it reaches batch_size
+                                            if len(batch_episodes) >= batch_size:
+                                                show_rows.extend(
+                                                    self._process_episode_batch(
+                                                        batch_episodes,
+                                                        show_data,
+                                                        show_imdb,
+                                                        season_num,
+                                                        plex_state,
+                                                        since,
+                                                        known_state,
+                                                    )
+                                                )
+                                                episodes_processed += len(batch_episodes)
+                                                batch_episodes = []
+
+                                        # Process remaining episodes in batch
+                                        if batch_episodes:
+                                            show_rows.extend(
+                                                self._process_episode_batch(
+                                                    batch_episodes,
+                                                    show_data,
+                                                    show_imdb,
+                                                    season_num,
+                                                    plex_state,
+                                                    since,
+                                                    known_state,
+                                                )
                                             )
                                             episodes_processed += len(batch_episodes)
-                                            batch_episodes = []
 
-                                    # Process remaining episodes in batch
-                                    if batch_episodes:
-                                        self._process_episode_batch(
-                                            batch_episodes,
-                                            show_data,
-                                            show_imdb,
-                                            season_num,
-                                            plex_state,
-                                            since,
-                                            known_state,
-                                        )
-                                        episodes_processed += len(batch_episodes)
+                                counters = self.plex.show_counters(show_item)
+                                if not self._counters_known(counters):
+                                    # No usable counters from either read: keep no
+                                    # snapshot rather than an unusable one.
+                                    counters = live_counters.get(rating_key) or {}
+                                if self._counters_known(counters):
+                                    self.plex.cache.record_show_episodes(
+                                        rating_key, counters, show_rows
+                                    )
+                                else:
+                                    self.plex.cache.forget_show_episodes(rating_key)
 
-                    except (AttributeError, NotFound) as e:
-                        # Expected errors: show structure issues or missing items
-                        logger.debug(
-                            f"Could not process show episodes for {show_data.get('title')}: {e}"
-                        )
-                        continue
-                    except Exception as e:
-                        # Unexpected errors should be logged as warnings
-                        logger.warning(
-                            f"Unexpected error processing show {show_data.get('title')}: {e}"
-                        )
-                        continue
+                        except (AttributeError, NotFound) as e:
+                            # Expected errors: show structure issues or missing
+                            # items. Drop the snapshot so the next run reads this
+                            # show again instead of trusting a partial read.
+                            self.plex.cache.forget_show_episodes(rating_key)
+                            logger.debug(
+                                f"Could not process show episodes for {show_data.get('title')}: {e}"
+                            )
+                            continue
+                        except Exception as e:
+                            # Unexpected errors should be logged as warnings
+                            self.plex.cache.forget_show_episodes(rating_key)
+                            logger.warning(
+                                f"Unexpected error processing show {show_data.get('title')}: {e}"
+                            )
+                            continue
+                finally:
+                    # Persist once per pull, and only when something changed.
+                    self.plex.cache.flush_show_episodes()
 
+                self.stats["shows_reused_from_snapshot"] = shows_reused
                 logger.debug(
-                    f"Processed {shows_processed} shows with {episodes_processed} episodes "
+                    f"Processed {shows_processed} shows ({shows_reused} reused from cached "
+                    f"episode state) with {episodes_processed} episodes "
                     f"({self.stats['items_skipped_due_to_delta']} skipped due to delta)"
                 )
+                if shows_reused:
+                    logger.info(
+                        f"Reused cached episode state for {shows_reused} of "
+                        f"{shows_processed} show(s); no season or episode requests for them"
+                    )
 
             logger.info(f"Pulled {len(plex_state)} item(s) from Plex")
             return plex_state
@@ -455,6 +520,117 @@ class WatchSyncEngine:
             # Never degrade to empty state - see WatchStatePullError docstring.
             logger.error(f"Failed to pull watch state from Plex: {e}", exc_info=True)
             raise WatchStatePullError(f"Failed to pull watch state from Plex: {e}") from e
+
+    @staticmethod
+    def _counters_known(counters) -> bool:
+        """True when all three show counters carry a usable value.
+
+        A missing counter cannot prove that a show's episodes are unchanged, so
+        such a show is re-read rather than trusted (issue #21).
+        """
+        if not isinstance(counters, dict):
+            return False
+        if not isinstance(counters.get("viewedLeafCount"), int):
+            return False
+        if not isinstance(counters.get("leafCount"), int):
+            return False
+        return counters.get("lastViewedAt") is None or isinstance(counters.get("lastViewedAt"), str)
+
+    @classmethod
+    def _show_episodes_unchanged(cls, snapshot, current) -> bool:
+        """True when a show's cached episodes still describe its live state.
+
+        Plex's own show-level counters decide this: ``viewedLeafCount``,
+        ``leafCount`` and ``lastViewedAt`` move whenever an episode is watched,
+        un-watched, added or removed, so equal counters mean the cached rows are
+        still accurate and no season or episode request is needed (issue #21).
+
+        Args:
+            snapshot: Cached snapshot from the previous pull, or None
+            current: Counters read from Plex now, or None
+
+        Returns:
+            True only for a complete snapshot whose counters are unchanged
+        """
+        if not isinstance(snapshot, dict) or not cls._counters_known(current):
+            return False
+        if not isinstance(snapshot.get("episodes"), list):
+            return False
+        return all(snapshot.get(field) == current.get(field) for field in _SHOW_COUNTER_FIELDS)
+
+    def _replay_show_episodes(
+        self, snapshot, show_data, show_imdb, plex_state, since=None, known_state=None
+    ) -> int:
+        """Emit a show's episodes from its cached snapshot, without asking Plex.
+
+        The rows reuse the live pull's per-episode path, so the resulting state
+        is identical to a full read - only the requests are gone.
+
+        Args:
+            snapshot: Cached snapshot for the show
+            show_data: Cache entry of the show
+            show_imdb: Show IMDb ID, used to build episode keys
+            plex_state: State dict being built
+            since: Delta window start
+            known_state: State already pulled from Trakt
+
+        Returns:
+            Number of episode rows replayed
+        """
+        emitted = 0
+        for row in snapshot.get("episodes") or []:
+            if not isinstance(row, (list, tuple)) or len(row) < _EPISODE_ROW_FIELDS:
+                continue
+            season_num, episode_num, episode_key, watched, last_viewed = row[:5]
+            emitted += 1
+            self._record_episode(
+                show_data.get("title"),
+                show_imdb,
+                season_num,
+                episode_num,
+                bool(watched),
+                last_viewed,
+                episode_key,
+                plex_state,
+                since,
+                known_state,
+            )
+        return emitted
+
+    def _record_episode(
+        self,
+        show_title,
+        show_imdb,
+        season_num,
+        episode_num,
+        is_watched,
+        last_viewed,
+        episode_rating_key,
+        plex_state,
+        since=None,
+        known_state=None,
+    ) -> None:
+        """Add one episode to plex_state, applying the #19 delta guard.
+
+        Shared by the live Plex read and the cached-snapshot replay so both
+        produce the same state - the live read normalizes its timestamp to the
+        same ISO-8601 form the snapshot stores, so a replayed run is
+        indistinguishable from a fetched one (issues #19, #21).
+        """
+        key = ("episode", show_imdb, season_num, episode_num)
+        last_viewed_dt = self._parse_plex_timestamp(last_viewed)
+
+        # Skip only when the other side already agrees (issue #19).
+        if self._delta_skip_allowed(key, is_watched, last_viewed_dt, known_state, since):
+            self.stats["items_skipped_due_to_delta"] += 1
+            return
+
+        plex_state[key] = {
+            "watched": is_watched,
+            "last_watched_at": last_viewed,
+            "rating_key": episode_rating_key,
+            "title": f"{show_title} S{season_num}E{episode_num}",
+        }
 
     def _process_episode_batch(
         self,
@@ -465,11 +641,12 @@ class WatchSyncEngine:
         plex_state,
         since=None,
         known_state=None,
-    ):
+    ) -> List[List[Any]]:
         """Process a batch of episodes and add to plex_state.
 
         This helper method reduces memory usage by processing episodes in batches
-        rather than all at once.
+        rather than all at once. It returns the compact snapshot rows for the
+        cached-episode store (issue #21).
 
         Watch status is read directly from the episode objects returned by
         ``season.episodes()`` (``isWatched``/``lastViewedAt`` attributes are
@@ -478,6 +655,7 @@ class WatchSyncEngine:
         were never added to the rating-key cache - an API storm of ~100k calls
         for large libraries (see TODO audit A1).
         """
+        rows: List[List[Any]] = []
         for episode in episodes:
             ep_rating_key = episode.ratingKey
 
@@ -485,29 +663,34 @@ class WatchSyncEngine:
             # carries viewCount/lastViewedAt for every episode.
             is_watched = getattr(episode, "isWatched", False)
             last_viewed = getattr(episode, "lastViewedAt", None)
-            last_viewed_dt = self._parse_plex_timestamp(last_viewed)
 
             # Get episode number
             episode_num = getattr(episode, "episodeNumber", None)
             if episode_num is None:
                 continue
 
-            # Build unique key using show, season, and episode numbers
-            key = ("episode", show_imdb, season_num, episode_num)
+            parsed_last_viewed = self._parse_plex_timestamp(last_viewed)
+            last_viewed_iso = parsed_last_viewed.isoformat() if parsed_last_viewed else None
+            # Store the watched flag Plex reported, not the raw play count: the
+            # replay must reproduce exactly what the live path emitted.
+            rows.append(
+                [season_num, episode_num, ep_rating_key, 1 if is_watched else 0, last_viewed_iso]
+            )
 
-            # Skip only when the other side already agrees (see
-            # _delta_skip_allowed); episodes share the movie path's defect
-            # class, so they take the same guard (issue #19).
-            if self._delta_skip_allowed(key, is_watched, last_viewed_dt, known_state, since):
-                self.stats["items_skipped_due_to_delta"] += 1
-                continue
+            self._record_episode(
+                show_data.get("title"),
+                show_imdb,
+                season_num,
+                episode_num,
+                is_watched,
+                last_viewed_iso,
+                ep_rating_key,
+                plex_state,
+                since,
+                known_state,
+            )
 
-            plex_state[key] = {
-                "watched": is_watched,
-                "last_watched_at": last_viewed,
-                "rating_key": ep_rating_key,
-                "title": f"{show_data.get('title')} S{season_num}E{episode_num}",
-            }
+        return rows
 
     def _pull_from_trakt(self, movies_only=False, shows_only=False, since=None) -> Dict:
         """Pull watch state from Trakt.
