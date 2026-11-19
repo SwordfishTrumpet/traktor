@@ -2,7 +2,7 @@
 
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 from plexapi.exceptions import NotFound
@@ -107,6 +107,7 @@ class WatchSyncEngine:
             "errors": 0,
             "items_skipped_due_to_delta": 0,
             "shows_reused_from_snapshot": 0,
+            "shows_skipped_no_watch_state": 0,
             "shows_unreadable": 0,
         }
 
@@ -143,6 +144,8 @@ class WatchSyncEngine:
             "delta_mode": False,
             "items_skipped_due_to_delta": 0,
             "shows_reused_from_snapshot": 0,
+            "shows_skipped_no_watch_state": 0,
+            "shows_unreadable": 0,
             "plex_progress_updated": 0,
             "trakt_progress_updated": 0,
             "progress_conflicts": 0,
@@ -339,7 +342,8 @@ class WatchSyncEngine:
             shows_only: If True, only process shows/episodes
             since: Optional datetime to only fetch items changed since this time
             known_state: Watch state already pulled from Trakt, used to decide
-                whether the delta filter may skip an item (issue #19)
+                whether the delta filter may skip an item (issue #19) and
+                whether a show has nothing to transfer at all (issue #39)
 
         Returns:
             Dict mapping (media_type, imdb_id, tmdb_id) -> watch_info
@@ -397,12 +401,20 @@ class WatchSyncEngine:
                 shows_processed = 0
                 episodes_processed = 0
                 shows_reused = 0
+                shows_skipped = 0
 
-                # One cheap read of the show-level watch counters. A show's
-                # cached episodes may only be reused while these still match the
-                # counters they were read with; anything unread stays out of the
-                # mapping and is treated as changed (issue #21).
-                live_counters = self.plex.get_show_counters() if since else {}
+                # One cheap read of the show-level watch counters, on every kind
+                # of pull. A show's cached episodes may only be reused while
+                # these still match the counters they were read with, and the
+                # same counters say whether the show holds a watched episode at
+                # all; anything unread stays out of the mapping and is treated
+                # as changed (issues #21, #39). This costs one paged request per
+                # show section, against the one season request per show it saves.
+                live_counters = self.plex.get_show_counters()
+
+                # A show with a watched episode in Trakt needs its Plex episode
+                # rating keys to be pushable, so it is never skipped (#39).
+                trakt_watched_shows = self._trakt_shows_with_watched_episodes(known_state)
 
                 try:
                     for show_data in cache.get("shows_list", []):
@@ -412,6 +424,15 @@ class WatchSyncEngine:
 
                         # Get show's external ID from pre-built lookup
                         show_imdb = show_key_to_imdb.get(rating_key)
+
+                        # A show that neither platform reports a watched episode
+                        # for has nothing to transfer, so its seasons and
+                        # episodes are not read at all (issue #39).
+                        if self._show_has_no_watch_state(
+                            live_counters.get(rating_key), show_imdb, trakt_watched_shows
+                        ):
+                            shows_skipped += 1
+                            continue
 
                         # Delta runs reuse a show's cached episodes when Plex's
                         # counters say nothing in it changed, which is where the
@@ -482,9 +503,11 @@ class WatchSyncEngine:
                     self.plex.cache.flush_show_episodes()
 
                 self.stats["shows_reused_from_snapshot"] = shows_reused
+                self.stats["shows_skipped_no_watch_state"] = shows_skipped
                 logger.debug(
                     f"Processed {shows_processed} shows ({shows_reused} reused from cached "
-                    f"episode state) with {episodes_processed} episodes "
+                    f"episode state, {shows_skipped} skipped with no watch state) with "
+                    f"{episodes_processed} episodes "
                     f"({self.stats['items_skipped_due_to_delta']} skipped due to delta, "
                     f"{self.stats['shows_unreadable']} unreadable)"
                 )
@@ -492,6 +515,11 @@ class WatchSyncEngine:
                     logger.info(
                         f"Reused cached episode state for {shows_reused} of "
                         f"{shows_processed} show(s); no season or episode requests for them"
+                    )
+                if shows_skipped:
+                    logger.info(
+                        f"Skipped {shows_skipped} show(s) with no watched episode on "
+                        f"either platform; no season or episode requests for them"
                     )
 
             logger.info(f"Pulled {len(plex_state)} item(s) from Plex")
@@ -514,6 +542,59 @@ class WatchSyncEngine:
         """
         self.stats["shows_unreadable"] += 1
         logger.warning(f"Show '{show_data.get('title')}' left out of the watch pull: {error}")
+
+    @staticmethod
+    def _trakt_shows_with_watched_episodes(known_state) -> Optional[Set[Any]]:
+        """Collect the IMDb IDs of the shows Trakt reports a watched episode for.
+
+        Args:
+            known_state: Watch state already pulled from Trakt
+
+        Returns:
+            Set of show IMDb IDs, or None when the Trakt state was not supplied -
+            an unknown Trakt side can never justify skipping a show (issue #39)
+        """
+        if not isinstance(known_state, dict):
+            return None
+        return {
+            key[1]
+            for key in known_state
+            if isinstance(key, tuple) and key and key[0] == "episode" and key[1]
+        }
+
+    @classmethod
+    def _show_has_no_watch_state(cls, counters, show_imdb, trakt_watched_shows) -> bool:
+        """True when neither platform holds a watched episode for this show.
+
+        A full pull used to read the seasons and episodes of every show in the
+        library, so a first run, a cache reset and a backfill spent most of their
+        time discovering that a show has nothing to report (4,369 of 4,596 shows
+        on the owner's server, issue #39). Two cheap signals settle it: the
+        show's own counters, and the Trakt state pulled moments earlier.
+
+        The skip keeps the issue #19 rule - only an item the resolver would send
+        to ``no_action`` may be dropped - because both platforms report the show
+        as unwatched, so every episode of it resolves to ``no_action``. A show
+        Trakt has a watched episode for is never skipped: pushing it to Plex
+        needs the Plex rating keys a read would have collected.
+
+        Args:
+            counters: Counters read from Plex now, or None when unread
+            show_imdb: Show IMDb ID, or None
+            trakt_watched_shows: Show IMDb IDs with a watched episode in Trakt,
+                or None when the Trakt state is unknown
+
+        Returns:
+            True only when Plex's counters are complete enough to rule out a
+            watched episode and Trakt reports none either
+        """
+        if trakt_watched_shows is None:
+            return False
+        if not cls._counters_known(counters):
+            return False
+        if counters.get("viewedLeafCount"):
+            return False
+        return show_imdb not in trakt_watched_shows
 
     def _read_show_with_retry(
         self, rating_key, show_data, show_imdb, plex_state, since=None, known_state=None

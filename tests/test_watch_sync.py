@@ -2155,6 +2155,134 @@ class TestDeltaEpisodeReuse:
         assert replayed[("episode", "tt9000", 1, 1)]["watched"] is True
 
 
+class TestUnwatchedShowsAreNotRead:
+    """A show with no watched episode on either side is not read (#39).
+
+    A full pull used to read the seasons and episodes of every show in the
+    library, so a first run, a cache reset and a backfill spent most of their
+    time discovering that a show has nothing to report: 4,369 of the owner's
+    4,596 shows. The show's own counters and the Trakt state pulled moments
+    earlier settle it without a request.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _real_show_counters(self, sync_engine):
+        """Use the real counter reader, not an auto-created MagicMock."""
+        sync_engine.plex.show_counters.side_effect = PlexClient.show_counters
+
+    def _library(self, sync_engine, shows):
+        cache = {
+            "movies_by_imdb": {},
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+            "movies_list": [],
+            "shows_list": [{"ratingKey": rk, "title": f"Show {rk}"} for rk in shows],
+            "show_episodes": {},
+        }
+        store = _FakeEpisodeStore(memory_cache=cache)
+        sync_engine.plex.cache = store
+        sync_engine.plex.cache.movie_key_to_ids = {}
+        sync_engine.plex.cache.show_key_to_imdb = {rk: f"tt{rk}" for rk in shows}
+        sync_engine.plex._get_plex_item.side_effect = lambda rk: shows[rk]
+        sync_engine.plex.get_show_counters.side_effect = lambda: {
+            rk: PlexClient.show_counters(show) for rk, show in shows.items()
+        }
+        return store
+
+    @staticmethod
+    def _unwatched_show(rating_key):
+        """A show Plex reports as entirely unwatched, with three episodes."""
+        episodes = [_make_episode(rating_key * 10 + n, n, False) for n in (1, 2, 3)]
+        return _make_show(rating_key, 0, 3, None, [(1, episodes)])
+
+    def test_full_pull_reads_only_the_shows_with_watch_state(self, sync_engine):
+        """The DoD: 50 shows, 2 watched, and none of the other 48 read."""
+        watched = {1000: _wiki_show(1000), 1001: _wiki_show(1001)}
+        unwatched = {2000 + i: self._unwatched_show(2000 + i) for i in range(48)}
+        self._library(sync_engine, {**watched, **unwatched})
+
+        state = sync_engine._pull_from_plex(shows_only=True, since=None, known_state={})
+
+        assert {rk: show.seasons.call_count for rk, show in watched.items()} == {
+            1000: 1,
+            1001: 1,
+        }
+        assert {show.seasons.call_count for show in unwatched.values()} == {0}
+        # Only the watched shows contribute state: three episodes each.
+        assert len(state) == 6
+        assert sync_engine.stats["shows_skipped_no_watch_state"] == 48
+
+    def test_trakt_watched_episode_still_reads_the_show(self, sync_engine):
+        """A show watched only in Trakt is read, so its rating keys can be pushed."""
+        show = self._unwatched_show(3000)
+        self._library(sync_engine, {3000: show})
+        known_state = {
+            ("episode", "tt3000", 1, 1): {
+                "watched": True,
+                "last_watched_at": "2024-05-01T20:00:00.000Z",
+            }
+        }
+
+        state = sync_engine._pull_from_plex(shows_only=True, since=None, known_state=known_state)
+
+        assert show.seasons.call_count == 1
+        assert sync_engine.stats["shows_skipped_no_watch_state"] == 0
+        # The push to Plex needs the episode's Plex rating key, which only a
+        # read can supply.
+        assert state[("episode", "tt3000", 1, 1)]["rating_key"] == 30001
+
+    def test_missing_counters_read_the_show(self, sync_engine):
+        """Counters Plex did not report are no evidence, so the show is read."""
+        show = self._unwatched_show(4000)
+        self._library(sync_engine, {4000: show})
+        sync_engine.plex.get_show_counters.side_effect = lambda: {}
+
+        sync_engine._pull_from_plex(shows_only=True, since=None, known_state={})
+
+        assert show.seasons.call_count == 1
+        assert sync_engine.stats["shows_skipped_no_watch_state"] == 0
+
+    def test_unknown_trakt_state_reads_the_show(self, sync_engine):
+        """Without the Trakt pull the skip cannot be proven, so it is not made."""
+        show = self._unwatched_show(4100)
+        self._library(sync_engine, {4100: show})
+
+        sync_engine._pull_from_plex(shows_only=True)
+
+        assert show.seasons.call_count == 1
+        assert sync_engine.stats["shows_skipped_no_watch_state"] == 0
+
+    def test_delta_pull_after_cleared_snapshots_skips_unwatched_shows(self, sync_engine):
+        """A delta run with no snapshots still skips the shows with nothing to say."""
+        watched = _wiki_show(5000)
+        unwatched = self._unwatched_show(5001)
+        self._library(sync_engine, {5000: watched, 5001: unwatched})
+
+        state = sync_engine._pull_from_plex(
+            shows_only=True, since=datetime.now(timezone.utc), known_state={}
+        )
+
+        assert watched.seasons.call_count == 1
+        assert unwatched.seasons.call_count == 0
+        assert len(state) == 3
+        assert sync_engine.stats["shows_skipped_no_watch_state"] == 1
+
+    def test_skip_survives_a_sync_run(self, sync_engine):
+        """The counter is reset by sync_watched_status, so it must exist there."""
+        show = self._unwatched_show(6000)
+        self._library(sync_engine, {6000: show})
+        sync_engine.plex.get_show_counters.side_effect = lambda: {
+            6000: PlexClient.show_counters(show)
+        }
+        sync_engine.plex.cache.memory_cache["movies_list"] = []
+        sync_engine._apply_changes = MagicMock()
+
+        stats = sync_engine.sync_watched_status(shows_only=True)
+
+        assert stats["shows_skipped_no_watch_state"] == 1
+        assert show.seasons.call_count == 0
+
+
 class TestShowReadFailuresAreSurfaced:
     """A show that cannot be read must never look like an unwatched show (#22).
 
