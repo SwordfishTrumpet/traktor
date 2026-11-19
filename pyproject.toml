@@ -60,7 +60,7 @@ dev = [
     "pytest>=9.0",
     "black>=26.10.1",
     "ruff>=0.16.0",
-    "mypy>=2.1",
+    "mypy>=2.4.1",
     # Type stubs are a development-only concern; they used to sit in
     # [project].dependencies and were therefore installed in the runtime image.
     "types-psutil>=7.2.2.20260518",
