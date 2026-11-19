@@ -14,3 +14,4 @@
 37	uv run pytest -q tests/test_conflict_resolver.py tests/test_watch_sync.py -k "BothWatchedTimestampDivergence or WatchDatePropagation or WatchSyncIdempotency"	0	correctness
 21	uv run pytest -q tests/test_watch_sync.py tests/test_clients.py -k "DeltaEpisodeReuse or ShowCountersAndEpisodeSnapshots"	0	performance
 22	uv run pytest -q tests/test_watch_sync.py tests/test_sync.py -k "ShowReadFailuresAreSurfaced or failed_watch_sync"	0	reliability
+39	uv run pytest -q tests/test_watch_sync.py -k "UnwatchedShowsAreNotRead or DeltaEpisodeReuse"	0	performance
