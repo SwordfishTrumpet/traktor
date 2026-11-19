@@ -12,4 +12,4 @@
 25	uv run pytest -q tests/test_sync.py -k "official_lists_survive_auth_failure or auth_failure_still_exits"	0	reliability
 26	uv run pytest -q tests/test_sync.py tests/test_clients.py -k "own_lists or liked_source or owner_route or other_failures or nothing_to_add or costs_only_that_list or empty_items"	0	correctness
 37	uv run pytest -q tests/test_conflict_resolver.py tests/test_watch_sync.py -k "BothWatchedTimestampDivergence or WatchDatePropagation or WatchSyncIdempotency"	0	correctness
-38	uv run pytest -q tests/test_clients.py -k TraktResponseCounting	0	reliability
+21	uv run pytest -q tests/test_watch_sync.py tests/test_clients.py -k "DeltaEpisodeReuse or ShowCountersAndEpisodeSnapshots"	0	performance

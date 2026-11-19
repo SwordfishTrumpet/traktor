@@ -38,6 +38,18 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **A delta run no longer re-reads every show's episodes (issue #21)**
+  - The Plex pull now keeps each show's episode watch rows in the library cache, next to the
+    show counters they were read with (`viewedLeafCount`, `leafCount`, `lastViewedAt`). A delta
+    run reuses those rows while the counters are unchanged, and re-reads only the shows whose
+    counters moved. The state handed to the resolver is identical; only the requests are gone
+  - `PlexClient.get_show_counters()` reads the show level for the whole library (one paged read
+    per section, 52.9 s for 4,596 shows on the owner's server) instead of one `fetchItem` plus
+    roughly two season requests per show on every run
+  - A show whose read fails, or whose counters Plex does not report, has its snapshot dropped, so
+    a later run reads it again instead of trusting a partial read. `--backfill-history` still
+    reads every show
+
 - **A Plex→Trakt push keeps the Plex watch date (issue #37)**
   - `_apply_changes()` dropped the `watched_at` value the resolver had already attached to
     the change, so Trakt stamped every pushed play with the moment of the request. Movie and

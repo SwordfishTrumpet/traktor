@@ -164,6 +164,9 @@ class CacheManager:
         self._movie_key_to_ids: Optional[Dict[int, Tuple[Optional[str], Optional[str]]]] = None
         self._show_key_to_imdb: Optional[Dict[int, str]] = None
         self._movie_imdb_to_rating_key: Optional[Dict[str, int]] = None
+        # Set when a show's episode snapshot changed, so a pull that only reuses
+        # snapshots costs no cache write (issue #21)
+        self._show_episodes_dirty = False
 
     def _invalidate_reverse_indexes(self) -> None:
         """Drop lazily-built reverse indexes; rebuilt on next property access."""
@@ -194,6 +197,69 @@ class CacheManager:
                         ids_map[rating_key] = (None, tmdb_id)
             self._movie_key_to_ids = ids_map
         return self._movie_key_to_ids
+
+    def get_show_episodes(self, rating_key: Any) -> Optional[Dict[str, Any]]:
+        """Return the cached episode snapshot for a show, or None.
+
+        The snapshot holds the show's Plex watch counters at the moment its
+        episodes were read, plus one compact row per episode. A later pull may
+        reuse it only while those counters still match the live ones (issue #21).
+
+        Args:
+            rating_key: Plex rating key of the show
+
+        Returns:
+            Snapshot dict, or None when this show has never been read
+        """
+        snapshots = self.memory_cache.get("show_episodes") or {}
+        snapshot = snapshots.get(str(rating_key))
+        return snapshot if isinstance(snapshot, dict) else None
+
+    def record_show_episodes(
+        self,
+        rating_key: Any,
+        counters: Dict[str, Any],
+        episodes: List[List[Any]],
+    ) -> None:
+        """Store a show's episode rows next to the counters they were read with.
+
+        Args:
+            rating_key: Plex rating key of the show
+            counters: ``viewedLeafCount``, ``leafCount`` and ``lastViewedAt``
+            episodes: Rows of ``[season, number, rating_key, watched, lastViewedAt]``
+        """
+        snapshots = self.memory_cache.setdefault("show_episodes", {})
+        snapshots[str(rating_key)] = {
+            "viewedLeafCount": counters.get("viewedLeafCount"),
+            "leafCount": counters.get("leafCount"),
+            "lastViewedAt": counters.get("lastViewedAt"),
+            "episodes": episodes,
+        }
+        self._show_episodes_dirty = True
+
+    def forget_show_episodes(self, rating_key: Any) -> None:
+        """Drop a show's snapshot so the next pull reads it from Plex again.
+
+        Called when a show's episodes could not be read completely: a partial
+        snapshot would hide watch state on every later run (issue #21).
+
+        Args:
+            rating_key: Plex rating key of the show
+        """
+        snapshots = self.memory_cache.get("show_episodes") or {}
+        if snapshots.pop(str(rating_key), None) is not None:
+            self._show_episodes_dirty = True
+
+    def flush_show_episodes(self) -> None:
+        """Persist snapshot changes, if any. A pull that reuses them writes nothing."""
+        if not self._show_episodes_dirty:
+            return
+        self.save_cache()
+        self._show_episodes_dirty = False
+
+    def save_cache(self) -> None:
+        """Persist the in-memory cache to disk."""
+        self._save_cache()
 
     @property
     def show_key_to_imdb(self) -> Dict[int, str]:
@@ -332,6 +398,9 @@ class CacheManager:
                     self._build_cache()
                     return False
 
+                # Cache files written before issue #21 hold no episode snapshots
+                self.memory_cache.setdefault("show_episodes", {})
+
                 # Try incremental update if enabled
                 if incremental:
                     if self._incremental_cache_update():
@@ -438,6 +507,10 @@ class CacheManager:
         """Build cache by scanning all library items."""
         self._plex_objects.clear()
         self._invalidate_reverse_indexes()
+        # Episode snapshots survive a rebuild: they are keyed by rating key and
+        # validated against live counters before every reuse, so a library
+        # rescan does not have to re-read every season (issue #21).
+        existing_show_episodes = (self.memory_cache or {}).get("show_episodes") or {}
         self.memory_cache = {
             "movies_by_imdb": {},
             "movies_by_tmdb": {},
@@ -446,6 +519,7 @@ class CacheManager:
             "movies_list": [],
             "shows_list": [],
             "by_rating_key": {},  # O(1) lookup for watch status
+            "show_episodes": existing_show_episodes,
         }
 
         start_time = time.time()
@@ -1838,6 +1912,69 @@ class PlexClient:
                 f"Cached ratingKey {rating_key} could not be fetched (stale cache entry?): {e}"
             )
             return None
+
+    @staticmethod
+    def show_counters(show: Any) -> Dict[str, Any]:
+        """Read a show's watch counters, the cheap signal for episode reuse.
+
+        ``viewedLeafCount`` (watched episodes), ``leafCount`` (episodes present)
+        and ``lastViewedAt`` move whenever any episode's watch state changes: a
+        new watch raises the count and the timestamp, an un-watch lowers the
+        count, an added or removed episode moves ``leafCount`` (issue #21).
+
+        Args:
+            show: Plex show object
+
+        Returns:
+            Dict with the three counters, timestamps as ISO-8601 UTC or None
+        """
+        last_viewed = parse_timestamp(getattr(show, "lastViewedAt", None))
+        return {
+            "viewedLeafCount": getattr(show, "viewedLeafCount", None),
+            "leafCount": getattr(show, "leafCount", None),
+            "lastViewedAt": last_viewed.isoformat() if last_viewed else None,
+        }
+
+    def get_show_counters(self) -> Dict[int, Dict[str, Any]]:
+        """Read every show's watch counters, one paged request per section.
+
+        A delta pull needs a cheap, current signal for "did this show's episode
+        watch state change?" before it decides whether to read seasons and
+        episodes. This reads the show level only, which is what the library
+        rescan already does - about ten requests for a 4,600-show library,
+        instead of one request per show.
+
+        A section that cannot be read is left out of the result, so its shows
+        are treated as changed and re-read individually - never as unchanged.
+
+        Returns:
+            Dict mapping rating key -> counters from :meth:`show_counters`
+        """
+        counters: Dict[int, Dict[str, Any]] = {}
+        try:
+            sections = self.server.library.sections()
+        except Exception as e:
+            logger.warning(f"Could not list Plex library sections for show counters: {e}")
+            return counters
+
+        for section in sections:
+            if getattr(section, "type", None) != "show":
+                continue
+            try:
+                shows = section.all(container_size=CONTAINER_SIZE)
+            except Exception as e:
+                logger.warning(
+                    f"Could not read show counters from section "
+                    f"'{getattr(section, 'title', 'unknown')}': {e}"
+                )
+                continue
+            for show in shows:
+                rating_key = getattr(show, "ratingKey", None)
+                if rating_key:
+                    counters[rating_key] = self.show_counters(show)
+
+        logger.debug(f"Read watch counters for {len(counters)} show(s)")
+        return counters
 
     def _playlists_titled(self, name):
         """Return every playlist on the server whose title matches ``name``.

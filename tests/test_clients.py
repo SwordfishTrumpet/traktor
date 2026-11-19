@@ -1,6 +1,8 @@
 """Tests for clients module."""
 
+import gzip
 import json
+from datetime import datetime
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2055,3 +2057,135 @@ class TestTraktResponseCounting:
         # A bare list has no per-media split, so it is not counted twice
         assert result["added"] == {"movies": 0, "episodes": 0}
         assert result["not_found"] == {"movies": 1, "episodes": 0}
+
+
+class TestShowCountersAndEpisodeSnapshots:
+    """Issue #21: the cheap show-level signal and the snapshot store it feeds."""
+
+    @pytest.fixture
+    def cache_manager(self, tmp_path, monkeypatch):
+        cache_dir = tmp_path / ".traktor_cache"
+        cache_dir.mkdir()
+        monkeypatch.setattr(clients, "CACHE_DIR", cache_dir)
+        server = MagicMock()
+        server.library.sections.return_value = []
+        return clients.CacheManager(server)
+
+    @staticmethod
+    def _show(rating_key, watched=2, leaf=3, last_viewed=None):
+        show = MagicMock()
+        show.ratingKey = rating_key
+        show.viewedLeafCount = watched
+        show.leafCount = leaf
+        show.lastViewedAt = last_viewed
+        return show
+
+    def test_show_counters_normalizes_last_viewed(self):
+        """plexapi returns a naive datetime; the snapshot stores UTC ISO."""
+        counters = clients.PlexClient.show_counters(
+            self._show(1, 2, 3, datetime(2024, 6, 15, 12, 0, 0))
+        )
+
+        assert counters["viewedLeafCount"] == 2
+        assert counters["leafCount"] == 3
+        assert counters["lastViewedAt"].endswith("+00:00")
+        assert counters["lastViewedAt"].startswith("2024-06-15T12:00:00")
+
+    def test_show_counters_without_timestamp(self):
+        """A never-watched show reports None rather than a fake date."""
+        counters = clients.PlexClient.show_counters(self._show(1, 0, 3, None))
+
+        assert counters["lastViewedAt"] is None
+
+    def test_get_show_counters_reads_only_show_sections(self, cache_manager):
+        """One paged read per show section; movie sections are not touched."""
+        show_section = MagicMock()
+        show_section.type = "show"
+        show_section.title = "TV"
+        show_section.all.return_value = [self._show(700), self._show(701)]
+        movie_section = MagicMock()
+        movie_section.type = "movie"
+        movie_section.title = "Films"
+
+        server = MagicMock()
+        server.library.sections.return_value = [movie_section, show_section]
+        plex_client = clients.PlexClient(server, cache_manager)
+
+        counters = plex_client.get_show_counters()
+
+        assert set(counters) == {700, 701}
+        show_section.all.assert_called_once_with(container_size=clients.CONTAINER_SIZE)
+        movie_section.all.assert_not_called()
+
+    def test_get_show_counters_skips_an_unreadable_section(self, cache_manager):
+        """A failing section is left out, so its shows are re-read, not trusted."""
+        broken = MagicMock()
+        broken.type = "show"
+        broken.title = "Broken"
+        broken.all.side_effect = requests.exceptions.ReadTimeout("slow")
+        healthy = MagicMock()
+        healthy.type = "show"
+        healthy.title = "TV"
+        healthy.all.return_value = [self._show(700)]
+
+        server = MagicMock()
+        server.library.sections.return_value = [broken, healthy]
+        plex_client = clients.PlexClient(server, cache_manager)
+
+        counters = plex_client.get_show_counters()
+
+        assert set(counters) == {700}
+
+    def test_snapshot_roundtrip_and_flush(self, cache_manager):
+        """Rows and counters are readable back, and flush persists them."""
+        rows = [[1, 1, 7001, 1, "2024-05-01T20:00:00+00:00"]]
+        counters = {
+            "viewedLeafCount": 2,
+            "leafCount": 3,
+            "lastViewedAt": "2024-05-01T20:00:00+00:00",
+        }
+
+        cache_manager.record_show_episodes(700, counters, rows)
+
+        # Rating key works as int and as the JSON string
+        assert cache_manager.get_show_episodes(700)["episodes"] == rows
+        assert cache_manager.get_show_episodes("700")["viewedLeafCount"] == 2
+
+        cache_manager.flush_show_episodes()
+
+        with gzip.open(cache_manager.cache_file, "rt", encoding="utf-8") as f:
+            saved = json.load(f)
+        assert saved["show_episodes"]["700"]["episodes"] == rows
+
+    def test_flush_writes_nothing_when_no_snapshot_changed(self, cache_manager):
+        """A pull that only reuses snapshots costs no cache write."""
+        counters = {"viewedLeafCount": 1, "leafCount": 1, "lastViewedAt": None}
+        cache_manager.record_show_episodes(700, counters, [[1, 1, 7001, 1, None]])
+        cache_manager.flush_show_episodes()
+        cache_manager.cache_file.unlink()
+
+        cache_manager.flush_show_episodes()
+
+        assert not cache_manager.cache_file.exists()
+
+    def test_forget_drops_the_snapshot_and_marks_it_dirty(self, cache_manager):
+        """Forgetting a show persists the removal, not just the memory change."""
+        counters = {"viewedLeafCount": 1, "leafCount": 1, "lastViewedAt": None}
+        cache_manager.record_show_episodes(700, counters, [])
+        cache_manager.flush_show_episodes()
+
+        cache_manager.forget_show_episodes(700)
+
+        assert cache_manager.get_show_episodes(700) is None
+        cache_manager.flush_show_episodes()
+        with gzip.open(cache_manager.cache_file, "rt", encoding="utf-8") as f:
+            assert "700" not in json.load(f)["show_episodes"]
+
+    def test_snapshots_survive_a_cache_rebuild(self, cache_manager):
+        """A library rescan must not throw away every show's episode state."""
+        counters = {"viewedLeafCount": 1, "leafCount": 1, "lastViewedAt": None}
+        cache_manager.record_show_episodes(700, counters, [[1, 1, 7001, 1, None]])
+
+        cache_manager._build_cache()
+
+        assert cache_manager.get_show_episodes(700)["episodes"] == [[1, 1, 7001, 1, None]]
