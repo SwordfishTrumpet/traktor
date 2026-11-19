@@ -120,3 +120,22 @@ def parse_timestamp(value, tz_name: Optional[str] = None) -> Optional[datetime]:
         return None
     except (ValueError, TypeError, OverflowError):
         return None
+
+
+def format_trakt_timestamp(value) -> Optional[str]:
+    """Render a timestamp in the ISO-8601 UTC form the Trakt API expects.
+
+    Trakt accepts a per-item ``watched_at`` when history is written. Without
+    one it stamps the play with the moment of the request, which turns a sync
+    into fabricated watch dates (issue #37).
+
+    Args:
+        value: Timestamp as datetime, ISO string, or epoch int/float
+
+    Returns:
+        ``YYYY-MM-DDTHH:MM:SS.000Z`` in UTC, or None when unparseable
+    """
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        return None
+    return parsed.strftime("%Y-%m-%dT%H:%M:%S.000Z")

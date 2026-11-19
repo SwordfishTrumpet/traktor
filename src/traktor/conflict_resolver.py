@@ -7,9 +7,6 @@ from datetime import datetime
 from .log import logger
 from .utils import parse_timestamp
 
-# Default threshold in seconds for considering timestamps significantly different
-DEFAULT_TIMESTAMP_THRESHOLD_SECONDS = 60
-
 # Confidence scoring constants
 MAX_PLAY_COUNT_BONUS = 0.3
 PLAY_COUNT_BONUS_PER_DIFF = 0.1
@@ -77,25 +74,21 @@ class ConflictResolver:
         Returns:
             Action to take: 'push_to_trakt', 'push_to_plex', or 'no_action'
         """
+        # When both platforms agree on the watched state there is no state to
+        # apply, and timestamp divergence is not a change either: Plex cannot
+        # be handed a watch date, and re-adding a Trakt play to move its date
+        # fabricates a play and overwrites the real one. Pushing either way is
+        # also self-defeating - the push restamps the winner with "now", so the
+        # difference never closes and every run pushes the same items again
+        # (a permanently non-idempotent sync, issue #37).
+        if plex_watched == trakt_watched:
+            return "no_action"
+
         # Callers pass the platform's own serialized timestamps: an ISO-8601
-        # string from the Plex cache and from the Trakt API response. The
-        # both-watched branch below subtracts the two values, so normalize them
-        # here first - the same two lines resolve_with_context() already runs
-        # (issue #20).
+        # string from the Plex cache and from the Trakt API response. Normalize
+        # them here before the strategies compare them (issue #20).
         plex_ts = self._normalize_timestamp(plex_last_watched)
         trakt_ts = self._normalize_timestamp(trakt_last_watched)
-
-        # If states match, no action needed
-        if plex_watched == trakt_watched:
-            # But we might want to update timestamps
-            if plex_watched and trakt_watched:
-                # Both watched - check if timestamps differ significantly
-                if self._should_update_timestamp(plex_ts, trakt_ts):
-                    # Update the older one to match the newer timestamp
-                    if self._is_newer(plex_ts, trakt_ts):
-                        return "push_to_plex"  # Update Plex timestamp
-                    return "push_to_trakt"  # Update Trakt timestamp
-            return "no_action"
 
         # Apply resolution strategy
         if self.strategy == "newest_wins":
@@ -150,15 +143,9 @@ class ConflictResolver:
         Returns:
             Action to take: 'push_to_trakt', 'push_to_plex', or 'no_action'
         """
-        # If states match, check timestamps with timezone awareness
+        # Agreed states need no action - see resolve() for why timestamp
+        # divergence between two watched records is not a change.
         if plex_watched == trakt_watched:
-            if plex_watched and trakt_watched:
-                plex_ts = self._normalize_timestamp(plex_last_watched, plex_tz)
-                trakt_ts = self._normalize_timestamp(trakt_last_watched, trakt_tz)
-                if self._should_update_timestamp(plex_ts, trakt_ts):
-                    if self._is_newer(plex_ts, trakt_ts):
-                        return "push_to_plex"
-                    return "push_to_trakt"
             return "no_action"
 
         # Apply per-media-type rules
@@ -522,12 +509,7 @@ class ConflictResolver:
             trakt_effective_watched = True
 
         if plex_effective_watched == trakt_effective_watched:
-            # If effective states match, update timestamps if needed
-            if plex_effective_watched and trakt_effective_watched:
-                if self._should_update_timestamp(plex_ts, trakt_ts):
-                    if self._is_newer(plex_ts, trakt_ts):
-                        return "push_to_plex"
-                    return "push_to_trakt"
+            # Agreed states need no action - see resolve().
             return "no_action"
 
         # Use confidence scoring for the effective states
@@ -624,37 +606,3 @@ class ConflictResolver:
             UTC-aware datetime or None
         """
         return parse_timestamp(dt, tz_name=tz_name)
-
-    def _is_newer(self, dt1: datetime | None, dt2: datetime | None) -> bool:
-        """Check if dt1 is newer than dt2.
-
-        Returns True if dt1 is newer, False if dt2 is newer or equal.
-        Handles None values by treating None as "old".
-        """
-        if dt1 is None:
-            return False
-        if dt2 is None:
-            return True
-        return dt1 > dt2
-
-    def _should_update_timestamp(
-        self,
-        plex_last_watched: datetime | None,
-        trakt_last_watched: datetime | None,
-        threshold_seconds: int = DEFAULT_TIMESTAMP_THRESHOLD_SECONDS,
-    ) -> bool:
-        """Determine if timestamps differ enough to warrant an update.
-
-        Args:
-            plex_last_watched: Plex timestamp
-            trakt_last_watched: Trakt timestamp
-            threshold_seconds: Minimum difference in seconds to trigger update
-
-        Returns:
-            True if timestamps differ by more than threshold
-        """
-        if plex_last_watched is None or trakt_last_watched is None:
-            return False
-
-        diff = abs((plex_last_watched - trakt_last_watched).total_seconds())
-        return diff > threshold_seconds

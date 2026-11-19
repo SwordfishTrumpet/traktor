@@ -1687,3 +1687,167 @@ class TestBatchFailureSurfacing:
 
         assert len(sync_engine.history.state["synced_items"]) == 3
         assert sync_engine.stats["errors"] == 0
+
+
+class TestWatchDatePropagation:
+    """Plex->Trakt pushes must carry the Plex watch date (issue #37).
+
+    Trakt stamps a play with the moment of the request when ``watched_at`` is
+    omitted. Dropping the date turned each sync into a fabricated watch date
+    plus a duplicate play, and because the fabricated date is newer than Plex's
+    the resolver kept re-pushing the same items on every run.
+    """
+
+    def test_movie_push_carries_watched_at(self, sync_engine):
+        """The movie payload keeps the Plex lastViewedAt value."""
+        changes = {
+            "plex": {"mark_watched": [], "mark_unwatched": []},
+            "trakt": {
+                "mark_watched": [
+                    {
+                        "key": ("movie", "tt1234567", "12345"),
+                        "imdb_id": "tt1234567",
+                        "tmdb_id": "12345",
+                        "media_type": "movie",
+                        "title": "Test Movie",
+                        "watched_at": "2023-02-06T21:30:39.000Z",
+                    }
+                ],
+                "mark_unwatched": [],
+            },
+        }
+
+        sync_engine._apply_changes(changes)
+
+        payload = sync_engine.trakt.add_to_history.call_args.kwargs["movies"][0]
+        assert payload["watched_at"] == "2023-02-06T21:30:39.000Z"
+        assert payload["ids"] == {"imdb": "tt1234567", "tmdb": "12345"}
+
+    def test_movie_push_converts_datetime_watched_at(self, sync_engine):
+        """A datetime watch date is rendered as Trakt's ISO-8601 UTC form."""
+        watched_at = datetime(2026, 10, 26, 18, 30, 34, tzinfo=timezone.utc)
+        changes = {
+            "plex": {"mark_watched": [], "mark_unwatched": []},
+            "trakt": {
+                "mark_watched": [
+                    {
+                        "key": ("movie", "tt1234567", None),
+                        "imdb_id": "tt1234567",
+                        "tmdb_id": None,
+                        "media_type": "movie",
+                        "title": "Test Movie",
+                        "watched_at": watched_at,
+                    }
+                ],
+                "mark_unwatched": [],
+            },
+        }
+
+        sync_engine._apply_changes(changes)
+
+        payload = sync_engine.trakt.add_to_history.call_args.kwargs["movies"][0]
+        assert payload["watched_at"] == "2026-10-26T18:30:34.000Z"
+
+    def test_episode_push_carries_watched_at(self, sync_engine):
+        """The episode payload keeps the Plex lastViewedAt value too."""
+        changes = {
+            "plex": {"mark_watched": [], "mark_unwatched": []},
+            "trakt": {
+                "mark_watched": [
+                    {
+                        "key": ("episode", "tt1234567", 2, 5),
+                        "imdb_id": "tt1234567",
+                        "tmdb_id": None,
+                        "media_type": "episode",
+                        "title": "Test Show S02E05",
+                        "watched_at": "2024-01-02T20:00:00.000Z",
+                    }
+                ],
+                "mark_unwatched": [],
+            },
+        }
+
+        sync_engine._apply_changes(changes)
+
+        payload = sync_engine.trakt.add_to_history.call_args.kwargs["episodes"][0]
+        assert payload == {
+            "ids": {"imdb": "tt1234567"},
+            "season": 2,
+            "number": 5,
+            "watched_at": "2024-01-02T20:00:00.000Z",
+        }
+
+    def test_push_without_watch_date_omits_field(self, sync_engine):
+        """No watch date means no watched_at key (Trakt falls back to now)."""
+        changes = {
+            "plex": {"mark_watched": [], "mark_unwatched": []},
+            "trakt": {
+                "mark_watched": [
+                    {
+                        "key": ("movie", "tt1234567", None),
+                        "imdb_id": "tt1234567",
+                        "tmdb_id": None,
+                        "media_type": "movie",
+                        "title": "Test Movie",
+                        "watched_at": None,
+                    }
+                ],
+                "mark_unwatched": [],
+            },
+        }
+
+        sync_engine._apply_changes(changes)
+
+        payload = sync_engine.trakt.add_to_history.call_args.kwargs["movies"][0]
+        assert "watched_at" not in payload
+
+
+class TestWatchSyncIdempotency:
+    """A sync must produce no changes once both platforms agree (issue #37)."""
+
+    def test_both_watched_with_divergent_timestamps_yields_no_changes(self, sync_engine):
+        """Watched on both sides is not a change, whatever the dates say."""
+        plex_state = {
+            ("movie", "tt0071562", "240"): {
+                "watched": True,
+                "last_watched_at": "2024-04-20T20:54:27",
+                "rating_key": "12345",
+                "title": "The Godfather Part II",
+            }
+        }
+        trakt_state = {
+            ("movie", "tt0071562", "240"): {
+                "watched": True,
+                "last_watched_at": "2026-11-19T06:48:00.000Z",
+                "title": "The Godfather Part II",
+                "plays": 46,
+            }
+        }
+
+        changes = sync_engine._calculate_changes(plex_state, trakt_state, "both")
+
+        assert changes["plex"]["mark_watched"] == []
+        assert changes["trakt"]["mark_watched"] == []
+
+    def test_repeated_calculation_produces_no_new_changes(self, sync_engine):
+        """Resolving the same agreed state twice stays quiet (no ping-pong)."""
+        plex_state = {
+            ("episode", "tt1234567", 1, 1): {
+                "watched": True,
+                "last_watched_at": "2025-01-01T10:00:00",
+                "rating_key": "999",
+                "title": "Test Show S01E01",
+            }
+        }
+        trakt_state = {
+            ("episode", "tt1234567", 1, 1): {
+                "watched": True,
+                "last_watched_at": "2026-11-19T06:48:00.000Z",
+                "title": "Test Show S01E01",
+            }
+        }
+
+        for _ in range(3):
+            changes = sync_engine._calculate_changes(plex_state, trakt_state, "both")
+            assert changes["plex"]["mark_watched"] == []
+            assert changes["trakt"]["mark_watched"] == []
