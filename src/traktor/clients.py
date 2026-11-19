@@ -55,6 +55,58 @@ CONTAINER_SIZE = 500  # Items per page when fetching all library items
 DEFAULT_API_PAGE_SIZE = 100  # Default items per page for API requests
 DEFAULT_RECENTLY_ADDED_MAXRESULTS = 1000  # Max results for recentlyAdded API
 
+
+def count_trakt_items(value: Any) -> int:
+    """Count one field of a Trakt sync response.
+
+    Trakt reports ``added``/``deleted`` as a number but lists the offending
+    payloads in ``not_found`` (``{"movies": [...], "episodes": [...]}``).
+    Treating both shapes as a number raised ``TypeError: unsupported operand
+    type(s) for +: 'int' and 'list'`` whenever a batch contained anything Trakt
+    could not resolve, which aborted the response aggregation after the writes
+    had already been applied (issue #38).
+
+    Args:
+        value: A count, a list of payloads, or a missing field
+
+    Returns:
+        Number of items the field refers to
+    """
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value)
+    return 0
+
+
+def trakt_response_count(response_data: Any, section: str, field: str) -> int:
+    """Read one count out of a Trakt sync response, whatever shape it has.
+
+    The per-section block is normally a dict of counts, but the same field can
+    arrive as a payload list (``not_found``), or the whole block can be that
+    list. Reading it through this helper keeps every caller free of that
+    assumption (issue #38).
+
+    A bare list carries no per-media breakdown, so it counts 0 for every field:
+    reporting its length for both ``movies`` and ``episodes`` would count the
+    same items twice in a two-field aggregation.
+
+    Args:
+        response_data: Parsed response body
+        section: Section to read, e.g. ``added`` or ``not_found``
+        field: Field inside the section, e.g. ``movies``
+
+    Returns:
+        Number of items the field refers to, 0 when absent
+    """
+    if not isinstance(response_data, dict):
+        return 0
+    block = response_data.get(section)
+    if isinstance(block, dict):
+        return count_trakt_items(block.get(field))
+    return 0
+
+
 # HTTP status codes
 HTTP_OK = 200
 HTTP_UNAUTHORIZED = 401
@@ -1488,7 +1540,8 @@ class TraktClient:
 
                     data = response.json()
                     logger.info(
-                        f"Successfully processed movie batch: {data.get(success_key, {}).get('movies', 0)} movies"
+                        f"Successfully processed movie batch: "
+                        f"{trakt_response_count(data, success_key, 'movies')} movies"
                     )
                     all_responses.append(data)
 
@@ -1512,7 +1565,8 @@ class TraktClient:
 
                     data = response.json()
                     logger.info(
-                        f"Successfully processed episode batch: {data.get(success_key, {}).get('episodes', 0)} episodes"
+                        f"Successfully processed episode batch: "
+                        f"{trakt_response_count(data, success_key, 'episodes')} episodes"
                     )
                     all_responses.append(data)
 
@@ -1531,15 +1585,25 @@ class TraktClient:
                 )
             return None
 
-        # Combine results
+        # Combine results. Trakt answers with counts for what it processed and
+        # with payload lists for what it could not resolve, so every field is
+        # read through trakt_response_count().
         combined_result = {
             success_key: {
-                "movies": sum(r.get(success_key, {}).get("movies", 0) for r in all_responses),
-                "episodes": sum(r.get(success_key, {}).get("episodes", 0) for r in all_responses),
+                "movies": sum(
+                    trakt_response_count(r, success_key, "movies") for r in all_responses
+                ),
+                "episodes": sum(
+                    trakt_response_count(r, success_key, "episodes") for r in all_responses
+                ),
             },
             "not_found": {
-                "movies": sum(r.get("not_found", {}).get("movies", 0) for r in all_responses),
-                "episodes": sum(r.get("not_found", {}).get("episodes", 0) for r in all_responses),
+                "movies": sum(
+                    trakt_response_count(r, "not_found", "movies") for r in all_responses
+                ),
+                "episodes": sum(
+                    trakt_response_count(r, "not_found", "episodes") for r in all_responses
+                ),
             },
             # Per-batch failure information (issue #9): callers must surface these,
             # otherwise partial failures are invisible and drift goes unreconciled.
