@@ -1,5 +1,6 @@
 """Watch status synchronization engine."""
 
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
@@ -24,6 +25,16 @@ _SHOW_COUNTER_FIELDS = ("viewedLeafCount", "leafCount", "lastViewedAt")
 
 # A snapshot episode row is [season, number, rating_key, watched, lastViewedAt]
 _EPISODE_ROW_FIELDS = 5
+
+# A show whose read fails transiently is retried once before the pull gives up
+# (issue #22). One retry covers the read timeouts Plex actually returns; more
+# would just delay the report the owner needs.
+SHOW_READ_ATTEMPTS = 2
+SHOW_READ_RETRY_DELAY_SECONDS = 2.0
+
+# Transport errors that a retry can plausibly fix. requests covers plexapi's
+# ReadTimeout/ConnectionError, TimeoutError covers socket timeouts.
+_TRANSIENT_READ_ERRORS = (requests.exceptions.RequestException, TimeoutError)
 
 
 class WatchStatePullError(Exception):
@@ -96,6 +107,7 @@ class WatchSyncEngine:
             "errors": 0,
             "items_skipped_due_to_delta": 0,
             "shows_reused_from_snapshot": 0,
+            "shows_unreadable": 0,
         }
 
     def sync_watched_status(
@@ -417,86 +429,54 @@ class WatchSyncEngine:
                             )
                             continue
 
-                        # Read this show from Plex (full pull, changed show, or no
-                        # snapshot yet) and record what was read for later delta
-                        # runs.
+                        # Read this show from Plex (full pull, changed show, or
+                        # no snapshot yet) and record what was read for later
+                        # delta runs.
                         try:
-                            show_item = self.plex._get_plex_item(rating_key)
-                            if show_item and hasattr(show_item, "seasons"):
-                                shows_processed += 1
-                                show_rows: List[List[Any]] = []
-                                for season in show_item.seasons():
-                                    season_num = getattr(season, "seasonNumber", None)
-                                    if not season_num:
-                                        continue
-
-                                    # Process episodes in batches to limit memory
-                                    batch_episodes = []
-                                    batch_size = 50
-
-                                    if hasattr(season, "episodes"):
-                                        for episode in season.episodes():
-                                            batch_episodes.append(episode)
-
-                                            # Process batch when it reaches batch_size
-                                            if len(batch_episodes) >= batch_size:
-                                                show_rows.extend(
-                                                    self._process_episode_batch(
-                                                        batch_episodes,
-                                                        show_data,
-                                                        show_imdb,
-                                                        season_num,
-                                                        plex_state,
-                                                        since,
-                                                        known_state,
-                                                    )
-                                                )
-                                                episodes_processed += len(batch_episodes)
-                                                batch_episodes = []
-
-                                        # Process remaining episodes in batch
-                                        if batch_episodes:
-                                            show_rows.extend(
-                                                self._process_episode_batch(
-                                                    batch_episodes,
-                                                    show_data,
-                                                    show_imdb,
-                                                    season_num,
-                                                    plex_state,
-                                                    since,
-                                                    known_state,
-                                                )
-                                            )
-                                            episodes_processed += len(batch_episodes)
-
-                                counters = self.plex.show_counters(show_item)
-                                if not self._counters_known(counters):
-                                    # No usable counters from either read: keep no
-                                    # snapshot rather than an unusable one.
-                                    counters = live_counters.get(rating_key) or {}
-                                if self._counters_known(counters):
-                                    self.plex.cache.record_show_episodes(
-                                        rating_key, counters, show_rows
-                                    )
-                                else:
-                                    self.plex.cache.forget_show_episodes(rating_key)
-
+                            read = self._read_show_with_retry(
+                                rating_key, show_data, show_imdb, plex_state, since, known_state
+                            )
                         except (AttributeError, NotFound) as e:
-                            # Expected errors: show structure issues or missing
-                            # items. Drop the snapshot so the next run reads this
-                            # show again instead of trusting a partial read.
+                            # Plex says this show is gone or its structure is
+                            # unreadable. Not watch state we can transfer, but it
+                            # must be visible instead of looking unwatched (#22).
                             self.plex.cache.forget_show_episodes(rating_key)
-                            logger.debug(
-                                f"Could not process show episodes for {show_data.get('title')}: {e}"
-                            )
+                            self._record_unreadable_show(show_data, e)
                             continue
+                        except WatchStatePullError:
+                            # Never let a failed read pass for an unwatched show.
+                            self.plex.cache.forget_show_episodes(rating_key)
+                            raise
                         except Exception as e:
-                            # Unexpected errors should be logged as warnings
                             self.plex.cache.forget_show_episodes(rating_key)
-                            logger.warning(
-                                f"Unexpected error processing show {show_data.get('title')}: {e}"
+                            self._record_unreadable_show(show_data, e)
+                            raise WatchStatePullError(
+                                f"Could not read watch state for show "
+                                f"'{show_data.get('title')}': {e}"
+                            ) from e
+
+                        if read is None:
+                            # Plex no longer has this rating key (stale cache entry).
+                            self.plex.cache.forget_show_episodes(rating_key)
+                            self._record_unreadable_show(
+                                show_data, "not present in the Plex library"
                             )
                             continue
+
+                        show_rows, episodes_seen, item_counters = read
+                        shows_processed += 1
+                        episodes_processed += episodes_seen
+
+                        counters = item_counters
+                        if not self._counters_known(counters):
+                            # No usable counters from either read: keep no
+                            # snapshot rather than an unusable one.
+                            counters = live_counters.get(rating_key) or {}
+                        if self._counters_known(counters):
+                            self.plex.cache.record_show_episodes(rating_key, counters, show_rows)
+                        else:
+                            self.plex.cache.forget_show_episodes(rating_key)
+
                 finally:
                     # Persist once per pull, and only when something changed.
                     self.plex.cache.flush_show_episodes()
@@ -505,7 +485,8 @@ class WatchSyncEngine:
                 logger.debug(
                     f"Processed {shows_processed} shows ({shows_reused} reused from cached "
                     f"episode state) with {episodes_processed} episodes "
-                    f"({self.stats['items_skipped_due_to_delta']} skipped due to delta)"
+                    f"({self.stats['items_skipped_due_to_delta']} skipped due to delta, "
+                    f"{self.stats['shows_unreadable']} unreadable)"
                 )
                 if shows_reused:
                     logger.info(
@@ -516,10 +497,127 @@ class WatchSyncEngine:
             logger.info(f"Pulled {len(plex_state)} item(s) from Plex")
             return plex_state
 
+        except WatchStatePullError:
+            # Already carries the detail (and the show name) - see #22.
+            raise
         except Exception as e:
             # Never degrade to empty state - see WatchStatePullError docstring.
             logger.error(f"Failed to pull watch state from Plex: {e}", exc_info=True)
             raise WatchStatePullError(f"Failed to pull watch state from Plex: {e}") from e
+
+    def _record_unreadable_show(self, show_data, error) -> None:
+        """Count and name a show whose episode state could not be read (#22).
+
+        The show is left out of the state, which is indistinguishable from "no
+        episodes watched" unless it is reported, so it is counted in the run
+        statistics and logged by name at WARNING.
+        """
+        self.stats["shows_unreadable"] += 1
+        logger.warning(f"Show '{show_data.get('title')}' left out of the watch pull: {error}")
+
+    def _read_show_with_retry(
+        self, rating_key, show_data, show_imdb, plex_state, since=None, known_state=None
+    ):
+        """Read one show's episodes, retrying a transient failure once.
+
+        A read timeout used to leave the show out of the pull while the run
+        reported success, so watch state for it never transferred (issue #22).
+        One retry covers a slow server; if the failure persists the pull raises
+        and the run is recorded failed with the show named.
+
+        Args:
+            rating_key: Plex rating key of the show
+            show_data: Cache entry of the show
+            show_imdb: Show IMDb ID, used to build episode keys
+            plex_state: State dict being built
+            since: Delta window start
+            known_state: State already pulled from Trakt
+
+        Returns:
+            ``(rows, episodes_seen, counters)``, or None when Plex no longer has
+            the show
+
+        Raises:
+            WatchStatePullError: the read kept failing after the last attempt
+        """
+        last_error = None
+        for attempt in range(1, SHOW_READ_ATTEMPTS + 1):
+            try:
+                return self._read_show(
+                    rating_key, show_data, show_imdb, plex_state, since, known_state
+                )
+            except _TRANSIENT_READ_ERRORS as e:
+                last_error = e
+                if attempt < SHOW_READ_ATTEMPTS:
+                    logger.warning(
+                        f"Retrying show '{show_data.get('title')}' after a transient "
+                        f"Plex error (attempt {attempt}/{SHOW_READ_ATTEMPTS}): {e}"
+                    )
+                    time.sleep(SHOW_READ_RETRY_DELAY_SECONDS)
+
+        raise WatchStatePullError(
+            f"Could not read watch state for show '{show_data.get('title')}' after "
+            f"{SHOW_READ_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
+
+    def _read_show(
+        self, rating_key, show_data, show_imdb, plex_state, since=None, known_state=None
+    ):
+        """Read one show's seasons and episodes from Plex.
+
+        Returns:
+            ``(rows, episodes_seen, counters)`` for the episode snapshot, or None
+            when the show is not in the Plex library any more
+        """
+        show_item = self.plex._get_plex_item(rating_key)
+        if show_item is None or not hasattr(show_item, "seasons"):
+            return None
+
+        rows: List[List[Any]] = []
+        episodes_seen = 0
+        for season in show_item.seasons():
+            season_num = getattr(season, "seasonNumber", None)
+            if not season_num:
+                continue
+
+            # Process episodes in batches to limit memory
+            batch_episodes = []
+            batch_size = 50
+
+            if hasattr(season, "episodes"):
+                for episode in season.episodes():
+                    batch_episodes.append(episode)
+
+                    if len(batch_episodes) >= batch_size:
+                        rows.extend(
+                            self._process_episode_batch(
+                                batch_episodes,
+                                show_data,
+                                show_imdb,
+                                season_num,
+                                plex_state,
+                                since,
+                                known_state,
+                            )
+                        )
+                        episodes_seen += len(batch_episodes)
+                        batch_episodes = []
+
+                if batch_episodes:
+                    rows.extend(
+                        self._process_episode_batch(
+                            batch_episodes,
+                            show_data,
+                            show_imdb,
+                            season_num,
+                            plex_state,
+                            since,
+                            known_state,
+                        )
+                    )
+                    episodes_seen += len(batch_episodes)
+
+        return rows, episodes_seen, self.plex.show_counters(show_item)
 
     @staticmethod
     def _counters_known(counters) -> bool:

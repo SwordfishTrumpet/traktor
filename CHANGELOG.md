@@ -38,6 +38,14 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Fixed
 
+- **A show Plex cannot answer for no longer drops out of the watch sync silently (issue #22)**
+  - A transient read failure (timeout, connection reset) is retried once, 2 s apart. If the
+    retry fails too, the pull raises `WatchStatePullError` naming the show, the watch sync
+    reports the failure, and `_sync_lists()` returns 1 so the run is recorded failed instead of
+    succeeding with that show's watches missing
+  - A show Plex no longer has stays a skip, but is now counted (`stats["shows_unreadable"]`) and
+    logged by name at WARNING, so it cannot be mistaken for a show with nothing watched
+
 - **A delta run no longer re-reads every show's episodes (issue #21)**
   - The Plex pull now keeps each show's episode watch rows in the library cache, next to the
     show counters they were read with (`viewedLeafCount`, `leafCount`, `lastViewedAt`). A delta

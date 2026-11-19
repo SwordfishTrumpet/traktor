@@ -2119,12 +2119,13 @@ class TestDeltaEpisodeReuse:
             6000: PlexClient.show_counters(show)
         }
 
-        state = sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
+        with pytest.raises(watch_sync.WatchStatePullError) as excinfo:
+            sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
 
         assert "6000" in store.forgotten
         assert "6000" not in store.snapshots
-        assert state == {}
         assert store.flushes == 1
+        assert "Show 6000" in str(excinfo.value)
 
     def test_replay_matches_a_live_read_for_inconsistent_counters(self, sync_engine):
         """A replay must reproduce the live state even if Plex reports both.
@@ -2152,3 +2153,96 @@ class TestDeltaEpisodeReuse:
 
         assert replayed == live
         assert replayed[("episode", "tt9000", 1, 1)]["watched"] is True
+
+
+class TestShowReadFailuresAreSurfaced:
+    """A show that cannot be read must never look like an unwatched show (#22).
+
+    The pull used to log a warning per failing show and carry on, so eleven
+    shows could drop out of a run while the run recorded success.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_retry_sleep(self, monkeypatch):
+        monkeypatch.setattr(watch_sync, "SHOW_READ_RETRY_DELAY_SECONDS", 0)
+
+    def _engine_for(self, sync_engine, shows, imdb_by_key=None):
+        cache = {
+            "movies_by_imdb": {},
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+            "movies_list": [],
+            "shows_list": [{"ratingKey": rk, "title": f"Show {rk}"} for rk in shows],
+            "show_episodes": {},
+        }
+        store = _FakeEpisodeStore(memory_cache=cache)
+        sync_engine.plex.cache = store
+        sync_engine.plex.cache.movie_key_to_ids = {}
+        sync_engine.plex.cache.show_key_to_imdb = imdb_by_key or {}
+        sync_engine.plex.show_counters.side_effect = PlexClient.show_counters
+        sync_engine.plex.get_show_counters.side_effect = lambda: {}
+        return store
+
+    def test_transient_failure_is_retried_and_succeeds(self, sync_engine):
+        """One read timeout is retried, and the show's state still arrives."""
+        show = _wiki_show(8000)
+        self._engine_for(sync_engine, {8000: show}, {8000: "tt8000"})
+        sync_engine.plex._get_plex_item.side_effect = [
+            requests.exceptions.ReadTimeout("slow"),
+            show,
+        ]
+
+        state = sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
+
+        assert state[("episode", "tt8000", 1, 1)]["watched"] is True
+        assert state[("episode", "tt8000", 1, 3)]["watched"] is False
+        assert sync_engine.stats["shows_unreadable"] == 0
+
+    def test_timeout_after_the_retry_fails_the_pull(self, sync_engine):
+        """A second timeout raises, naming the show, instead of skipping it."""
+        show = _wiki_show(8100)
+        store = self._engine_for(sync_engine, {8100: show}, {8100: "tt8100"})
+        sync_engine.plex._get_plex_item.side_effect = requests.exceptions.ReadTimeout("still slow")
+
+        with pytest.raises(watch_sync.WatchStatePullError) as excinfo:
+            sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
+
+        assert "Show 8100" in str(excinfo.value)
+        assert "still slow" in str(excinfo.value)
+        assert "8100" in store.forgotten
+        # It was tried twice, not once
+        assert sync_engine.plex._get_plex_item.call_count == 2
+
+    def test_unexpected_error_fails_the_pull(self, sync_engine):
+        """An unexplained failure surfaces too, rather than dropping the show."""
+        self._engine_for(sync_engine, {8200: _wiki_show(8200)}, {8200: "tt8200"})
+        sync_engine.plex._get_plex_item.side_effect = ValueError("bad payload")
+
+        with pytest.raises(watch_sync.WatchStatePullError) as excinfo:
+            sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
+
+        assert "Show 8200" in str(excinfo.value)
+        assert "bad payload" in str(excinfo.value)
+
+    def test_show_gone_from_plex_is_counted_not_fatal(self, sync_engine):
+        """A stale cache entry must not fail every run, but must be visible."""
+        healthy = _wiki_show(8301)
+        self._engine_for(sync_engine, {8300: None, 8301: healthy}, {8300: "tt8300", 8301: "tt8301"})
+        sync_engine.plex._get_plex_item.side_effect = lambda rk: (None if rk == 8300 else healthy)
+
+        state = sync_engine._pull_from_plex(shows_only=True, since=datetime.now(timezone.utc))
+
+        assert sync_engine.stats["shows_unreadable"] == 1
+        assert ("episode", "tt8301", 1, 1) in state
+        assert not any(key[1] == "tt8300" for key in state)
+
+    def test_sync_reports_the_failure_instead_of_success(self, sync_engine):
+        """The failure reaches the caller, so the run is not recorded as a pass."""
+        self._engine_for(sync_engine, {8400: _wiki_show(8400)}, {8400: "tt8400"})
+        sync_engine.plex._get_plex_item.side_effect = requests.exceptions.ReadTimeout("slow")
+        sync_engine._apply_changes = MagicMock()
+
+        with pytest.raises(watch_sync.WatchStatePullError):
+            sync_engine.sync_watched_status()
+
+        sync_engine._apply_changes.assert_not_called()
