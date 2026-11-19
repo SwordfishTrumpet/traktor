@@ -1,4 +1,4 @@
-.PHONY: help install run dev test lint format clean
+.PHONY: help install run dev test lint typecheck format clean
 
 help:
 	@echo "Traktor - Trakt to Plex Playlist Sync"
@@ -9,6 +9,7 @@ help:
 	@echo "  make dev        - Install with dev dependencies"
 	@echo "  make test       - Run tests"
 	@echo "  make lint       - Run linter (ruff)"
+	@echo "  make typecheck  - Run the type checker (mypy)"
 	@echo "  make format     - Format code (black)"
 	@echo "  make clean      - Clean build artifacts"
 	@echo "  make setup      - Initial setup"
@@ -26,7 +27,10 @@ test:
 	uv run pytest
 
 lint:
-	uv run ruff check src/
+	uv run ruff check src/ tests/
+
+typecheck:
+	uv run mypy src/
 
 format:
 	uv run black src/
