@@ -464,7 +464,8 @@ class CacheManager:
             kept = [
                 item
                 for item in items
-                if isinstance(item, dict) and self.valid_rating_key(item.get("ratingKey")) is not None
+                if isinstance(item, dict)
+                and self.valid_rating_key(item.get("ratingKey")) is not None
             ]
             if len(kept) != len(items):
                 dropped += len(items) - len(kept)
