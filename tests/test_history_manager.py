@@ -285,18 +285,11 @@ class TestWatchHistoryManagerEdgeCases:
 
     def test_save_state_permission_error(self, mock_history_manager, monkeypatch):
         """Save failure is logged, not raised."""
-        import builtins
+        from unittest.mock import patch
 
-        real_open = builtins.open
-
-        def deny_write(*args, **kwargs):
-            if args and "w" in (args[1] if len(args) > 1 else kwargs.get("mode", "")):
-                raise PermissionError("denied")
-            return real_open(*args, **kwargs)
-
-        monkeypatch.setattr(builtins, "open", deny_write)
-        # Should not raise
-        mock_history_manager.save_state()
+        with patch("traktor.utils.os.replace", side_effect=PermissionError("denied")):
+            # Should not raise
+            mock_history_manager.save_state()
 
 
 def test_get_last_sync_timestamp_invalid_format(mock_history_manager, caplog):
@@ -343,17 +336,10 @@ def test_remove_synced_item_by_plex_rating_key(mock_history_manager):
 
 def test_backup_state_permission_error(mock_history_manager, tmp_path, monkeypatch):
     """Backup failure returns None without raising."""
-    import builtins
+    from unittest.mock import patch
 
-    real_open = builtins.open
-
-    def deny_write(*args, **kwargs):
-        if args and "w" in (args[1] if len(args) > 1 else kwargs.get("mode", "")):
-            raise PermissionError("denied")
-        return real_open(*args, **kwargs)
-
-    monkeypatch.setattr(builtins, "open", deny_write)
-    result = mock_history_manager.backup_state(tmp_path / "backup.json")
+    with patch("traktor.utils.os.replace", side_effect=PermissionError("denied")):
+        result = mock_history_manager.backup_state(tmp_path / "backup.json")
     assert result is None
 
 
@@ -441,3 +427,37 @@ class TestHistoryPruning:
         mock_history_manager.state["synced_items"][-1]["updated_at"] = "garbage"
 
         assert mock_history_manager.prune_synced_items(max_age_days=1) == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #23: an interrupted state save keeps the previous file
+# ---------------------------------------------------------------------------
+
+
+def test_interrupted_state_save_keeps_the_previous_file(temp_state_file, monkeypatch):
+    """A failed save must not empty the watch state (issue #23)."""
+    from unittest.mock import patch
+
+    manager = history_manager.WatchHistoryManager()
+    manager.state["synced_items"].append(
+        {
+            "media_type": "movie",
+            "imdb_id": "tt0113277",
+            "plex_rating_key": 42,
+            "trakt_id": 7,
+            "updated_at": datetime.now().isoformat(),
+        }
+    )
+    manager.save_state()
+    before = Path(temp_state_file).read_text(encoding="utf-8")
+    assert "tt0113277" in before
+
+    manager.state["synced_items"].append(
+        {"media_type": "movie", "imdb_id": "tt0000002", "plex_rating_key": 43}
+    )
+    with patch("traktor.utils.os.fsync", side_effect=OSError(28, "No space left on device")):
+        manager.save_state()
+
+    assert Path(temp_state_file).read_text(encoding="utf-8") == before
+    reloaded = history_manager.WatchHistoryManager()
+    assert [item["imdb_id"] for item in reloaded.state["synced_items"]] == ["tt0113277"]

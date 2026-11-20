@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from .log import logger
 from .settings import DATA_DIR, HISTORY_RETENTION_DAYS
+from .utils import write_json_atomic
 
 # Sync state file location
 WATCH_SYNC_FILE = DATA_DIR / ".traktor_watch_sync.json"
@@ -82,14 +83,15 @@ class WatchHistoryManager:
         return all(key in state for key in required_keys)
 
     def save_state(self):
-        """Save current sync state to disk."""
-        try:
-            self.sync_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.sync_file, "w") as f:
-                json.dump(self.state, f, indent=2)
+        """Save current sync state to disk.
+
+        The file is replaced atomically: an interrupted save used to leave it
+        empty, and the next run then started from an empty state (issue #23).
+        """
+        if write_json_atomic(self.sync_file, self.state):
             logger.debug(f"Saved watch sync state to {self.sync_file}")
-        except (PermissionError, FileNotFoundError, OSError) as e:
-            logger.error(f"Failed to save watch sync state: {e}")
+        else:
+            logger.error(f"Failed to save watch sync state: {self.sync_file}")
 
     def update_last_sync_timestamp(self):
         """Update the last sync timestamp to now."""
@@ -337,14 +339,11 @@ class WatchHistoryManager:
         if backup_path is None:
             backup_path = self.sync_file.with_suffix(".json.backup")
 
-        try:
-            with open(backup_path, "w") as f:
-                json.dump(self.state, f, indent=2)
+        if write_json_atomic(backup_path, self.state):
             logger.info(f"Created watch sync state backup: {backup_path}")
             return backup_path
-        except (PermissionError, FileNotFoundError, OSError) as e:
-            logger.error(f"Failed to create backup: {e}")
-            return None
+        logger.error(f"Failed to create backup: {backup_path}")
+        return None
 
     def restore_from_backup(self, backup_path=None):
         """Restore state from a backup file.

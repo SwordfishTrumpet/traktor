@@ -14,6 +14,7 @@ import requests
 from .log import logger
 from .settings import CACHE_DIR
 from .trakt_official import TraktOfficialClient
+from .utils import write_json_atomic
 
 
 class OfficialListsService:
@@ -99,12 +100,10 @@ class OfficialListsService:
             items: List of items to cache
         """
         cache_file = self._get_cache_file(endpoint_name)
-        try:
-            with open(cache_file, "w", encoding="utf-8") as f:
-                json.dump(items, f)
-            logger.debug(f"Saved {len(items)} items to cache for {endpoint_name}")
-        except (PermissionError, FileNotFoundError, OSError) as e:
-            logger.error(f"Failed to save cache for {endpoint_name}: {e}")
+        if not write_json_atomic(cache_file, items, indent=None):
+            logger.error(f"Failed to save cache for {endpoint_name}")
+            return
+        logger.debug(f"Saved {len(items)} items to cache for {endpoint_name}")
 
     def _load_stale_cache(self, endpoint_name: str) -> Optional[List[Dict]]:
         """Load stale cache as fallback when API request fails.
