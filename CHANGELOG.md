@@ -6,6 +6,8 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-11-20
+
 ### Added
 
 - **Your own Trakt lists can be synced now (issue #26)**
@@ -141,6 +143,78 @@ The format is based on Keep a Changelog and this project currently uses a simple
     triggering a full-history rewrite against Trakt while reporting success
   - Pull failures now raise `WatchStatePullError`; `sync_watched_status()` aborts before any
     change is applied, increments `errors`, and leaves `last_sync_timestamp` untouched
+
+### Releasing and rollback
+
+This release ships when the `v1.1.1` tag is pushed: `.github/workflows/release.yml` runs the
+tests, builds the wheel and sdist, publishes to PyPI and creates the GitHub Release from this
+section. PyPI does not allow a version to be unpublished, so the remedy for a bad release is to
+yank it and ship the next patch. That procedure is not documented yet - issue #72 tracks writing
+it down.
+
+### Every commit in this release
+
+- Format the batch with black so CI accepts it
+- Make the C-locale regression test decode non-ASCII bytes (#49)
+- Register the runnable reproductions for this batch (#23 through #59)
+- Document the Plex flag pair and the automatic token removal (#48, #44)
+- Ship a container that builds and a first-run example that syncs (#56, #57, #58)
+- Use the same config validation in --health-check (#47, #49, #59)
+- Report the same version that the package declares (#52)
+- Escape remote release text before printing it (#43)
+- Write the watch state and the official-list cache atomically (#23)
+- Verify a multi-file backup in a stable order and report the first health failure (#42, #59, #23)
+- Index the library once for suggestions and keep the auth code out of the log (#53, #45, #43, #54, #23)
+- Validate cached rating keys, drop revoked tokens, and stop repeating reads (#41, #44, #46, #50, #51, #54, #55, #23)
+- Reject a non-object config, partial Plex flags, and read the config as UTF-8 (#47, #48, #49, #23)
+- Add one atomic writer for state files and escape terminal control bytes (#23, #43)
+- Declare the lint and typecheck commands so the gate can run them (#39)
+- Skip shows with no watch state on either platform in the watch pull (#39)
+- Fail the run when a show's episode state cannot be read (#22)
+- bump ruff from 0.17.2 to 0.17.5
+- bump pytest from 9.1.1 to 9.2.0
+- Cache each show's episode watch state so a delta run stops re-reading the library (#21)
+- Count Trakt response fields that arrive as payload lists (#38)
+- Carry the watch date into Trakt and stop pushing agreed states (#37)
+- Call the list counts personal, since owned lists are not liked lists (#26)
+- Skip the create when a list has nothing to add (#26)
+- Read private lists through the owner route (#26)
+- bump mypy from 2.4.0 to 2.4.1
+- bump types-requests
+- bump actions/cache from 4 to 6 in /.github/workflows
+- bump actions/upload-artifact in /.github/workflows
+- bump codecov/codecov-action in /.github/workflows
+- bump actions/checkout from 4 to 7 in /.github/workflows
+- bump actions/setup-python from 5 to 7 in /.github/workflows
+- Sync your own lists, stop duplicate playlists, survive a bad token (#24, #25, #26)
+- Rewrite the README as a manual (#17)
+- Advertise bidirectional watch status in the README (#17)
+- Separate watch status from the list source in the README (#17)
+- Make the README read as a manual (#17)
+- Document the batch and register its reproductions (#13, #16, #17, #19, #20)
+- Say what the memory setting does instead of promising a ceiling (#16)
+- Report the real last-run outcome from /status (#13)
+- Stop watch sync aborting when both platforms watched a title (#20)
+- Stop losing watches the delta filter never saw (#19)
+- advisory floors, dev-only stubs, drop the Docker certifi hack
+- Make the documented official-list cache TTLs take effect (#15)
+- Fail closed when an interactive confirmation has no terminal (#14)
+- Restrict credential files to their owner (#12)
+- Refuse a backup manifest that names a path this build did not write (#11)
+- Require the OAuth state this login issued before accepting a code (#10)
+- Quote version variable in release notes extraction (SC2086)
+- Bound watch-history state growth with age-based pruning (#7 follow-up)
+- Bump CodeQL action to v4; add actionlint job to CI
+- Surface per-batch history failures; skip recording failed items (#9)
+- Fix Dependency Review workflow: PR-only trigger + required permissions
+- Make CI Bandit job gate on findings; resolve existing findings (#8)
+- Batch-persist watch history state; index rating-key lookups (#7)
+- Back up the live .env token store instead of the legacy token file (#6)
+- Include .json.gz library cache in integrity checks (#5)
+- Demote --undo to snapshot inspection; remove false restore claims (#4)
+- Fail closed on pre-sync prompts in non-interactive runs (#3)
+- Fix false 'Failed to process list' print on successful syncs (#2)
+- Propagate watch-state pull failures instead of degrading to empty state (#1)
 
 ## [1.1.0] - 2026-08-16
 

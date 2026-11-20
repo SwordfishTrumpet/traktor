@@ -389,6 +389,6 @@ uv run traktor -w 12
 
 ---
 
-**Document Version:** 1.0.0  
-**Last Updated:** 2026-04-19  
-**traktor Version:** 1.0.0+
+- **Document Version:** 1.1.1
+- **Last Updated:** 2026-11-20
+- **traktor Version:** 1.1.1+
