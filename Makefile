@@ -1,18 +1,19 @@
-.PHONY: help install run dev test lint typecheck format clean
+.PHONY: help install run dev test lint format-check format typecheck clean
 
 help:
 	@echo "Traktor - Trakt to Plex Playlist Sync"
 	@echo ""
 	@echo "Available commands:"
-	@echo "  make install    - Install dependencies with uv"
-	@echo "  make run        - Run the sync script"
-	@echo "  make dev        - Install with dev dependencies"
-	@echo "  make test       - Run tests"
-	@echo "  make lint       - Run linter (ruff)"
-	@echo "  make typecheck  - Run the type checker (mypy)"
-	@echo "  make format     - Format code (black)"
-	@echo "  make clean      - Clean build artifacts"
-	@echo "  make setup      - Initial setup"
+	@echo "  make install      - Install dependencies with uv"
+	@echo "  make run          - Run the sync script"
+	@echo "  make dev          - Install with dev dependencies"
+	@echo "  make test         - Run tests"
+	@echo "  make lint         - Run every check CI runs: formatting (black) and linter (ruff)"
+	@echo "  make format-check - Check formatting without changing files (black --check)"
+	@echo "  make typecheck    - Run the type checker (mypy)"
+	@echo "  make format       - Format code (black)"
+	@echo "  make clean        - Clean build artifacts"
+	@echo "  make setup        - Initial setup"
 
 install:
 	uv sync
@@ -21,13 +22,19 @@ run:
 	uv run traktor
 
 dev:
-	uv sync --extra dev
+	uv sync --group dev
 
 test:
 	uv run pytest
 
-lint:
+# `make lint` is the check CI runs, so a green local gate predicts a green CI:
+# the CI job fails a formatting difference, and `make lint` used to run ruff
+# only, so a batch could pass every local check and land red on main (issue #71).
+lint: format-check
 	uv run ruff check src/ tests/
+
+format-check:
+	uv run black --check src/ tests/
 
 typecheck:
 	uv run mypy src/

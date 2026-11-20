@@ -214,6 +214,65 @@ If only cache is corrupted (config and tokens are fine):
    uv run traktor --refresh-cache
    ```
 
+## Rolling back a release
+
+A release is a `v*` tag push: `.github/workflows/release.yml` tests the tagged tree, builds
+the wheel and sdist, and creates a GitHub Release with both files attached. That Release is
+the distribution channel - nothing is published to PyPI, so there is no package-index version
+to yank. "Roll back" therefore means one of three things. The maintainer (the person who cut
+the release) does it, and the deploy stage cites this section instead of inventing criteria.
+
+Before deciding, read what actually shipped:
+
+```bash
+gh release view "v$VERSION"            # notes, assets, tag
+gh run list --workflow Release --limit 5
+```
+
+### Case 1: the release notes are wrong
+
+The code and the artifacts are fine; only the description is not.
+
+1. Edit the release body: `gh release edit "v$VERSION" --notes-file NOTES.md`.
+2. Check it: `gh release view "v$VERSION"` shows the new body.
+
+Nothing else changes: the tag, the artifacts and the source stay as they are.
+
+### Case 2: the artifact is broken
+
+The notes and the source are right, but the wheel or sdist will not install, or holds the
+wrong files.
+
+1. Delete the release, keeping the tag: `gh release delete "v$VERSION"` (answer no to deleting
+the tag; if prompted, pass nothing - the tag stays).
+2. Re-run the workflow on the same tag from the Actions tab, or
+   `gh workflow run release.yml --ref "v$VERSION"`. It rebuilds from the tagged tree and
+   recreates the release.
+3. Verify: `gh release download "v$VERSION"`, then
+   `uv pip install --python /tmp/venv/bin/python dist/traktor-$VERSION-py3-none-any.whl` in a
+   scratch environment, and `uv run traktor --version`.
+
+**Never** move or re-point the tag, and never `--force` the push that created it: the tag is
+what makes the tarball auditable. If the tagged tree itself is wrong, that is case 3.
+
+### Case 3: the code is wrong
+
+A defect shipped in the release. The download must stop presenting it as current.
+
+1. Fix it on the default branch: revert the offending commit (`git revert <sha>`) or land a
+   fix, through the normal gate and merge. Never rewrite history on the default branch.
+2. Cut the next patch release: bump the version, add the `CHANGELOG.md` entry naming the
+   defect, then tag and push - that is the forward path, and it is the only way back to a
+   correct install for someone who already downloaded the broken release.
+3. Mark the old release: `gh release edit "v$VERSION" --notes-file NOTES.md` with a line at the
+   top saying which version supersedes it. Keep the release visible - deleting it hides the
+   fact that the version existed and leaves anyone holding it with no explanation.
+4. Verify: `gh release list` shows the new version as Latest, and the new notes name the
+   defect.
+
+In all three cases, record what happened in the next release's changelog entry, and check that
+the default branch is green: `gh run list --branch main --limit 3`.
+
 ## Monitoring & Alerting
 
 ### Recommended Metrics

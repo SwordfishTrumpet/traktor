@@ -33,7 +33,7 @@ Thank you for your interest in contributing to traktor! This document provides g
 
 3. Install dependencies:
    ```bash
-   uv sync --extra dev
+   uv sync --group dev
    ```
 
 4. Create your environment configuration:

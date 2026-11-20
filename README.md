@@ -304,7 +304,7 @@ Trakt publishes algorithmic lists (trending, popular, most played, box office, a
 
 This choice decides which playlists get built and nothing else: watch status reads your Trakt history and your Plex library, and works the same whichever source you pick. A list whose name is in `blacklisted_lists` is skipped from every source, and `own` needs the lists to carry a Trakt list ID, which lists created on trakt.tv always do.
 
-Official lists can be narrowed with `--official-endpoints` and widened across periods with `--official-periods`. `--official-playlist-mode=separate` (the default) writes one playlist per endpoint and period; `merged` combines them by media type, which keeps the playlist count down.
+Official lists can be narrowed with `--official-endpoints` and widened across periods with `--official-periods`. `--official-playlist-mode=separate` (the default) writes one playlist per endpoint and period; `merged` combines them by media type, which keeps the playlist count down. The cache is kept per period for the endpoints that take one (`played`, `watched`, `collected`), so asking for weekly and monthly fetches both instead of serving the weekly answer twice.
 
 ## 14. Matching by ID
 
@@ -331,7 +331,7 @@ For every item on either side, traktor asks: what does Plex say, what does Trakt
 
 Repeated runs are cheap because of a delta window: the run only considers items changed since the last sync ended. That window never loses a change, because the filter skips an item only when the other platform already holds the same state. Films are always checked against Trakt's full watched list, and episodes carry their own view count and timestamp. A first run, a backfill and a run after a cleared cache are cheap for the same reason in reverse: traktor reads a show's seasons and episodes only when that show has something to transfer, so a show with no watched episode on either side costs one counter read instead of one request per season. A show Trakt reports a watched episode for is always read, because marking that episode in Plex needs its Plex rating key.
 
-What traktor keeps for itself lives in `~/.traktor_watch_sync.json`: which items it has already synced and when the last run ended. Entries older than `TRAKTOR_HISTORY_RETENTION_DAYS` (180 by default) are pruned. Nothing is lost by pruning, because every decision is made from the live platform data, not from that file.
+What traktor keeps for itself lives in `~/.traktor_watch_sync.json`: which items it has already synced and when the last run ended. Entries older than `TRAKTOR_HISTORY_RETENTION_DAYS` (180 by default) are pruned on every run, including a run that changes nothing, and an entry with no usable timestamp at all is treated as over-age: retention is the promise, so undatable bookkeeping does not get to stay for ever. Nothing is lost by pruning, because every decision is made from the live platform data, not from that file. Two runs that overlap do not erase each other's rows: each save merges with what is on disk under a lock, keeping the newer entry.
 
 ## 17. When a pull fails
 
@@ -486,7 +486,7 @@ The report is the fastest way to fix a short playlist: it says whether the probl
 
 The log file rotates at 5 MB and keeps five files. `--verbose` sends debug lines to the console too, and `--structured-logging` writes the file as JSON with correlation IDs while the console stays readable.
 
-`--serve-health` starts an HTTP server for a container probe:
+`--serve-health` starts an HTTP server for a container probe. It reports the same components as `--health-check` - the cache directory and the config file - so a probe fails on the thing a sync would fail on:
 
 | Endpoint | Answers |
 |----------|---------|
@@ -579,7 +579,7 @@ uv run mypy src/
 uv run black src/ tests/
 ```
 
-`make test`, `make lint` and `make format` wrap the same commands. The Python floor is 3.10.
+`make test`, `make lint` and `make format` wrap the same commands. `make lint` is the check CI runs: formatting (`black --check`, also available alone as `make format-check`) and the linter (`ruff`), so a green local run predicts a green CI job. The Python floor is 3.10.
 
 ## 31. Repository layout
 

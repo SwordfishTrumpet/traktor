@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 import requests
 
-from .config import load_config
+from .config import load_config, resolve_plex_credentials
 from .log import logger
 from .settings import (
     CACHE_DIR,
@@ -134,7 +134,7 @@ class DiagnoseCommand:
                     f"Optional: {description}",
                     "warn",
                     f"{module_name} not installed",
-                    suggestions=["Install dev dependencies: uv sync --extra dev"],
+                    suggestions=["Install dev dependencies: uv sync --group dev"],
                 )
 
         # Platform info
@@ -184,28 +184,37 @@ class DiagnoseCommand:
                 ],
             )
 
-        # Check Plex credentials from environment
-        plex_url = os.getenv("PLEX_URL")
-        plex_token = os.getenv("PLEX_TOKEN")
+        # Resolve Plex credentials the way the sync does: environment first,
+        # then the credentials a previous interactive run saved. Reading only
+        # the environment told a working install its credentials were missing
+        # and skipped the Plex checks entirely (issue #62).
+        try:
+            plex_url, plex_token = resolve_plex_credentials()
+            credentials_error = None
+        except ValueError as e:
+            plex_url, plex_token = None, None
+            credentials_error = str(e)
 
-        if plex_url and plex_token:
+        if credentials_error:
             self._add_result(
-                "Plex Credentials (Environment)",
-                "pass",
-                "PLEX_URL and PLEX_TOKEN are set",
-            )
-        elif plex_url or plex_token:
-            self._add_result(
-                "Plex Credentials (Environment)",
+                "Plex Credentials",
                 "fail",
-                "Only one Plex credential set in environment",
-                suggestions=["Set both PLEX_URL and PLEX_TOKEN, or neither (to use saved config)"],
+                credentials_error,
+                suggestions=[
+                    "Set both PLEX_URL and PLEX_TOKEN, or neither (to use saved config)",
+                ],
+            )
+        elif plex_url and plex_token:
+            self._add_result(
+                "Plex Credentials",
+                "pass",
+                f"Resolved for {plex_url} (environment, flags or saved config)",
             )
         else:
             self._add_result(
-                "Plex Credentials (Environment)",
+                "Plex Credentials",
                 "warn",
-                "Plex credentials not in environment (will use saved config or prompt)",
+                "No Plex credentials configured (will prompt on first run)",
                 suggestions=[
                     "Set PLEX_URL and PLEX_TOKEN in .env file for convenience",
                     "Or run interactively to save credentials",
@@ -317,9 +326,11 @@ class DiagnoseCommand:
                 "Skipped (no TRAKT_CLIENT_ID set)",
             )
 
-        # Check Plex connectivity if credentials available
-        plex_url = os.getenv("PLEX_URL")
-        plex_token = os.getenv("PLEX_TOKEN")
+        # Check Plex connectivity with the credentials the sync would use
+        try:
+            plex_url, plex_token = resolve_plex_credentials()
+        except ValueError:
+            plex_url, plex_token = None, None
 
         if plex_url:
             try:
@@ -376,7 +387,7 @@ class DiagnoseCommand:
             self._add_result(
                 "Plex Server Connectivity",
                 "warn",
-                "Skipped (no PLEX_URL set)",
+                "Skipped (no Plex credentials configured)",
             )
 
     def _check_plex_user_permissions(self, plex_url: str, plex_token: str):
@@ -435,9 +446,11 @@ class DiagnoseCommand:
         """Check for common configuration issues."""
         print("\n🔎 Checking for common issues...")
 
-        # Check if running in non-interactive mode without saved credentials
-        plex_url = os.getenv("PLEX_URL")
-        plex_token = os.getenv("PLEX_TOKEN")
+        # Check if running in non-interactive mode without usable credentials
+        try:
+            plex_url, plex_token = resolve_plex_credentials()
+        except ValueError:
+            plex_url, plex_token = None, None
 
         if not sys.stdin.isatty():
             issues = []
