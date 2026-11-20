@@ -1,5 +1,9 @@
 services:
   traktor:
+    # `build: .` is what makes `docker compose build` produce the image named
+    # below; with only an image name, compose reported "No services to build"
+    # and the run step failed with "No such image" (issue #57).
+    build: .
     image: traktor:test
     container_name: traktor
     

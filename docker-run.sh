@@ -64,7 +64,7 @@ case "${1:-}" in
     clean)
         echo "Cleaning up Docker resources..."
         $COMPOSE_CMD down
-        docker rmi traktor-traktor 2>/dev/null || true
+        docker rmi traktor:test 2>/dev/null || true
         echo -e "${YELLOW}Note: data/ directory was not removed.${NC}"
         ;;
     *)

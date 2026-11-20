@@ -17,7 +17,10 @@ ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
 ENV CERTIFI_CERTIFICATE=/etc/ssl/certs/ca-certificates.crt
 
 # Copy project files
+# uv.lock is copied too: the install step below runs `uv sync --frozen`, which
+# aborts when the lock file is missing from the build context (issue #56).
 COPY pyproject.toml ./
+COPY uv.lock ./
 COPY README.md ./
 COPY src/ ./src/
 
