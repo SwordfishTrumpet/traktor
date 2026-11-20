@@ -266,13 +266,15 @@ def test_load_config_reads_utf8_under_a_c_locale(tmp_path):
 
     target = tmp_path / "config.json"
     payload = {"managed_playlists": ["Café", "日本語"]}
-    target.write_text(json.dumps(payload), encoding="utf-8")
+    target.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
     src_root = Path(__file__).resolve().parents[1] / "src"
     env = {
         **os.environ,
         "LC_ALL": "C",
         "LANG": "C",
+        # LC_CTYPE wins over LC_ALL/LANG for the file encoding on some systems.
+        "LC_CTYPE": "C",
         "PYTHONUTF8": "0",
         "PYTHONCOERCECLOCALE": "0",
         "PYTHONPATH": str(src_root),
