@@ -1,7 +1,20 @@
 """Tests for utils module."""
 
+import json
+from unittest.mock import patch
+
+import pytest
+
 import traktor.utils as utils
-from traktor.utils import normalize_tmdb_id, parse_timestamp, restrict_to_owner
+from traktor.utils import (
+    normalize_tmdb_id,
+    parse_timestamp,
+    restrict_to_owner,
+    sanitize_terminal_text,
+    write_bytes_atomic,
+    write_json_atomic,
+    write_text_atomic,
+)
 
 
 class TestNormalizeTmdbId:
@@ -166,3 +179,60 @@ class TestRestrictToOwnerPermissions:
 
         monkeypatch.setattr(utils.os, "chmod", deny_chmod)
         assert restrict_to_owner(target) is False
+
+
+class TestAtomicWrites:
+    """A save must never destroy what it was replacing (issue #23)."""
+
+    def test_write_bytes_atomic_replaces_the_file(self, tmp_path):
+        target = tmp_path / "state.json"
+        target.write_text("old", encoding="utf-8")
+
+        assert write_bytes_atomic(target, b"new") is True
+        assert target.read_bytes() == b"new"
+
+    def test_failed_write_keeps_the_previous_content(self, tmp_path):
+        target = tmp_path / "state.json"
+        target.write_text("good content", encoding="utf-8")
+
+        with patch.object(utils.os, "fsync", side_effect=OSError(28, "No space left on device")):
+            assert write_bytes_atomic(target, b"half-written") is False
+
+        assert target.read_text(encoding="utf-8") == "good content"
+        assert list(tmp_path.glob(".state.json.*.tmp")) == []
+
+    def test_write_json_atomic_round_trips(self, tmp_path):
+        target = tmp_path / "nested" / "config.json"
+
+        assert write_json_atomic(target, {"a": [1, 2]}) is True
+        assert json.loads(target.read_text(encoding="utf-8")) == {"a": [1, 2]}
+
+    def test_write_text_atomic_keeps_requested_mode(self, tmp_path):
+        target = tmp_path / ".env"
+
+        assert write_text_atomic(target, "TOKEN=1\n", mode=0o600) is True
+        assert (target.stat().st_mode & 0o777) == 0o600
+
+
+class TestSanitizeTerminalText:
+    """Remote text is displayed, never obeyed (issue #43)."""
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "\x1b]52;c;Y2xpcGJvYXJkLXN0ZWFs\x07",
+            "line\rforged",
+            "\x9b2Jcleared",
+        ],
+    )
+    def test_control_bytes_are_escaped(self, payload):
+        rendered = sanitize_terminal_text(payload)
+
+        assert "\\x" in rendered
+        assert not any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in rendered)
+
+    def test_plain_text_and_newlines_survive(self):
+        assert sanitize_terminal_text("notes\nsecond line") == "notes\nsecond line"
+
+    def test_none_renders_as_empty(self):
+        assert sanitize_terminal_text(None) == ""

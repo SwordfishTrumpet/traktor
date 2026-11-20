@@ -1,10 +1,16 @@
 """Shared utility functions for traktor."""
 
 import importlib.util
+import json
 import os
+import re
 import stat
+import tempfile
 from datetime import datetime, timezone
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
+
+from .log import logger
 
 # zoneinfo is available in Python 3.9+; find_spec guard provides a fallback
 # without try/except import redefinition issues flagged by mypy.
@@ -27,6 +33,109 @@ def normalize_tmdb_id(tmdb_id):
     if tmdb_id is None:
         return None
     return str(tmdb_id) if tmdb_id else None
+
+
+# Control characters a terminal acts on: carriage return, escape, backspace and
+# the C1 range. Only tab and newline are left alone, because a report
+# legitimately carries them.
+TERMINAL_CONTROL_CHARS = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def sanitize_terminal_text(value: Any) -> str:
+    """Render remote text so a terminal can only display it, never obey it.
+
+    A release body, a URL or a Trakt list name is written by somebody else. An
+    escape byte in it can move the cursor, clear the screen or set the
+    clipboard, and a carriage return can overwrite the line the user is reading,
+    so every control character is turned into a visible ``\\x1b``-style escape
+    (issue #43).
+
+    Args:
+        value: Text to render; ``None`` becomes the empty string
+
+    Returns:
+        The text with every control character escaped
+    """
+    text = "" if value is None else str(value)
+    return TERMINAL_CONTROL_CHARS.sub(lambda match: f"\\x{ord(match.group()):02x}", text)
+
+
+def write_bytes_atomic(path, payload: bytes, mode: Optional[int] = None) -> bool:
+    """Replace a file's content without ever exposing a partial file (issue #23).
+
+    The bytes go to a temporary file in the target's own directory, are flushed
+    to disk, and are then renamed over the target. A crash, a full disk or a
+    concurrent reader therefore sees either the old file or the new one: opening
+    the destination for writing used to empty it first, so a failed dump left
+    the state file, the cache, the config or the ``.env`` token store truncated.
+
+    Args:
+        path: Destination path; its directory is created when missing
+        payload: Bytes to write
+        mode: Optional permission bits for the new file (the temporary file is
+            created 0600, which is kept when ``mode`` is None)
+
+    Returns:
+        True when the file was replaced, False when the write failed
+    """
+    target = Path(path)
+    tmp_name: Optional[str] = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp"
+        )
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if mode is not None:
+            os.chmod(tmp_name, mode)
+        os.replace(tmp_name, target)
+        tmp_name = None
+        return True
+    except OSError as e:
+        logger.error(f"Failed to write {target}: {e}")
+        return False
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError as e:
+                # Leaving no trace is how a failure hides: say where it was.
+                logger.debug(f"Could not remove temporary file {tmp_name}: {e}")
+
+
+def write_text_atomic(path, text: str, encoding: str = "utf-8", mode: Optional[int] = None) -> bool:
+    """Write text to a file through :func:`write_bytes_atomic`.
+
+    Args:
+        path: Destination path
+        text: Text to write
+        encoding: Encoding used to turn the text into bytes
+        mode: Optional permission bits for the new file
+
+    Returns:
+        True when the file was replaced, False when the write failed
+    """
+    return write_bytes_atomic(path, text.encode(encoding), mode=mode)
+
+
+def write_json_atomic(
+    path, data: Any, indent: Optional[int] = 2, mode: Optional[int] = None
+) -> bool:
+    """Serialize ``data`` as JSON and write it through :func:`write_text_atomic`.
+
+    Args:
+        path: Destination path
+        data: JSON-serializable value
+        indent: Indentation passed to ``json.dumps``
+        mode: Optional permission bits for the new file
+
+    Returns:
+        True when the file was replaced, False when the write failed
+    """
+    return write_text_atomic(path, json.dumps(data, indent=indent), mode=mode)
 
 
 def restrict_to_owner(path) -> bool:
