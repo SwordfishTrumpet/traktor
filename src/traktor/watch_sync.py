@@ -262,6 +262,9 @@ class WatchSyncEngine:
 
             # Update sync timestamp
             if not dry_run:
+                # Prune before this save too: _apply_changes() may not have run
+                # (a dry run) and the run still persists state (issue #69).
+                self.history.prune_synced_items()
                 self.history.update_last_sync_timestamp()
 
             # Log final summary
@@ -1160,10 +1163,11 @@ class WatchSyncEngine:
                     watched_plex=update["watched"],
                 )
         finally:
-            if plex_items_to_update:
-                # Prune stale entries before the batch persist (issue #7 follow-up)
-                self.history.prune_synced_items()
-                self.history.save_state()
+            # Prune stale entries before every persist, not only when Plex items
+            # changed (issue #69): a settled library - the state a converged sync
+            # reaches - is exactly when expired entries used to survive for ever.
+            self.history.prune_synced_items()
+            self.history.save_state()
 
         # Apply Trakt changes in batches
         movies_to_add = []

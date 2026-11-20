@@ -96,13 +96,17 @@ class TestGetCurrentMemoryUsage:
                     assert result == 1024.0
 
     def test_get_memory_usage_psutil_not_installed_macos(self):
-        """Test memory usage fallback on macOS without psutil."""
+        """macOS reports ru_maxrss in bytes, so 512 MB stays 512 MB (issue #63).
+
+        This test used to feed a kilobyte count to the darwin branch and assert
+        the same number back, which is what pinned the 1024x error in place.
+        """
         manager = ResourceManager()
-        with patch.object(sys, "platform", "darwin"):
+        with patch("traktor.utils.sys.platform", "darwin"):
             with patch("traktor.resource_manager.psutil", None):
                 with patch("traktor.resource_manager.resource") as mock_resource:
                     mock_usage = MagicMock()
-                    mock_usage.ru_maxrss = 512 * KB_PER_MB  # KB
+                    mock_usage.ru_maxrss = 512 * 1024 * 1024  # bytes on macOS
                     mock_resource.getrusage.return_value = mock_usage
                     result = manager.get_current_memory_usage_mb()
                     assert result == 512.0
@@ -226,3 +230,58 @@ class TestConstants:
     def test_cpu_throttle_interval_ms(self):
         """Test CPU_THROTTLE_INTERVAL_MS constant."""
         assert CPU_THROTTLE_INTERVAL_MS == 100
+
+
+# ---------------------------------------------------------------------------
+# Issue #63: the macOS fallback reported bytes as if they were kilobytes
+# ---------------------------------------------------------------------------
+
+
+def test_darwin_rusage_is_bytes_not_kilobytes(monkeypatch):
+    """300 MB resident reports as 300 MB on macOS, not 307200 MB (#63)."""
+
+    class FakeUsage:
+        ru_maxrss = 314572800  # 300 MB in bytes, the documented macOS contract
+
+    import traktor.resource_manager as resource_manager_module
+
+    monkeypatch.setattr(resource_manager_module.sys, "platform", "darwin")
+    monkeypatch.setattr(resource_manager_module, "resource", type("R", (), {})())
+    monkeypatch.setattr(
+        resource_manager_module.resource, "getrusage", lambda who: FakeUsage(), raising=False
+    )
+    monkeypatch.setattr(resource_manager_module.resource, "RUSAGE_SELF", 0, raising=False)
+    monkeypatch.setattr(resource_manager_module, "psutil", None)
+
+    manager = resource_manager_module.ResourceManager(max_memory_mb=512)
+
+    assert manager.get_current_memory_usage_mb() == 300.0
+    assert manager.check_memory_usage() is True
+
+
+def test_both_memory_surfaces_agree_on_the_same_figure(monkeypatch):
+    """The resource manager and the performance monitor share one converter (#63)."""
+
+    class FakeUsage:
+        ru_maxrss = 314572800
+
+    import traktor.performance as performance_module
+    import traktor.resource_manager as resource_manager_module
+
+    monkeypatch.setattr(resource_manager_module.sys, "platform", "darwin")
+    monkeypatch.setattr(resource_manager_module, "resource", type("R", (), {})())
+    monkeypatch.setattr(
+        resource_manager_module.resource, "getrusage", lambda who: FakeUsage(), raising=False
+    )
+    monkeypatch.setattr(resource_manager_module.resource, "RUSAGE_SELF", 0, raising=False)
+    monkeypatch.setattr(resource_manager_module, "psutil", None)
+
+    monkeypatch.setattr(performance_module.resource, "getrusage", lambda who: FakeUsage())
+    monkeypatch.setattr(performance_module.resource, "RUSAGE_SELF", 0)
+    monkeypatch.setattr(performance_module, "psutil", None)
+
+    monitor = performance_module.PerformanceMonitor()
+    monitor.record_memory_usage()
+    resource_mb = resource_manager_module.ResourceManager().get_current_memory_usage_mb()
+
+    assert monitor.memory_samples[-1]["rss_mb"] == resource_mb == 300.0

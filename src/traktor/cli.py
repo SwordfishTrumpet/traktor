@@ -262,11 +262,16 @@ def parse_args():
     return parser.parse_args()
 
 
-def _run_health_check():
-    """Run health checks and print results."""
-    print("Running health checks...\n")
+def _register_health_checks() -> None:
+    """Register the component checks both health entry points report (issue #61).
 
-    # Register health checks
+    ``--health-check`` registered the cache and config checks while
+    ``--serve-health`` started the server with an empty registry, so /health
+    answered 200 healthy and /metrics was empty for an install that could read
+    neither its config nor its cache. One function now fills the registry for
+    both doors.
+    """
+
     def check_cache_exists():
         from .settings import CACHE_DIR
 
@@ -288,6 +293,13 @@ def _run_health_check():
 
     health_checker.register("cache", check_cache_exists)
     health_checker.register("config", check_config_valid)
+
+
+def _run_health_check():
+    """Run health checks and print results."""
+    print("Running health checks...\n")
+
+    _register_health_checks()
 
     results = health_checker.check_all()
 
@@ -444,6 +456,9 @@ def main():
 
     # Handle health server command first (before any other processing)
     if args.serve_health:
+        # Register the component checks before the server answers anything: an
+        # empty registry always reports healthy (issue #61).
+        _register_health_checks()
         server = HealthServer(port=HEALTH_SERVER_PORT)
         server.start()
         print(f"Health server running on port {HEALTH_SERVER_PORT}")

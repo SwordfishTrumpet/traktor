@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import resource
-import sys
 import time
 from typing import Any
+
+from .utils import rusage_maxrss_to_mb
 
 # Optional dependency for memory tracking; find_spec guard avoids try/except
 # import redefinition issues flagged by mypy.
@@ -87,11 +88,9 @@ class PerformanceMonitor:
             # Fallback to resource module (Unix only)
             try:
                 usage = resource.getrusage(resource.RUSAGE_SELF)
-                # ru_maxrss is in KB on Linux, bytes on macOS
-                if sys.platform == "darwin":
-                    rss_mb = usage.ru_maxrss / (1024 * 1024)
-                else:
-                    rss_mb = usage.ru_maxrss / 1024
+                # ru_maxrss is KB on Linux and bytes on macOS; the shared helper
+                # keeps this figure equal to the resource manager's (issue #63).
+                rss_mb = rusage_maxrss_to_mb(usage.ru_maxrss)
             except (AttributeError, OSError):
                 # Final fallback: approximate using sys.getsizeof on globals
                 rss_mb = 0.0

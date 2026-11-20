@@ -76,10 +76,26 @@ def save_config(config):
     logger.info(f"Saved config keys: {list(config.keys())}")
 
 
-def get_plex_credentials(args=None):
-    """Get Plex credentials from environment, config, or user input."""
-    logger.debug("Getting Plex credentials...")
+def _configured_plex_credentials(args=None):
+    """Resolve Plex credentials without prompting.
 
+    The order matches what a sync has always done: environment (or .env), then
+    the ``--plex-url``/``--plex-token`` flags, then the credentials saved by a
+    previous interactive run. A partial or invalid pair raises, exactly as
+    get_plex_credentials() does.
+
+    This is the one resolver for both doors: diagnose used to read only the
+    environment, so an install whose credentials were saved by the first run
+    was told its credentials were missing and the Plex checks were skipped
+    (issue #62).
+
+    Args:
+        args: Parsed CLI arguments, if any
+
+    Returns:
+        Tuple of (plex_url, plex_token, source), where source is
+        ``"environment"``, ``"cli"``, ``"config"`` or None
+    """
     plex_url = os.getenv("PLEX_URL")
     plex_token = os.getenv("PLEX_TOKEN")
 
@@ -102,22 +118,22 @@ def get_plex_credentials(args=None):
         logger.info("Using Plex credentials from environment/.env file")
         logger.debug(f"URL length: {len(plex_url)}")
         logger.debug(f"Token length: {len(plex_token)}")
-        return plex_url, plex_token
+        return plex_url, plex_token, "environment"
 
-    if args and args.plex_url and args.plex_token:
+    cli_url = getattr(args, "plex_url", None) if args else None
+    cli_token = getattr(args, "plex_token", None) if args else None
+    if cli_url and cli_token:
         # Validate CLI credentials
-        if not _is_valid_plex_url(args.plex_url):
+        if not _is_valid_plex_url(cli_url):
             raise ValueError(
-                f"Invalid --plex-url format: {args.plex_url}. URL must start with http:// or https://"
+                f"Invalid --plex-url format: {cli_url}. URL must start with http:// or https://"
             )
         logger.info("Using Plex credentials from command line arguments")
-        return args.plex_url, args.plex_token
+        return cli_url, cli_token, "cli"
 
     # A lone --plex-url or --plex-token is a mistake, not a partial override:
     # falling through used to reach the saved server while the user believed
     # the flag had been applied (issue #48).
-    cli_url = getattr(args, "plex_url", None) if args else None
-    cli_token = getattr(args, "plex_token", None) if args else None
     if (cli_url and not cli_token) or (cli_token and not cli_url):
         missing_flag = "--plex-token" if cli_url else "--plex-url"
         logger.error(f"Partial Plex credentials on the command line: {missing_flag} is missing")
@@ -131,13 +147,44 @@ def get_plex_credentials(args=None):
     config = load_config()
     if "plex_url" in config and "plex_token" in config:
         logger.info("Found saved Plex configuration")
+        return config["plex_url"], config["plex_token"], "config"
+
+    return None, None, None
+
+
+def resolve_plex_credentials(args=None):
+    """Return the Plex credentials the sync would use, without prompting (issue #62).
+
+    Args:
+        args: Parsed CLI arguments, if any
+
+    Returns:
+        Tuple of (plex_url, plex_token); (None, None) when none are configured
+
+    Raises:
+        ValueError: When only half of a pair is configured, or a URL is invalid
+    """
+    plex_url, plex_token, _source = _configured_plex_credentials(args)
+    return plex_url, plex_token
+
+
+def get_plex_credentials(args=None):
+    """Get Plex credentials from environment, config, or user input."""
+    logger.debug("Getting Plex credentials...")
+
+    plex_url, plex_token, source = _configured_plex_credentials(args)
+
+    if source in ("environment", "cli"):
+        return plex_url, plex_token
+
+    if source == "config":
         # Check if running in non-interactive mode
         if not sys.stdin.isatty():
             logger.info("Non-interactive mode detected, using saved credentials")
-            return config["plex_url"], config["plex_token"]
-        use_saved = input(f"Use saved Plex server at {config['plex_url']}? [Y/n]: ").lower()
+            return plex_url, plex_token
+        use_saved = input(f"Use saved Plex server at {plex_url}? [Y/n]: ").lower()
         if use_saved != "n":
-            return config["plex_url"], config["plex_token"]
+            return plex_url, plex_token
 
     # Check if running in non-interactive mode before prompting
     if not sys.stdin.isatty():
@@ -155,6 +202,7 @@ def get_plex_credentials(args=None):
     plex_url = _prompt_for_url()
     plex_token = _prompt_for_token()
 
+    config = load_config()
     config["plex_url"] = plex_url
     config["plex_token"] = plex_token
     save_config(config)

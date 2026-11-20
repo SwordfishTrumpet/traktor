@@ -51,8 +51,8 @@ uv run traktor --help
 ## Development
 
 ```bash
-uv sync --extra dev
-uv run ruff check src/
+uv sync --group dev
+uv run ruff check src/ tests/
 uv run black src/
 uv run pytest
 ```

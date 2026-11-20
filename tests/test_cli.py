@@ -530,3 +530,52 @@ def test_health_check_exits_zero_when_every_component_is_healthy(monkeypatch, tm
     monkeypatch.setattr(settings, "CACHE_DIR", tmp_path)
 
     assert cli._run_health_check() == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #61: --serve-health reported an empty component registry
+# ---------------------------------------------------------------------------
+
+
+def test_register_health_checks_fills_the_registry():
+    """Both health doors report the same components (#61)."""
+    cli._register_health_checks()
+
+    results = cli.health_checker.check_all()
+
+    assert set(results["components"]) == {"cache", "config"}
+
+
+def test_serve_health_registers_checks_before_the_server_answers(monkeypatch, tmp_path):
+    """`--serve-health` used to start an empty registry, which is always healthy (#61)."""
+    from traktor import settings
+
+    seen = {}
+
+    class FakeServer:
+        def __init__(self, port=None):
+            seen["components_at_start"] = set(cli.health_checker.check_all()["components"])
+
+        def start(self):
+            seen["started"] = True
+
+        def stop(self):
+            seen["stopped"] = True
+
+    monkeypatch.setattr(cli, "HealthServer", FakeServer)
+    monkeypatch.setattr(cli, "ensure_dirs", lambda: None)
+    monkeypatch.setattr(cli, "setup_logging", lambda verbose=False, structured=False: None)
+    monkeypatch.setattr(settings, "CONFIG_FILE", tmp_path / ".traktor_config.json")
+    monkeypatch.setattr(settings, "CACHE_DIR", tmp_path)
+
+    def interrupt(seconds):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli.time, "sleep", interrupt)
+    monkeypatch.setattr(sys, "argv", ["traktor", "--serve-health"])
+
+    with pytest.raises(SystemExit):
+        cli.main()
+
+    assert seen["started"] is True
+    assert seen["components_at_start"] == {"cache", "config"}

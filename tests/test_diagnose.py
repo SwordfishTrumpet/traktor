@@ -366,3 +366,58 @@ class TestDiagnoseCommandCommonIssues:
 
         result = next(r for r in diagnose_cmd.results if r.name == "Trakt Credentials")
         assert result.status == "fail"
+
+
+# ---------------------------------------------------------------------------
+# Issue #62: diagnose must use the credentials the product saved
+# ---------------------------------------------------------------------------
+
+
+class TestDiagnoseUsesSavedPlexCredentials:
+    """The interactive first run saves plex_url/plex_token to the config file."""
+
+    @pytest.fixture
+    def diagnose_cmd(self):
+        return diagnose.DiagnoseCommand()
+
+    @pytest.fixture
+    def saved_config(self, monkeypatch, tmp_path):
+        import json
+
+        import traktor.config as config_module
+
+        config_file = tmp_path / ".traktor_config.json"
+        config_file.write_text(
+            json.dumps({"plex_url": "http://plex.local:32400", "plex_token": "fixture-token"}),
+            encoding="utf-8",
+        )
+        monkeypatch.delenv("PLEX_URL", raising=False)
+        monkeypatch.delenv("PLEX_TOKEN", raising=False)
+        monkeypatch.setattr(config_module, "CONFIG_FILE", config_file)
+        return config_file
+
+    def test_configuration_check_passes_on_saved_credentials(self, diagnose_cmd, saved_config):
+        diagnose_cmd._check_configuration()
+
+        plex_credentials = [r for r in diagnose_cmd.results if r.name == "Plex Credentials"]
+        assert len(plex_credentials) == 1
+        assert plex_credentials[0].status == "pass"
+        assert "plex.local" in plex_credentials[0].message
+
+    @patch("traktor.diagnose.requests.get")
+    def test_connectivity_check_requests_the_saved_plex_url(
+        self, mock_get, diagnose_cmd, saved_config, monkeypatch
+    ):
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_get.return_value = mock_response
+        # The permission check opens its own PlexAPI session; this test is about
+        # which URL the connectivity check asks for.
+        monkeypatch.setattr(diagnose_cmd, "_check_plex_user_permissions", lambda url, token: None)
+
+        diagnose_cmd._check_connectivity()
+
+        plex_calls = [call for call in mock_get.call_args_list if "plex.local" in str(call.args[0])]
+        assert plex_calls, "diagnose never requested the saved Plex URL"
+        connectivity = [r for r in diagnose_cmd.results if r.name == "Plex Server Connectivity"]
+        assert connectivity[0].status == "pass"

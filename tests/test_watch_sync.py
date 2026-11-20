@@ -2374,3 +2374,58 @@ class TestShowReadFailuresAreSurfaced:
             sync_engine.sync_watched_status()
 
         sync_engine._apply_changes.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Issue #69: a settled library must still expire old history entries
+# ---------------------------------------------------------------------------
+
+
+class TestPruningOnAQuietRun:
+    """`_apply_changes()` used to prune only when Plex items needed updating."""
+
+    @pytest.fixture
+    def quiet_engine(self, sync_engine):
+        sync_engine._pull_from_plex = MagicMock(return_value={})
+        sync_engine._pull_from_trakt = MagicMock(return_value={})
+        return sync_engine
+
+    def test_a_no_change_sync_drops_an_expired_entry(self, quiet_engine, mock_history_manager):
+        """Both sides agree, nothing is applied, and the expired row still goes (#69)."""
+        mock_history_manager.state["synced_items"].append(
+            {
+                "media_type": "movie",
+                "imdb_id": "tt-expired-entry",
+                "plex_rating_key": 4242,
+                "updated_at": (datetime.now(timezone.utc) - timedelta(days=400)).isoformat(),
+            }
+        )
+        mock_history_manager.save_state()
+
+        stats = quiet_engine.sync_watched_status()
+
+        assert stats["plex_watched"] == 0
+        assert stats["trakt_watched"] == 0
+        reloaded = history_manager.WatchHistoryManager(plex_server_id="test-server")
+        assert "tt-expired-entry" not in [
+            item.get("imdb_id") for item in reloaded.state["synced_items"]
+        ]
+
+    def test_a_dry_run_keeps_the_state_file_untouched(self, quiet_engine, mock_history_manager):
+        """Retention runs with the run's persist, and a dry run persists nothing."""
+        mock_history_manager.state["synced_items"].append(
+            {
+                "media_type": "movie",
+                "imdb_id": "tt-expired-entry",
+                "plex_rating_key": 4242,
+                "updated_at": (datetime.now(timezone.utc) - timedelta(days=400)).isoformat(),
+            }
+        )
+        mock_history_manager.save_state()
+
+        quiet_engine.sync_watched_status(dry_run=True)
+
+        reloaded = history_manager.WatchHistoryManager(plex_server_id="test-server")
+        assert [item.get("imdb_id") for item in reloaded.state["synced_items"]] == [
+            "tt-expired-entry"
+        ]

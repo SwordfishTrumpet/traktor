@@ -5,16 +5,30 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Iterator, Optional
 
 from .log import logger
 
 # zoneinfo is available in Python 3.9+; find_spec guard provides a fallback
 # without try/except import redefinition issues flagged by mypy.
 ZoneInfo = __import__("zoneinfo").ZoneInfo if importlib.util.find_spec("zoneinfo") else None
+
+# fcntl is Unix-only; the same find_spec guard keeps this module importable on
+# Windows, where file_lock() degrades to no locking.
+fcntl = __import__("fcntl") if importlib.util.find_spec("fcntl") else None
+
+KB_PER_MB = 1024
+BYTES_PER_MB = 1024 * 1024
+# How long a read-modify-write waits for another process before it gives up and
+# writes anyway. Bookkeeping must never block a sync.
+LOCK_TIMEOUT_SECONDS = 10.0
+LOCK_POLL_SECONDS = 0.05
 
 
 def normalize_tmdb_id(tmdb_id):
@@ -136,6 +150,106 @@ def write_json_atomic(
         True when the file was replaced, False when the write failed
     """
     return write_text_atomic(path, json.dumps(data, indent=indent), mode=mode)
+
+
+def read_json_object(path) -> Dict[str, Any]:
+    """Read a JSON object from ``path``, returning an empty dict when unusable.
+
+    A state file is written by one process while another may be reading it, so
+    a missing, unreadable, malformed or non-object file is normal rather than
+    exceptional: the caller merges its own keys into the result.
+
+    Args:
+        path: File to read
+
+    Returns:
+        The parsed object, or an empty dict
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, PermissionError, json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+@contextmanager
+def file_lock(path, timeout: float = LOCK_TIMEOUT_SECONDS) -> Iterator[None]:
+    """Hold an exclusive advisory lock around a file's read-modify-write (issues #64, #65).
+
+    The sync progress file and the watch-state file are each written by more
+    than one process: a frequent cron run and a one-off run, or two runs the
+    scheduler overlapped. Replacing the file atomically keeps a reader from
+    seeing half a file, but it does not stop two writers from each saving a
+    state that lacks the other's rows. Serializing the read, the merge and the
+    write under one lock does.
+
+    The lock is advisory (``flock``) and therefore honoured only by this
+    program, which is the only writer of these files. A platform without
+    ``fcntl``, or a lock that cannot be taken within ``timeout``, proceeds
+    unlocked: bookkeeping must never break a sync.
+
+    Args:
+        path: File whose read-modify-write is being serialized; the lock file
+            is ``<path>.lock`` beside it
+        timeout: Seconds to wait for the lock before proceeding without it
+    """
+    if fcntl is None:
+        yield
+        return
+
+    lock_path = Path(f"{path}.lock")
+    handle = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock_path, "a+", encoding="utf-8")
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    logger.warning(
+                        f"Could not lock {lock_path} within {timeout:.0f}s; "
+                        "merging without the lock"
+                    )
+                    break
+                time.sleep(LOCK_POLL_SECONDS)
+    except OSError as e:
+        logger.warning(f"Could not lock {lock_path}: {e}")
+        if handle is not None:
+            handle.close()
+            handle = None
+
+    try:
+        yield
+    finally:
+        if handle is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError as e:
+                logger.debug(f"Could not release {lock_path}: {e}")
+            handle.close()
+
+
+def rusage_maxrss_to_mb(maxrss: float) -> float:
+    """Convert ``resource.getrusage().ru_maxrss`` to megabytes (issue #63).
+
+    ``ru_maxrss`` is in kilobytes on Linux and in *bytes* on macOS, so a single
+    divisor reports a 300 MB process as 307200 MB on a Mac - and the memory
+    warning then fires on every run, hiding a real problem. The resource
+    manager and the performance monitor both read this figure, so they share
+    this helper instead of keeping a copy of the platform split each.
+
+    Args:
+        maxrss: ``ru_maxrss`` value from ``getrusage``
+
+    Returns:
+        Resident set size in MB, rounded to two decimals
+    """
+    divisor = BYTES_PER_MB if sys.platform == "darwin" else KB_PER_MB
+    return round(float(maxrss) / divisor, 2)
 
 
 def restrict_to_owner(path) -> bool:

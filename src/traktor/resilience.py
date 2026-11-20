@@ -17,7 +17,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .log import logger
 from .settings import CACHE_DIR, CONFIG_FILE, ENV_FILE
-from .utils import write_json_atomic, write_text_atomic
+from .utils import file_lock, read_json_object, write_json_atomic, write_text_atomic
+
+# A backup directory name carries microseconds, so two backups in the same
+# second land in two directories. The retry covers the pathological case where
+# even that collides (issue #67).
+BACKUP_PATH_ATTEMPTS = 5
 
 
 class CircuitState(Enum):
@@ -339,20 +344,20 @@ class BackupManager:
     def create_backup(self, reason: str = "manual") -> Path:
         """Create a backup of all traktor state.
 
+        The directory is created exclusively (``exist_ok=False``) and its name
+        carries microseconds, so a retry or two backups in the same second end
+        up as two snapshots instead of the second overwriting the first
+        (issue #67).
+
         Args:
             reason: Reason for backup (manual, scheduled, pre_sync, etc.)
 
         Returns:
             Path to created backup
         """
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        backup_name = f"traktor_backup_{timestamp}_{reason}"
-        backup_path = self.backup_dir / backup_name
+        backup_path = self._create_backup_dir(reason)
 
-        logger.info(f"Creating backup: {backup_name}")
-
-        # Create backup directory
-        backup_path.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Creating backup: {backup_path.name}")
 
         # Backup each item
         manifest: Dict[str, Any] = {
@@ -390,6 +395,32 @@ class BackupManager:
 
         logger.info(f"Backup completed: {backup_path}")
         return backup_path
+
+    def _create_backup_dir(self, reason: str) -> Path:
+        """Create a backup directory nothing else can already occupy (issue #67).
+
+        Args:
+            reason: Reason for backup, part of the directory name
+
+        Returns:
+            The freshly created, uniquely named backup directory
+
+        Raises:
+            FileExistsError: When every attempt collided with an existing backup
+        """
+        for attempt in range(BACKUP_PATH_ATTEMPTS):
+            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
+            suffix = f"_{attempt}" if attempt else ""
+            candidate = self.backup_dir / f"traktor_backup_{timestamp}_{reason}{suffix}"
+            try:
+                candidate.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                continue
+            return candidate
+        raise FileExistsError(
+            f"Could not create a unique backup directory under {self.backup_dir} "
+            f"after {BACKUP_PATH_ATTEMPTS} attempts"
+        )
 
     @staticmethod
     def _files_in_order(root: Path, strip_compression_suffix: bool = False) -> List[Path]:
@@ -792,7 +823,6 @@ class IntegrityChecker:
             "healthy": len(corrupt_files) == 0,
             "details": {
                 "exists": True,
-                "file_count": len(cache_files),
                 "corrupt_files": corrupt_files if corrupt_files else None,
             },
         }
@@ -900,6 +930,9 @@ class SyncProgress:
     def __init__(self, progress_file: Path):
         self.progress_file = progress_file
         self._completed: set = set()
+        # reset() starts a new run's resume list, so that one save replaces the
+        # completed set instead of merging it (issue #64).
+        self._replace_completed = False
         self._load()
 
     def _load(self) -> None:
@@ -917,16 +950,23 @@ class SyncProgress:
     def save(self) -> None:
         """Save progress to disk.
 
-        The file also holds the run record (issue #13), so it is replaced
-        atomically instead of being emptied first (issue #23).
+        The file also holds the run record (issue #13), so the progress keys are
+        merged into the current JSON under a lock instead of replacing it: a
+        plain overwrite deleted the record a run had just written, and the
+        status endpoint then reported ``unknown`` for the whole run (issue #64).
         """
-        payload = json.dumps(
-            {
-                "completed": sorted(list(self._completed)),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        )
-        if not write_text_atomic(self.progress_file, payload):
+        with file_lock(self.progress_file):
+            payload = read_json_object(self.progress_file)
+            completed = set(self._completed)
+            if not self._replace_completed:
+                # Another run may have marked its own lists completed; a plain
+                # overwrite left only the last writer's entries (issue #64).
+                completed |= {name for name in payload.get("completed") or []}
+            payload["completed"] = sorted(completed)
+            payload["timestamp"] = datetime.now(timezone.utc).isoformat()
+            written = write_text_atomic(self.progress_file, json.dumps(payload))
+            self._replace_completed = False
+        if not written:
             logger.warning(f"Could not save sync progress: {self.progress_file}")
 
     def is_completed(self, name: str) -> bool:
@@ -941,6 +981,7 @@ class SyncProgress:
     def reset(self) -> None:
         """Clear all progress (call at start of new sync)."""
         self._completed.clear()
+        self._replace_completed = True
         self.save()
 
     def get_stats(self) -> Dict[str, Any]:

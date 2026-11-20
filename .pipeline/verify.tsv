@@ -35,3 +35,16 @@
 57	uv run pytest -q tests/test_packaging.py -k "compose or clean_removes"	0	deployment
 58	uv run pytest -q tests/test_packaging.py -k "official_source or runtime_keys"	0	deployment
 59	uv run pytest -q tests/test_cli.py tests/test_resilience.py -k "health or first_failure"	0	observability
+60	uv run pytest -q tests/test_packaging.py -k documented_dev_install	0	build
+61	uv run pytest -q tests/test_cli.py -k "register_health_checks or serve_health_registers"	0	observability
+62	uv run pytest -q tests/test_diagnose.py -k "saved_credentials or saved_plex_url"	0	correctness
+63	uv run pytest -q tests/test_resource_manager.py tests/test_utils.py -k "darwin or agree or rusage"	0	portability
+64	uv run pytest -q tests/test_resilience.py -k KeepsTheRunRecord	0	observability
+65	uv run pytest -q tests/test_history_manager.py -k OverlappingRuns	0	data-integrity
+66	uv run pytest -q tests/test_official_lists.py -k PeriodAwareCache	0	correctness
+67	uv run pytest -q tests/test_resilience.py -k same_second	0	data-integrity
+68	uv run pytest -q tests/test_history_manager.py -k "invalid_timestamp or without_any_timestamp"	0	privacy
+69	uv run pytest -q tests/test_watch_sync.py -k PruningOnAQuietRun	0	privacy
+70	uv run pytest -q tests/test_resilience.py -k IntegrityCheckerGzipCache	0	maintainability
+71	uv run pytest -q tests/test_packaging.py -k make_lint	0	build
+72	uv run pytest -q tests/test_packaging.py -k "rollback or pypi"	0	documentation
