@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .log import logger
 from .settings import CACHE_DIR, CONFIG_FILE, ENV_FILE
+from .utils import write_json_atomic, write_text_atomic
 
 
 class CircuitState(Enum):
@@ -206,6 +207,13 @@ class HealthCheck:
     Useful for monitoring dashboards and alerting.
     """
 
+    # A component stays degraded for its first failures and is only called
+    # unhealthy once the failures repeat. The first failure is never healthy: a
+    # one-shot process (`traktor --health-check`) has exactly one sample, so the
+    # old "healthy until the second failure" rule made it report every broken
+    # component as healthy (issue #59).
+    UNHEALTHY_AFTER_FAILURES = 3
+
     def __init__(self):
         """Initialize health checker."""
         self._checks: Dict[str, Dict[str, Any]] = {}
@@ -227,6 +235,22 @@ class HealthCheck:
                 "status": HealthStatus.HEALTHY,
             }
 
+    def _record_result(self, check: Dict[str, Any], healthy: bool) -> HealthStatus:
+        """Store one check result and return the component's current status."""
+        with self._lock:
+            check["last_result"] = healthy
+            check["last_check"] = datetime.now(timezone.utc).isoformat()
+            if healthy:
+                check["consecutive_failures"] = 0
+                check["status"] = HealthStatus.HEALTHY
+            else:
+                check["consecutive_failures"] += 1
+                if check["consecutive_failures"] >= self.UNHEALTHY_AFTER_FAILURES:
+                    check["status"] = HealthStatus.UNHEALTHY
+                else:
+                    check["status"] = HealthStatus.DEGRADED
+            return check["status"]
+
     def check(self, name: str) -> HealthStatus:
         """Run a single health check.
 
@@ -234,7 +258,8 @@ class HealthCheck:
             name: Component name
 
         Returns:
-            Health status for the component
+            Health status for the component, degraded or unhealthy as soon as
+            the check fails
         """
         with self._lock:
             if name not in self._checks:
@@ -243,32 +268,10 @@ class HealthCheck:
             check = self._checks[name]
 
         try:
-            result = check["func"]()
-            with self._lock:
-                check["last_result"] = result
-                check["last_check"] = datetime.now(timezone.utc).isoformat()
-                if result:
-                    check["consecutive_failures"] = 0
-                    check["status"] = HealthStatus.HEALTHY
-                else:
-                    check["consecutive_failures"] += 1
-                    # Degraded after 2 failures, unhealthy after 5
-                    if check["consecutive_failures"] >= 5:
-                        check["status"] = HealthStatus.UNHEALTHY
-                    elif check["consecutive_failures"] >= 2:
-                        check["status"] = HealthStatus.DEGRADED
-                return check["status"]
+            return self._record_result(check, bool(check["func"]()))
         except Exception as e:
             logger.error(f"Health check '{name}' failed: {e}")
-            with self._lock:
-                check["last_result"] = False
-                check["last_check"] = datetime.now(timezone.utc).isoformat()
-                check["consecutive_failures"] += 1
-                if check["consecutive_failures"] >= 5:
-                    check["status"] = HealthStatus.UNHEALTHY
-                elif check["consecutive_failures"] >= 2:
-                    check["status"] = HealthStatus.DEGRADED
-                return check["status"]
+            return self._record_result(check, False)
 
     def check_all(self) -> Dict[str, Any]:
         """Run all health checks.
@@ -378,14 +381,41 @@ class BackupManager:
 
         # Write manifest
         manifest_path = backup_path / "manifest.json"
-        with open(manifest_path, "w") as f:
-            json.dump(manifest, f, indent=2)
+        if not write_json_atomic(manifest_path, manifest, mode=0o600):
+            logger.error(f"Failed to write backup manifest: {manifest_path}")
+            return backup_path
 
         # Cleanup old backups
         self._cleanup_old_backups()
 
         logger.info(f"Backup completed: {backup_path}")
         return backup_path
+
+    @staticmethod
+    def _files_in_order(root: Path, strip_compression_suffix: bool = False) -> List[Path]:
+        """Return the files under ``root`` sorted by their logical path (issue #42).
+
+        A backup's checksum is computed over the files in this order, so the
+        source tree and the backup made from it must be walked identically.
+        Filesystem iteration order is not stable, and appending ``.gz`` changed
+        it, which made every multi-file backup fail its own verification.
+
+        Args:
+            root: Directory to walk
+            strip_compression_suffix: Drop the backup's trailing ``.gz`` before
+                sorting, so a backup sorts like the tree it was made from
+
+        Returns:
+            File paths, sorted by logical relative path
+        """
+
+        def logical(path: Path) -> str:
+            relative = path.relative_to(root).as_posix()
+            if strip_compression_suffix and relative.endswith(".gz"):
+                return relative[: -len(".gz")]
+            return relative
+
+        return sorted((path for path in root.rglob("*") if path.is_file()), key=logical)
 
     def _backup_item(self, source: Path, dest: Path) -> str:
         """Backup a single item (file or directory).
@@ -411,23 +441,22 @@ class BackupManager:
         else:
             # Backup directory
             dest.mkdir(parents=True, exist_ok=True)
-            for item in source.rglob("*"):
-                if item.is_file():
-                    rel_path = item.relative_to(source)
-                    item_dest = dest / rel_path
-                    item_dest.parent.mkdir(parents=True, exist_ok=True)
+            for item in self._files_in_order(source):
+                rel_path = item.relative_to(source)
+                item_dest = dest / rel_path
+                item_dest.parent.mkdir(parents=True, exist_ok=True)
 
-                    if self.compress:
-                        item_dest = item_dest.with_suffix(item_dest.suffix + ".gz")
-                        with open(item, "rb") as f_in:
-                            with gzip.open(item_dest, "wb") as f_out:
-                                data = f_in.read()
-                                f_out.write(data)
-                                sha256.update(data)
-                    else:
-                        shutil.copy2(item, item_dest)
-                        with open(item, "rb") as f:
-                            sha256.update(f.read())
+                if self.compress:
+                    item_dest = item_dest.with_suffix(item_dest.suffix + ".gz")
+                    with open(item, "rb") as f_in:
+                        with gzip.open(item_dest, "wb") as f_out:
+                            data = f_in.read()
+                            f_out.write(data)
+                            sha256.update(data)
+                else:
+                    shutil.copy2(item, item_dest)
+                    with open(item, "rb") as f:
+                        sha256.update(f.read())
 
         return sha256.hexdigest()
 
@@ -490,7 +519,10 @@ class BackupManager:
         # Verify backup integrity
         if verify:
             for name, info in items.items():
-                if not self._verify_backup_item(backup_path / name, info.get("checksum", "")):
+                compressed = bool(info.get("compressed", self.compress))
+                if not self._verify_backup_item(
+                    backup_path / name, info.get("checksum", ""), compressed
+                ):
                     logger.error(f"Backup verification failed for {name}")
                     return False
 
@@ -507,7 +539,7 @@ class BackupManager:
                     shutil.rmtree(dest)
 
             # Restore
-            self._restore_item(source, dest)
+            self._restore_item(source, dest, compressed=bool(info.get("compressed", self.compress)))
 
             if name == "env":
                 # Restrictive permissions on restored credential material
@@ -516,8 +548,16 @@ class BackupManager:
         logger.info("Restore completed successfully")
         return True
 
-    def _verify_backup_item(self, backup_item: Path, expected_checksum: str) -> bool:
+    def _verify_backup_item(
+        self, backup_item: Path, expected_checksum: str, compressed: bool = True
+    ) -> bool:
         """Verify a backed up item matches its checksum.
+
+        Args:
+            backup_item: Path to the backed up file or directory
+            expected_checksum: SHA256 recorded in the manifest
+            compressed: Whether the backup appended ``.gz`` to every file, which
+                the sort order has to undo to match the source walk (issue #42)
 
         Returns:
             False if the item cannot be read (e.g. corrupt gzip stream) or
@@ -529,7 +569,7 @@ class BackupManager:
             if backup_item.is_file() or backup_item.with_suffix(".gz").exists():
                 # Single file
                 file_path = backup_item if backup_item.exists() else backup_item.with_suffix(".gz")
-                if file_path.suffix == ".gz":
+                if compressed:
                     with gzip.open(file_path, "rb") as f:
                         sha256.update(f.read())
                 else:
@@ -537,27 +577,39 @@ class BackupManager:
                         sha256.update(f.read())
             else:
                 # Directory
-                for file_path in backup_item.rglob("*"):
-                    if file_path.is_file():
-                        if file_path.suffix == ".gz":
-                            with gzip.open(file_path, "rb") as f:
-                                sha256.update(f.read())
-                        else:
-                            with open(file_path, "rb") as f:
-                                sha256.update(f.read())
+                for file_path in self._files_in_order(
+                    backup_item, strip_compression_suffix=compressed
+                ):
+                    # The manifest decides whether a file is compressed, not its
+                    # name: an uncompressed backup of the library cache carries
+                    # a plain "*.json.gz" file (issue #42).
+                    if compressed and file_path.suffix == ".gz":
+                        with gzip.open(file_path, "rb") as f:
+                            sha256.update(f.read())
+                    else:
+                        with open(file_path, "rb") as f:
+                            sha256.update(f.read())
         except (OSError, EOFError) as e:
             logger.error(f"Failed to verify backup item {backup_item}: {e}")
             return False
 
         return sha256.hexdigest() == expected_checksum
 
-    def _restore_item(self, source: Path, dest: Path) -> None:
-        """Restore a single item from backup."""
+    def _restore_item(self, source: Path, dest: Path, compressed: bool = True) -> None:
+        """Restore a single item from backup.
+
+        Args:
+            source: Backed up file or directory
+            dest: Destination path
+            compressed: Whether the backup appended ``.gz`` to every file, as the
+                manifest records; a plain file that happens to end in ``.gz``
+                must not be decompressed (issue #42)
+        """
         if source.is_file() or source.with_suffix(".gz").exists():
             file_path = source if source.exists() else source.with_suffix(".gz")
             dest.parent.mkdir(parents=True, exist_ok=True)
 
-            if file_path.suffix == ".gz":
+            if compressed:
                 with gzip.open(file_path, "rb") as f_in:
                     with open(dest, "wb") as f_out:
                         f_out.write(f_in.read())
@@ -572,7 +624,7 @@ class BackupManager:
                     item_dest = dest / rel_path
                     item_dest.parent.mkdir(parents=True, exist_ok=True)
 
-                    if item.suffix == ".gz":
+                    if compressed:
                         with gzip.open(item, "rb") as f_in:
                             # Remove .gz suffix
                             final_dest = item_dest.with_suffix("")
@@ -863,18 +915,19 @@ class SyncProgress:
             self._completed = set()
 
     def save(self) -> None:
-        """Save progress to disk."""
-        try:
-            with open(self.progress_file, "w") as f:
-                json.dump(
-                    {
-                        "completed": sorted(list(self._completed)),
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    },
-                    f,
-                )
-        except (PermissionError, FileNotFoundError) as e:
-            logger.warning(f"Could not save sync progress: {e}")
+        """Save progress to disk.
+
+        The file also holds the run record (issue #13), so it is replaced
+        atomically instead of being emptied first (issue #23).
+        """
+        payload = json.dumps(
+            {
+                "completed": sorted(list(self._completed)),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        if not write_text_atomic(self.progress_file, payload):
+            logger.warning(f"Could not save sync progress: {self.progress_file}")
 
     def is_completed(self, name: str) -> bool:
         """Check if a list/playlist has been completed."""
