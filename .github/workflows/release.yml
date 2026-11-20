@@ -48,7 +48,16 @@ jobs:
         run: |
           # Extract changelog section for this version
           VERSION=${GITHUB_REF_NAME#v}
-          awk -v ver="$VERSION" 'index($0, "## [" ver "]") == 1 {found=1} found{print} /^## \[/{if(found)exit}' CHANGELOG.md > RELEASE_NOTES.md || echo "See CHANGELOG.md for details" > RELEASE_NOTES.md
+          # Copy one changelog section: from its "## [<version>]" heading up to the next
+          # "## [" heading. The previous version tested for the end of the section on the
+          # same line it matched, so it exited immediately and the release body carried
+          # the heading alone (found on v1.1.1).
+          awk -v heading="## [$VERSION]" '
+            index($0, heading) == 1 {found=1; print; next}
+            found && /^## \[/ {exit}
+            found {print}
+          ' CHANGELOG.md > RELEASE_NOTES.md || echo "See CHANGELOG.md for details" > RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md || echo "See CHANGELOG.md for details" > RELEASE_NOTES.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
