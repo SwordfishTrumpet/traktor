@@ -357,6 +357,10 @@ Playlists are updated in place up to 1000 items: traktor diffs the current playl
 |------|--------------|
 | `--plex-url URL`, `-u URL` | Override `PLEX_URL` |
 | `--plex-token TOKEN`, `-t TOKEN` | Override `PLEX_TOKEN` |
+
+The two Plex flags are one override: pass both or neither. One flag on its own is
+an error rather than a silent fallback to the saved server, and the same rule
+applies to the `PLEX_URL`/`PLEX_TOKEN` environment pair.
 | `--workers N`, `-w N` | Parallel workers for matching (default 8) |
 | `--verbose`, `-v` | Debug logging to the console |
 | `--refresh-cache` | Rebuild the Plex library cache |
@@ -539,7 +543,7 @@ Three things are worth watching:
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | Titles you own are reported missing | Stale library cache | `uv run traktor --refresh-cache` |
-| 401 from Trakt, or "authentication expired" | The refresh token was revoked or replaced | `uv run traktor --force-auth` |
+| 401 from Trakt, or "authentication expired" | The refresh token was revoked or replaced; the dead token is removed from `.env` for you | `uv run traktor --force-auth` |
 | "incomplete Plex credentials" | Only one of `PLEX_URL` and `PLEX_TOKEN` is set | Set both, or neither to be prompted |
 | A film shows as watched in the wrong place | The other side has a newer timestamp | `--watch-conflict=plex` or `trakt`, or fix the timestamp at the source |
 | Nothing happens on the first list run | No official lists enabled, or none configured | Check `TRAKTOR_OFFICIAL_LISTS_ENABLED` and `--official-endpoints` |
