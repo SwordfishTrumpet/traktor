@@ -500,3 +500,33 @@ def test_main_unhandled_exception(monkeypatch, capsys):
     with pytest.raises(SystemExit) as exc_info:
         cli.main()
     assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #59: --health-check is one shot and must report a failure
+# ---------------------------------------------------------------------------
+
+
+def test_health_check_exits_non_zero_for_a_corrupt_config(monkeypatch, tmp_path, capsys):
+    """A corrupt config is reported on the first sample, not the second (#59)."""
+    from traktor import settings
+
+    corrupt = tmp_path / ".traktor_config.json"
+    corrupt.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(settings, "CONFIG_FILE", corrupt)
+    monkeypatch.setattr(settings, "CACHE_DIR", tmp_path)
+
+    assert cli._run_health_check() == 1
+    out = capsys.readouterr().out
+    status_line = next(line for line in out.splitlines() if line.startswith("Overall Status"))
+    assert "HEALTHY" not in status_line
+
+
+def test_health_check_exits_zero_when_every_component_is_healthy(monkeypatch, tmp_path):
+    """A healthy install still exits 0."""
+    from traktor import settings
+
+    monkeypatch.setattr(settings, "CONFIG_FILE", tmp_path / "absent-config.json")
+    monkeypatch.setattr(settings, "CACHE_DIR", tmp_path)
+
+    assert cli._run_health_check() == 0

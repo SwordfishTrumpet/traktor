@@ -278,9 +278,11 @@ def _run_health_check():
         if not CONFIG_FILE.exists():
             return True  # Optional
         try:
-            with open(CONFIG_FILE) as f:
-                json.load(f)
-            return True
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                config = json.load(f)
+            # A config that is valid JSON but not an object is corrupt, and
+            # load_config falls back to defaults for it (issue #47).
+            return isinstance(config, dict)
         except (json.JSONDecodeError, FileNotFoundError, PermissionError, OSError):
             return False
 
