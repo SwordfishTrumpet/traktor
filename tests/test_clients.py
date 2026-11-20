@@ -2189,3 +2189,308 @@ class TestShowCountersAndEpisodeSnapshots:
         cache_manager._build_cache()
 
         assert cache_manager.get_show_episodes(700)["episodes"] == [[1, 1, 7001, 1, None]]
+
+
+# ---------------------------------------------------------------------------
+# Issue #41: a cached rating key is used to build a Plex request URL
+# ---------------------------------------------------------------------------
+
+
+def _empty_cache(cache) -> None:
+    cache.memory_cache = {
+        "movies_by_imdb": {},
+        "movies_by_tmdb": {},
+        "shows_by_imdb": {},
+        "shows_by_tmdb": {},
+        "movies_list": [],
+        "shows_list": [],
+        "by_rating_key": {},
+        "show_episodes": {},
+    }
+
+
+class TestCachedRatingKeyValidation:
+    """A rating key from disk is untrusted input, not a URL fragment (#41)."""
+
+    @pytest.fixture
+    def server(self):
+        server = MagicMock()
+        server.library.sections.return_value = []
+        return server
+
+    def test_legacy_cache_with_a_url_rating_key_is_dropped(self, server, tmp_path, monkeypatch):
+        """A doctored legacy cache cannot keep an entry that redirects a lookup."""
+        monkeypatch.setattr(clients, "CACHE_DIR", tmp_path)
+        poisoned = {
+            "movies_by_imdb": {
+                "tt0000001": {
+                    "title": "Injected",
+                    "year": 2026,
+                    "ratingKey": "@127.0.0.1:9/steal",
+                }
+            },
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+            "shows_by_tmdb": {},
+            "movies_list": [
+                {"title": "Injected", "year": 2026, "ratingKey": "@127.0.0.1:9/steal"}
+            ],
+            "shows_list": [],
+            "by_rating_key": {},
+        }
+        (tmp_path / "plex_library_cache.json").write_text(json.dumps(poisoned), encoding="utf-8")
+
+        cache = clients.CacheManager(server)
+
+        assert cache.load_cache() is True
+        assert cache.find_movie_by_imdb("tt0000001") is None
+        assert cache.memory_cache["movies_list"] == []
+
+    def test_compressed_cache_with_a_url_rating_key_is_dropped(self, server, tmp_path, monkeypatch):
+        """The compressed path sanitizes its entries too."""
+        monkeypatch.setattr(clients, "CACHE_DIR", tmp_path)
+        cache = clients.CacheManager(server)
+        _empty_cache(cache)
+        cache.memory_cache["shows_by_imdb"] = {
+            "tt0000002": {"title": "Injected", "year": 2026, "ratingKey": "../steal"}
+        }
+
+        assert cache._validate_cache_structure() is True
+        assert cache.memory_cache["shows_by_imdb"] == {}
+
+    def test_integer_rating_keys_are_kept(self, server):
+        cache = clients.CacheManager(server)
+        _empty_cache(cache)
+        cache.memory_cache["movies_by_imdb"] = {
+            "tt1": {"title": "Kept", "year": 2000, "ratingKey": 42}
+        }
+
+        assert cache._validate_cache_structure() is True
+        assert cache.memory_cache["movies_by_imdb"]["tt1"]["ratingKey"] == 42
+
+    def test_fetch_refuses_a_non_integer_rating_key(self, server):
+        """The sink refuses it too, so a value injected at runtime cannot leak."""
+        cache = clients.CacheManager(server)
+        _empty_cache(cache)
+        plex = clients.PlexClient(server, cache)
+
+        assert plex._get_plex_item("@evil.example/steal") is None
+        server.fetchItem.assert_not_called()
+
+    def test_watched_check_refuses_a_non_integer_rating_key(self, server):
+        """The watched-status fallback reaches the same fetchItem sink (#41)."""
+        cache = clients.CacheManager(server)
+        _empty_cache(cache)
+        plex = clients.PlexClient(server, cache)
+
+        assert plex.is_watched("@evil.example/steal") == (False, None)
+        server.fetchItem.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Issue #55: a warm cache fetched the same item again for every occurrence
+# ---------------------------------------------------------------------------
+
+
+def test_fetched_item_is_reused_within_the_run():
+    server = MagicMock()
+    server.library.sections.return_value = []
+    item = object()
+    server.fetchItem.return_value = item
+    cache = clients.CacheManager(server)
+    _empty_cache(cache)
+    plex = clients.PlexClient(server, cache)
+
+    assert plex._get_plex_item(7) is item
+    assert plex._get_plex_item(7) is item
+    assert server.fetchItem.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #54: a show repeated across playlists was resolved every time
+# ---------------------------------------------------------------------------
+
+
+def test_first_episode_is_resolved_once_per_run():
+    server = MagicMock()
+    server.library.sections.return_value = []
+    cache = clients.CacheManager(server)
+    _empty_cache(cache)
+    plex = clients.PlexClient(server, cache)
+
+    episode = MagicMock()
+    season = MagicMock()
+    season.seasonNumber = 1
+    season.episodes.return_value = [episode]
+    show = MagicMock()
+    show.ratingKey = 42
+    show.title = "Show"
+    show.seasons.return_value = [season]
+
+    assert plex.resolve_first_episode(show) == (episode, "S01E01")
+    assert plex.resolve_first_episode(show) == (episode, "S01E01")
+    assert show.seasons.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #46: a full first page is not the last page
+# ---------------------------------------------------------------------------
+
+
+def _page(items, headers=None):
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = items
+    response.headers = headers or {}
+    response.content = b"[]"
+    return response
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [{}, {"X-Pagination-Page-Count": "not-a-number"}, {"X-Pagination-Page-Count": ""}],
+)
+def test_pagination_continues_when_page_count_is_unknown(headers):
+    """A missing or unreadable page count must not cut the list at 100 (#46)."""
+    auth = MagicMock()
+    auth.get_headers.return_value = {}
+    client = clients.TraktClient(auth)
+    first = [{"movie": {"title": f"M{i}"}} for i in range(100)]
+    second = [{"movie": {"title": f"M{i}"}} for i in range(100, 150)]
+
+    with patch.object(client._rate_limiter, "wait", return_value=None):
+        with patch.object(
+            client._session,
+            "get",
+            side_effect=[_page(first, headers), _page(second, headers)],
+        ):
+            result = client.get_watched_movies()
+
+    assert len(result) == 150
+
+
+# ---------------------------------------------------------------------------
+# Issue #51: Retry-After is not always a bare integer
+# ---------------------------------------------------------------------------
+
+
+def test_parse_retry_after_handles_every_documented_form():
+    assert clients.parse_retry_after("7", 2) == 7.0
+    assert clients.parse_retry_after(None, 2) == 2
+    assert clients.parse_retry_after("", 2) == 2
+    assert clients.parse_retry_after("1.5", 2) == 1.5
+    # An HTTP-date in the past means "now", never a negative sleep.
+    assert clients.parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT", 2) == 0.0
+    assert clients.parse_retry_after("nonsense", 2) == 2
+    assert clients.parse_retry_after("99999", 2) == clients.MAX_RETRY_AFTER_SECONDS
+
+
+@pytest.mark.parametrize("header", ["Wed, 21 Oct 2015 07:28:00 GMT", "1.5", "", "nonsense"])
+def test_unusual_retry_after_values_still_retry(header):
+    auth = MagicMock()
+    auth.get_headers.return_value = {}
+    client = clients.TraktClient(auth)
+    limited = MagicMock()
+    limited.status_code = 429
+    limited.headers = {"Retry-After": header}
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.headers = {}
+
+    with patch.object(client._rate_limiter, "wait", return_value=None):
+        with patch.object(client._session, "get", side_effect=[limited, ok]):
+            with patch("traktor.clients.time.sleep", return_value=None):
+                result = client._request_with_retry("GET", "https://example.invalid/x")
+
+    assert result.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Issue #50 and #44: the .env token store
+# ---------------------------------------------------------------------------
+
+
+class TestTokenFile:
+    """Token persistence must survive duplicates and prove a revocation (#50, #44)."""
+
+    @pytest.fixture
+    def env_file(self, tmp_path, monkeypatch):
+        target = tmp_path / ".env"
+        # Never resolve to the real /app/.env of a Docker host.
+        monkeypatch.setattr(clients.TraktAuth, "env_file_path", staticmethod(lambda: target))
+        monkeypatch.chdir(tmp_path)
+        return target
+
+    def test_duplicate_token_keys_do_not_shadow_the_saved_value(self, env_file):
+        env_file.write_text(
+            "TRAKT_ACCESS_TOKEN=old-access-0001\n"
+            "TRAKT_ACCESS_TOKEN=old-access-0002\n"
+            "TRAKT_REFRESH_TOKEN=old-refresh-0001\n"
+            "TRAKT_REFRESH_TOKEN=old-refresh-0002\n",
+            encoding="utf-8",
+        )
+        auth = clients.TraktAuth()
+        auth.access_token = "new-access-token-0001"
+        auth.refresh_token = "new-refresh-token-0001"
+
+        assert auth.save_tokens() is True
+
+        from dotenv import dotenv_values
+
+        effective = dotenv_values(env_file)
+        assert effective["TRAKT_ACCESS_TOKEN"] == "new-access-token-0001"
+        assert effective["TRAKT_REFRESH_TOKEN"] == "new-refresh-token-0001"
+        assert not any("old-access-0002" in line for line in env_file.read_text().splitlines())
+
+    @pytest.mark.parametrize("status", [400, 401, 403])
+    def test_rejected_refresh_removes_the_credential(self, status, env_file):
+        env_file.write_text(
+            "TRAKT_ACCESS_TOKEN=revoked-access-0001\n"
+            "TRAKT_REFRESH_TOKEN=revoked-refresh-0001\n",
+            encoding="utf-8",
+        )
+        auth = clients.TraktAuth()
+        auth.access_token = "revoked-access-0001"
+        auth.refresh_token = "revoked-refresh-0001"
+        response = MagicMock()
+        response.status_code = status
+
+        with patch.object(clients.requests.Session, "post", return_value=response):
+            assert auth.refresh_access_token() is False
+
+        assert auth.access_token is None
+        assert auth.refresh_token is None
+        assert auth.has_valid_tokens() is False
+        remaining = env_file.read_text(encoding="utf-8")
+        assert "revoked-access-0001" not in remaining
+        assert "revoked-refresh-0001" not in remaining
+
+    def test_other_refresh_failures_keep_the_credential(self, env_file):
+        """A 500 says nothing about the credential, so it stays."""
+        env_file.write_text(
+            "TRAKT_ACCESS_TOKEN=still-access-0001\nTRAKT_REFRESH_TOKEN=still-refresh-0001\n",
+            encoding="utf-8",
+        )
+        auth = clients.TraktAuth()
+        auth.access_token = "still-access-0001"
+        auth.refresh_token = "still-refresh-0001"
+        response = MagicMock()
+        response.status_code = 500
+
+        with patch.object(clients.requests.Session, "post", return_value=response):
+            assert auth.refresh_access_token() is False
+
+        assert auth.refresh_token == "still-refresh-0001"
+        assert "still-refresh-0001" in env_file.read_text(encoding="utf-8")
+
+    def test_interrupted_token_save_keeps_the_previous_file(self, env_file):
+        env_file.write_text("TRAKT_ACCESS_TOKEN=kept-access-0001\n", encoding="utf-8")
+        before = env_file.read_text(encoding="utf-8")
+        auth = clients.TraktAuth()
+        auth.access_token = "fresh-access-0001"
+        auth.refresh_token = "fresh-refresh-0001"
+
+        with patch("traktor.utils.os.fsync", side_effect=OSError(28, "No space left on device")):
+            auth.save_tokens()
+
+        assert env_file.read_text(encoding="utf-8") == before

@@ -6,7 +6,7 @@ import sys
 
 from .log import logger
 from .settings import CONFIG_FILE
-from .utils import restrict_to_owner
+from .utils import restrict_to_owner, write_json_atomic
 
 
 def _is_valid_plex_url(url):
@@ -29,8 +29,16 @@ def load_config():
 
     if CONFIG_FILE.exists():
         try:
-            with open(CONFIG_FILE, "r") as f:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 config = json.load(f)
+            if not isinstance(config, dict):
+                # json.load accepts [], null, 42, "text" and true; callers expect
+                # a mapping, so a non-object config is corrupt, not data (#47).
+                logger.error(
+                    f"Config file holds a JSON {type(config).__name__}, expected an object; "
+                    f"using defaults"
+                )
+                return {}
             logger.info("Configuration loaded successfully")
             logger.debug(f"Config keys: {list(config.keys())}")
             return config
@@ -55,18 +63,17 @@ def save_config(config):
         config: Configuration dict to persist
     """
     logger.info(f"Saving config to: {CONFIG_FILE}")
-    try:
-        CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(config, f, indent=2)
-        if not restrict_to_owner(CONFIG_FILE):
-            logger.warning(
-                f"Could not restrict permissions on {CONFIG_FILE}; it can hold the Plex credential"
-            )
-        logger.info("Configuration saved successfully")
-        logger.info(f"Saved config keys: {list(config.keys())}")
-    except (PermissionError, FileNotFoundError, OSError) as e:
-        logger.error(f"Failed to write config file: {e}", exc_info=True)
+    # Written through a temporary file so an interrupted save cannot empty the
+    # file holding the Plex credential (issue #23).
+    if not write_json_atomic(CONFIG_FILE, config, mode=0o600):
+        logger.error(f"Failed to write config file: {CONFIG_FILE}")
+        return
+    if not restrict_to_owner(CONFIG_FILE):
+        logger.warning(
+            f"Could not restrict permissions on {CONFIG_FILE}; it can hold the Plex credential"
+        )
+    logger.info("Configuration saved successfully")
+    logger.info(f"Saved config keys: {list(config.keys())}")
 
 
 def get_plex_credentials(args=None):
@@ -105,6 +112,20 @@ def get_plex_credentials(args=None):
             )
         logger.info("Using Plex credentials from command line arguments")
         return args.plex_url, args.plex_token
+
+    # A lone --plex-url or --plex-token is a mistake, not a partial override:
+    # falling through used to reach the saved server while the user believed
+    # the flag had been applied (issue #48).
+    cli_url = getattr(args, "plex_url", None) if args else None
+    cli_token = getattr(args, "plex_token", None) if args else None
+    if (cli_url and not cli_token) or (cli_token and not cli_url):
+        missing_flag = "--plex-token" if cli_url else "--plex-url"
+        logger.error(f"Partial Plex credentials on the command line: {missing_flag} is missing")
+        raise ValueError(
+            f"Incomplete Plex credentials: --plex-url and --plex-token must be given together. "
+            f"Please pass both flags or neither (to use saved config or the interactive prompt). "
+            f"Missing: {missing_flag}"
+        )
 
     logger.debug("Checking saved config...")
     config = load_config()

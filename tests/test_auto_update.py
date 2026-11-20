@@ -310,3 +310,30 @@ class TestApplyUpdateAndPrint:
 
             captured = capsys.readouterr()
             assert "Failed to check" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Issue #43: release text is displayed, never executed by the terminal
+# ---------------------------------------------------------------------------
+
+
+PAYLOAD = "\x1b]52;c;Y2xpcGJvYXJkLXN0ZWFs\x07"
+
+
+def test_release_text_control_bytes_are_escaped(capsys):
+    """A release body or URL cannot drive the terminal (#43)."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "tag_name": "v9.9.9",
+        "html_url": "https://example.invalid/release" + PAYLOAD,
+        "body": "release notes\n" + PAYLOAD + "\n\x1b[2J",
+    }
+
+    with patch("traktor.auto_update.requests.get", return_value=fake_response):
+        result = check_and_print_update()
+
+    captured = capsys.readouterr()
+    assert result == 0
+    assert "\x1b" not in captured.out
+    assert "\\x1b" in captured.out
+    assert "v9.9.9" in captured.out

@@ -7,6 +7,7 @@ import secrets
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlencode
@@ -29,7 +30,14 @@ from .settings import (
     TRAKT_REDIRECT_URI,
     TRAKT_REFRESH_TOKEN,
 )
-from .utils import normalize_tmdb_id, parse_timestamp, restrict_to_owner
+from .utils import (
+    normalize_tmdb_id,
+    parse_timestamp,
+    restrict_to_owner,
+    write_bytes_atomic,
+    write_json_atomic,
+    write_text_atomic,
+)
 
 # Constants for API pagination and safety limits
 MAX_HISTORY_PAGES = 1000  # Safety limit to prevent infinite loops in pagination
@@ -40,6 +48,9 @@ TRAKT_RATE_LIMIT_WINDOW = 300  # 5 minutes in seconds
 MIN_REQUEST_INTERVAL = TRAKT_RATE_LIMIT_WINDOW / TRAKT_RATE_LIMIT_REQUESTS  # 0.3 seconds
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2  # exponential backoff base
+# A server that answers 429 with Retry-After can ask for a long wait. Honour it
+# up to this bound so one header cannot stall a sync for an hour (issue #51).
+MAX_RETRY_AFTER_SECONDS = 300
 
 # Connection pooling constants
 CONNECTION_POOL_SIZE = 10  # Maximum connections to keep in pool
@@ -110,7 +121,49 @@ def trakt_response_count(response_data: Any, section: str, field: str) -> int:
 # HTTP status codes
 HTTP_OK = 200
 HTTP_UNAUTHORIZED = 401
+HTTP_FORBIDDEN = 403
+HTTP_BAD_REQUEST = 400
 HTTP_RATE_LIMIT = 429
+
+
+def parse_retry_after(header_value: Any, default: float) -> float:
+    """Read a ``Retry-After`` header as a number of seconds to wait.
+
+    HTTP allows the header to be a decimal number of seconds or an HTTP-date.
+    Calling ``int()`` on it raised ``ValueError`` for a date, a fractional value
+    or an empty header, which turned a throttle into a failed run instead of a
+    retry (issue #51).
+
+    Args:
+        header_value: Raw header value, or None when the header is absent
+        default: Delay to use when the header is missing or unreadable
+
+    Returns:
+        Delay in seconds, between 0 and ``MAX_RETRY_AFTER_SECONDS``
+    """
+    if header_value is None:
+        return default
+
+    text = str(header_value).strip()
+    seconds: Optional[float] = None
+    if text:
+        try:
+            seconds = float(text)
+        except ValueError:
+            # Not a number: try the HTTP-date form (RFC 7231 section 7.1.3).
+            parsed = None
+            try:
+                parsed = parsedate_to_datetime(text)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is not None:
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
+
+    if seconds is None:
+        return default
+    return max(0.0, min(seconds, MAX_RETRY_AFTER_SECONDS))
 
 
 class RateLimiter:
@@ -342,6 +395,88 @@ class CacheManager:
             logger.error(f"Cache validation error: {e}")
             return False
 
+    # Cache indexes whose entries point at a Plex item by rating key.
+    RATING_KEY_INDEXES = (
+        "movies_by_imdb",
+        "movies_by_tmdb",
+        "shows_by_imdb",
+        "shows_by_tmdb",
+        "by_rating_key",
+    )
+
+    @staticmethod
+    def valid_rating_key(value: Any) -> Optional[int]:
+        """Return ``value`` as a Plex rating key, or None when it is not one.
+
+        A rating key is a non-negative integer. PlexAPI joins whatever it is
+        given onto the server URL, so a cached value such as
+        ``@evil.example/steal`` turns the next lookup into a request to that
+        host, carrying the user's ``X-Plex-Token`` (issue #41).
+
+        Args:
+            value: Candidate rating key
+
+        Returns:
+            The key as an int, or None when the value is not a plain key
+        """
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value >= 0 else None
+        if isinstance(value, str):
+            text = value.strip()
+            if text.isdigit():
+                return int(text)
+        return None
+
+    def _sanitize_cached_items(self) -> int:
+        """Drop cached entries whose rating key is not a plain integer (issue #41).
+
+        The cache arrives from disk - a legacy file, or a backup the user
+        restored - so its nested entries are untrusted. Only the top-level key
+        types used to be checked, which let a doctored entry redirect the next
+        Plex lookup to a host of the attacker's choosing.
+
+        Returns:
+            Number of entries dropped
+        """
+        dropped = 0
+        for index_name in self.RATING_KEY_INDEXES:
+            index = self.memory_cache.get(index_name)
+            if not isinstance(index, dict):
+                continue
+            for key in list(index.keys()):
+                if index_name == "by_rating_key":
+                    entry = index[key]
+                    key_is_valid = self.valid_rating_key(key) is not None
+                else:
+                    entry = index[key]
+                    key_is_valid = True
+                entry_key = entry.get("ratingKey") if isinstance(entry, dict) else None
+                if not key_is_valid or self.valid_rating_key(entry_key) is None:
+                    del index[key]
+                    dropped += 1
+
+        for list_name in ("movies_list", "shows_list"):
+            items = self.memory_cache.get(list_name)
+            if not isinstance(items, list):
+                continue
+            kept = [
+                item
+                for item in items
+                if isinstance(item, dict) and self.valid_rating_key(item.get("ratingKey")) is not None
+            ]
+            if len(kept) != len(items):
+                dropped += len(items) - len(kept)
+                self.memory_cache[list_name] = kept
+
+        if dropped:
+            logger.warning(
+                f"Dropped {dropped} cached entr{'y' if dropped == 1 else 'ies'} whose rating key "
+                f"is not an integer; a rating key is used to build a Plex request URL"
+            )
+        return dropped
+
     def _validate_cache_structure(self) -> bool:
         """Validate that loaded cache has required structure.
 
@@ -370,6 +505,7 @@ class CacheManager:
                 logger.warning(f"Cache key '{key}' has wrong type, rebuilding...")
                 return False
 
+        self._sanitize_cached_items()
         return True
 
     def load_cache(self, force_refresh: bool = False, incremental: bool = True) -> bool:
@@ -423,6 +559,18 @@ class CacheManager:
                 with open(legacy_cache, "r", encoding="utf-8") as f:
                     self.memory_cache = json.load(f)
                 logger.info(f"Loaded legacy cache with {len(self.memory_cache)} entries")
+                # The legacy file is untrusted too: an older release or a
+                # restored backup wrote it, so it goes through the same
+                # structure check and rating-key cleanup as the compressed
+                # path before it is saved again (issue #41).
+                if not self._validate_cache_structure():
+                    logger.warning("Legacy cache structure validation failed, rebuilding...")
+                    self.memory_cache = {}
+                    self._plex_objects.clear()
+                    self._build_cache()
+                    legacy_cache.unlink()
+                    return False
+                self.memory_cache.setdefault("show_episodes", {})
                 # Save in new compressed format
                 self._save_cache()
                 # Remove legacy cache
@@ -555,17 +703,23 @@ class CacheManager:
         self._save_cache()
 
     def _save_cache(self):
-        """Save cache to disk with gzip compression."""
+        """Save cache to disk with gzip compression.
+
+        Both files are replaced atomically: emptying the cache before writing
+        it left the next run with nothing to load (issue #23).
+        """
         try:
             # Serialize once, reuse for both compression and stats
             cache_json = json.dumps(self.memory_cache)
             uncompressed_bytes = cache_json.encode("utf-8")
             uncompressed_size = len(uncompressed_bytes)
 
-            with gzip.open(self.cache_file, "wt", encoding="utf-8", compresslevel=6) as f:
-                f.write(cache_json)
+            compressed = gzip.compress(uncompressed_bytes, compresslevel=6)
+            if not write_bytes_atomic(self.cache_file, compressed):
+                logger.error(f"Failed to save cache: {self.cache_file}")
+                return False
 
-            compressed_size = self.cache_file.stat().st_size
+            compressed_size = len(compressed)
             compression_ratio = (
                 (1 - compressed_size / uncompressed_size) * 100 if uncompressed_size > 0 else 0
             )
@@ -581,8 +735,8 @@ class CacheManager:
                     "ratio_percent": round(compression_ratio, 1),
                 },
             }
-            with open(self.cache_meta_file, "w") as f:
-                json.dump(meta, f)
+            if not write_json_atomic(self.cache_meta_file, meta, indent=None):
+                logger.warning(f"Could not write cache metadata: {self.cache_meta_file}")
 
             logger.info(
                 f"Cache saved to {self.cache_file} "
@@ -803,6 +957,62 @@ class TraktAuth:
 
         return True
 
+    TOKEN_VARIABLES = ("TRAKT_ACCESS_TOKEN", "TRAKT_REFRESH_TOKEN")
+
+    @staticmethod
+    def env_file_path() -> Path:
+        """Return the ``.env`` file that holds the Trakt tokens.
+
+        The Docker mount wins over the working directory, matching the
+        resolution :data:`traktor.settings.ENV_FILE` documents.
+        """
+        app_env = Path("/app/.env")
+        return app_env if app_env.exists() else Path(".env")
+
+    @staticmethod
+    def _rewrite_token_lines(lines: List[str], values: Dict[str, Optional[str]]) -> List[str]:
+        """Rewrite every line for a token variable, dropping duplicates.
+
+        python-dotenv resolves a repeated key to its *last* value, so updating
+        only the first occurrence left an older duplicate in charge and the
+        refreshed token was never the one loaded (issue #50). A value of None
+        removes the variable instead.
+
+        Args:
+            lines: Current lines of the credential file
+            values: Variable name -> value to keep, or None to remove it
+
+        Returns:
+            New file content
+        """
+        rewritten: List[str] = []
+        seen: Dict[str, bool] = {}
+
+        for line in lines:
+            stripped = line.strip()
+            matched = None
+            for var_name in values:
+                if stripped.startswith(f"{var_name}=") or stripped == var_name:
+                    matched = var_name
+                    break
+
+            if matched is None:
+                rewritten.append(line)
+                continue
+
+            if seen.get(matched):
+                continue  # a duplicate would shadow the value we just wrote
+            seen[matched] = True
+            value = values[matched]
+            if value is not None:
+                rewritten.append(f"{matched}={value}\n")
+
+        for var_name, value in values.items():
+            if value is not None and not seen.get(var_name):
+                rewritten.append(f"{var_name}={value}\n")
+
+        return rewritten
+
     def save_tokens(self):
         """Save tokens to .env file for persistence.
 
@@ -836,47 +1046,71 @@ class TraktAuth:
 
             # Save tokens to .env file
             try:
-                env_path = Path("/app/.env") if Path("/app/.env").exists() else Path(".env")
+                env_path = self.env_file_path()
                 if env_path.exists():
                     with open(env_path, "r", encoding="utf-8") as f:
                         lines = f.readlines()
 
-                    # Update or add token lines
-                    token_vars = {
+                    values: Dict[str, Optional[str]] = {
                         "TRAKT_ACCESS_TOKEN": self.access_token,
                         "TRAKT_REFRESH_TOKEN": self.refresh_token,
                     }
-
-                    for var_name, var_value in token_vars.items():
-                        found = False
-                        for i, line in enumerate(lines):
-                            # Match lines that start with the var name (allowing for whitespace/comments)
-                            stripped = line.strip()
-                            if stripped.startswith(f"{var_name}=") or stripped == var_name:
-                                lines[i] = f"{var_name}={var_value}\n"
-                                found = True
-                                break
-                        if not found:
-                            lines.append(f"{var_name}={var_value}\n")
-
-                    with open(env_path, "w", encoding="utf-8") as f:
-                        f.writelines(lines)
-
-                    # The file holds the Trakt tokens, so keep it owner-only
-                    # (issue #12).
-                    if not restrict_to_owner(env_path):
-                        logger.warning(
-                            f"Could not restrict permissions on {env_path}; it holds the Trakt tokens"
-                        )
-
-                    logger.info(f"Tokens saved to {env_path}")
-                    logger.info("You can now run traktor without --force-auth")
+                    # Written through a temporary file: an interrupted save must
+                    # not leave the user without any credential (issue #23).
+                    if write_text_atomic(
+                        env_path, "".join(self._rewrite_token_lines(lines, values)), mode=0o600
+                    ):
+                        # The file holds the Trakt tokens, so keep it owner-only
+                        # (issue #12).
+                        if not restrict_to_owner(env_path):
+                            logger.warning(
+                                f"Could not restrict permissions on {env_path}; "
+                                f"it holds the Trakt tokens"
+                            )
+                        logger.info(f"Tokens saved to {env_path}")
+                        logger.info("You can now run traktor without --force-auth")
+                    else:
+                        logger.warning(f"Failed to save tokens to .env: {env_path}")
+                        logger.info("Tokens are in memory for this session only")
                 else:
                     logger.warning(f".env file not found at {env_path}, tokens not saved")
             except Exception as e:
                 logger.warning(f"Failed to save tokens to .env: {e}")
                 logger.info("Tokens are in memory for this session only")
         return True
+
+    def clear_tokens(self, reason: str) -> None:
+        """Forget the Trakt tokens, in memory and in the ``.env`` store.
+
+        A refresh answered with 400, 401 or 403 proves the credential is no
+        longer valid. Clearing only the in-memory fields left the revoked value
+        in ``.env``, where every later run loaded it and treated it as valid
+        (issue #44).
+
+        Args:
+            reason: Why the credential is being dropped, for the log
+        """
+        self.access_token = None
+        self.refresh_token = None
+
+        env_path = self.env_file_path()
+        if not env_path.exists():
+            return
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            values: Dict[str, Optional[str]] = {name: None for name in self.TOKEN_VARIABLES}
+            if write_text_atomic(
+                env_path, "".join(self._rewrite_token_lines(lines, values)), mode=0o600
+            ):
+                logger.warning(
+                    f"Cleared the Trakt tokens from {env_path} ({reason}); "
+                    f"run with --force-auth to re-authenticate"
+                )
+            else:
+                logger.warning(f"Could not clear the Trakt tokens from {env_path}")
+        except OSError as e:
+            logger.warning(f"Could not clear the Trakt tokens from {env_path}: {e}")
 
     def get_auth_url(self) -> str:
         """Build the Trakt authorization URL for this login attempt.
@@ -977,15 +1211,19 @@ class TraktAuth:
                 self.save_tokens()
                 return True
 
-            # 400 Bad Request means the refresh token is invalid/expired
-            if response.status_code == 400:
-                logger.error("Token refresh failed with 400 - refresh token is invalid or expired")
+            # 400 Bad Request means the refresh token is invalid/expired, and
+            # 401/403 mean Trakt rejected it outright. All three prove the
+            # credential is dead, so it is removed from the store rather than
+            # left for the next run to keep retrying (issue #44).
+            if response.status_code in (HTTP_BAD_REQUEST, HTTP_UNAUTHORIZED, HTTP_FORBIDDEN):
+                logger.error(
+                    f"Token refresh failed with {response.status_code} - the refresh token is "
+                    f"invalid or revoked"
+                )
                 logger.error(
                     "Trakt authentication expired. Run with --force-auth to re-authenticate."
                 )
-                # Clear stored tokens to force re-authentication on next run
-                self.access_token = None
-                self.refresh_token = None
+                self.clear_tokens(f"refresh rejected with HTTP {response.status_code}")
                 return False
 
             logger.error(f"Token refresh failed with status {response.status_code}")
@@ -1066,8 +1304,8 @@ class TraktClient:
 
                 # Handle rate limit (429) with retry
                 if response.status_code == HTTP_RATE_LIMIT:
-                    retry_after = int(
-                        response.headers.get("Retry-After", RETRY_BACKOFF_BASE**attempt)
+                    retry_after = parse_retry_after(
+                        response.headers.get("Retry-After"), RETRY_BACKOFF_BASE**attempt
                     )
                     logger.warning(
                         f"Rate limited (429). Retry after {retry_after}s. Attempt {attempt + 1}/{MAX_RETRIES}"
@@ -1479,14 +1717,22 @@ class TraktClient:
 
             all_items.extend(data)
 
-            # Respect Trakt pagination headers if present; otherwise treat
-            # a short page as the end of the list.
-            try:
-                page_count = int(response.headers.get("X-Pagination-Page-Count", page))
-            except (TypeError, ValueError):
-                page_count = page
+            # Trakt reports the page count in a header. When it is missing or
+            # unreadable the count is unknown, so only a short page or the
+            # safety limit can end the walk: falling back to the current page
+            # number ended every list after its first full page (issue #46).
+            page_count: Optional[int] = None
+            raw_page_count = response.headers.get("X-Pagination-Page-Count")
+            if raw_page_count is not None:
+                try:
+                    page_count = int(str(raw_page_count).strip())
+                except (TypeError, ValueError):
+                    logger.debug(
+                        f"Unreadable X-Pagination-Page-Count {raw_page_count!r}; "
+                        f"continuing until a short page"
+                    )
 
-            if page >= page_count or len(data) < page_size:
+            if (page_count is not None and page >= page_count) or len(data) < page_size:
                 break
 
             page += 1
@@ -1800,6 +2046,71 @@ class TraktClient:
             return {}
 
 
+# Constants for the memoized first-episode lookup (issue #54).
+FIRST_EPISODE_MEMO_ATTR = "_traktor_first_episode_memo"
+_first_episode_lock = threading.Lock()
+
+
+def read_first_episode(show_item: Any) -> Tuple[Optional[Any], str]:
+    """Read a show's first playable episode (S01E01, else the earliest season).
+
+    This is the expensive read a playlist entry needs: one ``seasons()`` call and
+    one ``episodes()`` call per show. It performs no caching, so a caller that
+    resolves the same show repeatedly must use
+    :meth:`PlexClient.resolve_first_episode` instead (issue #54).
+
+    Args:
+        show_item: Plex show object
+
+    Returns:
+        ``(episode, label)`` on success, where ``label`` is ``S01E01``-style;
+        ``(None, reason)`` on failure, where ``reason`` explains why
+    """
+    title = getattr(show_item, "title", "unknown")
+    try:
+        seasons = show_item.seasons()
+
+        # S01E01 is the documented choice for a show in a playlist.
+        season1 = None
+        for season in seasons:
+            if season.seasonNumber == 1:
+                season1 = season
+                break
+
+        if season1:
+            episodes = season1.episodes()
+            if episodes:
+                first_episode = episodes[0]
+                logger.info(f"  Using S01E01 for '{title}': {first_episode.title}")
+                return first_episode, "S01E01"
+            logger.warning(f"  No episodes found in season 1 for '{title}' - trying other seasons")
+
+        # Fallback: the first episode of the earliest season that has one.
+        for season in sorted(seasons, key=lambda s: s.seasonNumber):
+            episodes = season.episodes()
+            if episodes:
+                first_episode = episodes[0]
+                logger.info(
+                    f"  Using S{season.seasonNumber:02d}E01 for '{title}'"
+                    f" (S01E01 not found): {first_episode.title}"
+                )
+                return first_episode, f"S{season.seasonNumber:02d}E01"
+
+        if not seasons:
+            logger.warning(f"  No seasons found for '{title}' - skipping")
+            return None, "No seasons found in Plex"
+
+        logger.warning(f"  No episodes found in any season for '{title}' - skipping")
+        return None, "No episodes found in any season"
+
+    except NotFound:
+        logger.warning(f"  Show data not found for '{title}' - skipping")
+        return None, "Show data not accessible in Plex"
+    except (AttributeError, IndexError) as e:
+        logger.error(f"  Error accessing season/episode data for '{title}': {e} - skipping")
+        return None, f"Error accessing show data: {e}"
+
+
 class PlexClient:
     """Client for interacting with Plex."""
 
@@ -1812,6 +2123,46 @@ class PlexClient:
 
         # Check if the current user is the server owner
         self._check_user_permissions()
+
+    def resolve_first_episode(self, show_item: Any) -> Tuple[Optional[Any], str]:
+        """Resolve a show to its first episode once per run (issue #54).
+
+        Official and liked-list runs commonly contain the same show in several
+        playlists, and it was resolved again for each of them. The outcome - an
+        episode, or the reason there is none - is kept on this client for the
+        rest of the run, so each distinct show costs one lookup.
+
+        The memo is guarded by a lock because items are processed in threads;
+        the read itself happens outside the lock so one slow show does not
+        serialize the others.
+
+        Args:
+            show_item: Plex show object
+
+        Returns:
+            ``(episode, label)`` or ``(None, reason)``, as
+            :func:`read_first_episode` returns them
+        """
+        memo = getattr(self, FIRST_EPISODE_MEMO_ATTR, None)
+        if memo is None:
+            memo = {}
+            setattr(self, FIRST_EPISODE_MEMO_ATTR, memo)
+
+        rating_key = getattr(show_item, "ratingKey", None)
+        if rating_key is None:
+            # Nothing to key the memo on; resolve without caching rather than
+            # sharing an answer between unrelated shows.
+            return read_first_episode(show_item)
+
+        memo_key = str(rating_key)
+        with _first_episode_lock:
+            cached = memo.get(memo_key)
+        if cached is not None:
+            return cached
+
+        result = read_first_episode(show_item)
+        with _first_episode_lock:
+            return memo.setdefault(memo_key, result)
 
     def _check_user_permissions(self):
         """Check if the current token belongs to the server owner or a managed user.
@@ -1902,16 +2253,33 @@ class PlexClient:
         return None
 
     def _get_plex_item(self, rating_key):
-        rating_key_str = str(rating_key)
+        """Return the Plex item for a cached rating key, fetching it once per run.
+
+        A warm cache holds only the JSON snapshot, so ``_plex_objects`` is empty
+        and every occurrence of the same item used to cost one ``fetchItem``
+        call (issue #55). Whatever this fetch returns is kept for the rest of
+        the run. A key that is not a plain integer is refused before it can
+        become part of a request URL (issue #41).
+        """
+        safe_key = CacheManager.valid_rating_key(rating_key)
+        if safe_key is None:
+            logger.warning(
+                f"Refusing a cached ratingKey that is not an integer: {str(rating_key)[:80]!r}"
+            )
+            return None
+
+        rating_key_str = str(safe_key)
         if rating_key_str in self.cache._plex_objects:
             return self.cache._plex_objects[rating_key_str]
         try:
-            return self.server.fetchItem(rating_key)
+            item = self.server.fetchItem(safe_key)
         except Exception as e:
             logger.warning(
-                f"Cached ratingKey {rating_key} could not be fetched (stale cache entry?): {e}"
+                f"Cached ratingKey {safe_key} could not be fetched (stale cache entry?): {e}"
             )
             return None
+        self.cache._plex_objects[rating_key_str] = item
+        return item
 
     @staticmethod
     def show_counters(show: Any) -> Dict[str, Any]:
@@ -2399,14 +2767,22 @@ class PlexClient:
         except (ValueError, TypeError):
             rating_key_int = None
 
+        if rating_key_int is None:
+            # A rating key that is not an integer would be joined onto the server
+            # URL by PlexAPI, so it is never handed to fetchItem (issue #41).
+            logger.warning(
+                f"Refusing to check watched status for a non-integer ratingKey: "
+                f"{str(rating_key)[:80]!r}"
+            )
+            return False, None
+
         # Try cache first using O(1) rating_key index (fast path - no API call)
-        if rating_key_int is not None:
-            cached = self.cache.memory_cache.get("by_rating_key", {}).get(rating_key_int)
-            if cached:
-                return (
-                    cached.get("isWatched", False),
-                    cached.get("lastViewedAt"),
-                )
+        cached = self.cache.memory_cache.get("by_rating_key", {}).get(rating_key_int)
+        if cached:
+            return (
+                cached.get("isWatched", False),
+                cached.get("lastViewedAt"),
+            )
 
         # Fallback to API call if not in cache (episodes, or cache miss)
         logger.debug(f"Cache miss for watched check: {rating_key}, falling back to API")

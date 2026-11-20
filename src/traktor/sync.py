@@ -7,6 +7,7 @@ import select
 import sys
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -15,10 +16,15 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 
 import requests
-from plexapi.exceptions import NotFound
 from plexapi.server import PlexServer
 
-from .clients import CacheManager, PlexClient, TraktAuth, TraktClient
+from .clients import (
+    CacheManager,
+    PlexClient,
+    TraktAuth,
+    TraktClient,
+    read_first_episode,
+)
 from .config import get_plex_credentials, load_config
 from .conflict_resolver import ConflictResolver
 from .history_manager import WatchHistoryManager
@@ -46,6 +52,7 @@ from .settings import (
     WATCH_SYNC_CONFLICT_RESOLUTION,
     WATCH_SYNC_DIRECTION,
 )
+from .utils import sanitize_terminal_text, write_text_atomic
 from .watch_sync import WatchSyncEngine
 
 # Personal list sources: what TRAKTOR_LIST_SOURCE picks besides the official lists.
@@ -58,10 +65,50 @@ PERSONAL_LIST_SOURCES = ("liked", "both", "own", "all")
 # Constants for batch processing
 DEFAULT_CHUNK_SIZE = 500  # Number of items to process per chunk for memory efficiency
 
-# Constants for missing item suggestion engine
+# Constants for the missing-item suggestion engine
 FUZZY_MATCH_THRESHOLD = 0.6  # Minimum similarity ratio for title matching
 MAX_SUGGESTIONS = 3  # Maximum suggestions per missing item
 YEAR_TOLERANCE = 1  # Year difference tolerance for matching
+MAX_CANDIDATE_TITLES = 200  # Titles compared per missing item (issue #53)
+TITLE_TRIGRAM_PAD = "$"  # Marks the start and end of a title for trigram indexing
+
+
+def _title_trigrams(text: str) -> Set[str]:
+    """Return the character trigrams of a title, padded so short titles work.
+
+    Trigram overlap is the cheap prefilter that decides which library titles a
+    missing item is compared against (issue #53).
+
+    Args:
+        text: Title to index or to look up
+
+    Returns:
+        Set of three-character slices of the padded, lowercased title
+    """
+    normalized = f"{TITLE_TRIGRAM_PAD}{text.strip().lower()}{TITLE_TRIGRAM_PAD}"
+    if len(normalized) < 3:
+        return {normalized}
+    return {normalized[index : index + 3] for index in range(len(normalized) - 2)}
+
+
+def _resolve_first_episode(plex: Any, show_item: Any) -> Tuple[Optional[Any], str]:
+    """Resolve a show to its first episode, once per run when the client can.
+
+    :class:`PlexClient` memoizes the answer per show, so a show that appears in
+    five playlists costs one lookup instead of five (issue #54). A stand-in
+    client without the memo still works, it just pays for every entry.
+
+    Args:
+        plex: Plex client, real or stand-in
+        show_item: Plex show object
+
+    Returns:
+        ``(episode, label)`` on success or ``(None, reason)`` on failure
+    """
+    resolver = getattr(plex, "resolve_first_episode", None)
+    if resolver is not None:
+        return resolver(show_item)
+    return read_first_episode(show_item)
 
 
 def process_item_parallel(idx: int, item: Dict[str, Any], plex: Any) -> Dict[str, Any]:
@@ -133,94 +180,18 @@ def process_item_parallel(idx: int, item: Dict[str, Any], plex: Any) -> Dict[str
             show_item, imdb_id, tmdb_id = find_media_item(show, "show")
 
             if show_item:
-                try:
-                    seasons = show_item.seasons()
-                    # Try to find S01E01 first
-                    season1 = None
-                    for season in seasons:
-                        if season.seasonNumber == 1:
-                            season1 = season
-                            break
-
-                    if season1:
-                        episodes = season1.episodes()
-                        if episodes:
-                            first_episode = episodes[0]
-                            logger.info(f"  Using S01E01 for '{title}': {first_episode.title}")
-                            return build_result(
-                                True,
-                                f"{title} - S01E01",
-                                year,
-                                plex_item=first_episode,
-                            )
-                        logger.warning(
-                            f"  No episodes found in season 1 for '{title}' - trying other seasons"
-                        )
-
-                    # Fallback: find the first available episode from any season
-                    first_episode = None
-                    for season in sorted(seasons, key=lambda s: s.seasonNumber):
-                        episodes = season.episodes()
-                        if episodes:
-                            first_episode = episodes[0]
-                            logger.info(
-                                f"  Using S{season.seasonNumber:02d}E01 for '{title}'"
-                                f" (S01E01 not found): {first_episode.title}"
-                            )
-                            return build_result(
-                                True,
-                                f"{title} - S{season.seasonNumber:02d}E01",
-                                year,
-                                plex_item=first_episode,
-                            )
-
-                    if not seasons:
-                        logger.warning(f"  No seasons found for '{title}' - skipping")
-                        return build_result(
-                            False,
-                            title,
-                            year,
-                            media_type="Show",
-                            imdb_id=imdb_id,
-                            tmdb_id=tmdb_id,
-                            reason="No seasons found in Plex",
-                        )
-
-                    logger.warning(f"  No episodes found in any season for '{title}' - skipping")
-                    return build_result(
-                        False,
-                        title,
-                        year,
-                        media_type="Show",
-                        imdb_id=imdb_id,
-                        tmdb_id=tmdb_id,
-                        reason="No episodes found in any season",
-                    )
-
-                except NotFound:
-                    logger.warning(f"  Show data not found for '{title}' - skipping")
-                    return build_result(
-                        False,
-                        title,
-                        year,
-                        media_type="Show",
-                        imdb_id=imdb_id,
-                        tmdb_id=tmdb_id,
-                        reason="Show data not accessible in Plex",
-                    )
-                except (AttributeError, IndexError) as e:
-                    logger.error(
-                        f"  Error accessing season/episode data for '{title}': {e} - skipping"
-                    )
-                    return build_result(
-                        False,
-                        title,
-                        year,
-                        media_type="Show",
-                        imdb_id=imdb_id,
-                        tmdb_id=tmdb_id,
-                        reason=f"Error accessing show data: {e}",
-                    )
+                episode, label = _resolve_first_episode(plex, show_item)
+                if episode is not None:
+                    return build_result(True, f"{title} - {label}", year, plex_item=episode)
+                return build_result(
+                    False,
+                    title,
+                    year,
+                    media_type="Show",
+                    imdb_id=imdb_id,
+                    tmdb_id=tmdb_id,
+                    reason=label,
+                )
 
             return build_result(
                 False,
@@ -286,6 +257,67 @@ class MissingItemSuggester:
 
     def __init__(self, cache_manager):
         self.cache = cache_manager
+        # One title index per media type, built on first use. The report used to
+        # scan the whole library with difflib once per missing item - three
+        # times over - so its cost grew with library size times missing items
+        # (issue #53).
+        self._title_indexes: Dict[
+            str, Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, List[int]]]
+        ] = {}
+
+    def _title_index(
+        self, media_type: str
+    ) -> Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, List[int]]]:
+        """Return the library titles for a media type and their trigram index.
+
+        Returns:
+            ``(entries, trigrams)`` where ``entries`` is a list of
+            ``(lowercased title, cached item)`` and ``trigrams`` maps a
+            character trigram to the positions of the titles holding it
+        """
+        index_key = media_type.lower()
+        cached = self._title_indexes.get(index_key)
+        if cached is not None:
+            return cached
+
+        entries: List[Tuple[str, Dict[str, Any]]] = []
+        trigrams: Dict[str, List[int]] = {}
+        memory_cache = getattr(self.cache, "memory_cache", None) or {}
+        for item in memory_cache.get(f"{index_key}s_list") or []:
+            if not isinstance(item, dict):
+                continue
+            cache_title = item.get("title")
+            if not cache_title:
+                continue
+            position = len(entries)
+            entries.append((cache_title.lower(), item))
+            for trigram in _title_trigrams(cache_title):
+                trigrams.setdefault(trigram, []).append(position)
+
+        index = (entries, trigrams)
+        self._title_indexes[index_key] = index
+        return index
+
+    def _candidate_titles(self, media_type: str, title: str) -> List[Tuple[str, Dict[str, Any]]]:
+        """Return the library titles worth comparing against ``title``.
+
+        Character trigrams keep a near match in the candidate set ("The
+        Offcie" shares ``off`` with "The Office"), while the comparison stays
+        bounded per missing item instead of covering the whole library.
+        """
+        entries, trigrams = self._title_index(media_type)
+        if not entries:
+            return []
+
+        scores: Counter = Counter()
+        for trigram in _title_trigrams(title):
+            for position in trigrams.get(trigram, ()):
+                scores[position] += 1
+
+        chosen = [position for position, _ in scores.most_common(MAX_CANDIDATE_TITLES)]
+        if not chosen:
+            chosen = list(range(min(len(entries), MAX_CANDIDATE_TITLES)))
+        return [entries[position] for position in chosen]
 
     def get_suggestions(
         self,
@@ -307,17 +339,11 @@ class MissingItemSuggester:
         self, title: str, year: Union[str, int], media_type: str
     ) -> List[Dict[str, Any]]:
         """Find items with similar titles in cache."""
-        cache_key = f"{media_type.lower()}s_list"
-        if not self.cache or not self.cache.memory_cache.get(cache_key):
-            return []
-
         results = []
         search_title = title.lower()
-        for item in self.cache.memory_cache[cache_key]:
+        for cache_title_lower, item in self._candidate_titles(media_type, title):
             cache_title = item.get("title", "")
-            if not cache_title:
-                continue
-            ratio = difflib.SequenceMatcher(None, search_title, cache_title.lower()).ratio()
+            ratio = difflib.SequenceMatcher(None, search_title, cache_title_lower).ratio()
             if ratio >= FUZZY_MATCH_THRESHOLD:
                 cache_year = item.get("year", "")
                 year_match = False
@@ -403,11 +429,6 @@ class MissingItemSuggester:
         if not self.cache or not self.cache.memory_cache:
             return []
 
-        cache_type = media_type.lower()
-        cache_key = f"{cache_type}s_list"
-        if not self.cache.memory_cache.get(cache_key):
-            return []
-
         results = []
         variations = []
 
@@ -430,12 +451,10 @@ class MissingItemSuggester:
             variations.append((base_title, "year_in_title"))
 
         for variant_title, pattern_type in variations:
-            for item in self.cache.memory_cache[cache_key]:
+            for cache_title_lower, item in self._candidate_titles(media_type, variant_title):
                 cache_title = item.get("title", "")
-                if not cache_title:
-                    continue
                 ratio = difflib.SequenceMatcher(
-                    None, variant_title.lower(), cache_title.lower()
+                    None, variant_title.lower(), cache_title_lower
                 ).ratio()
                 if ratio >= FUZZY_MATCH_THRESHOLD:
                     pattern_desc = {
@@ -476,26 +495,33 @@ def write_missing_report(
 
     suggester = MissingItemSuggester(cache_manager) if cache_manager else None
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("List | Type | Title | Year | IMDb ID | Reason | Suggestions\n")
-        f.write("-" * 150 + "\n")
-        for item in missing_items:
-            reason = item.get("reason", "Not found in Plex library")
-            suggestions_str = ""
-            if suggester:
-                suggestions = suggester.get_suggestions(
-                    title=item.get("title", ""),
-                    year=item.get("year", ""),
-                    imdb_id=item.get("imdb_id", ""),
-                    tmdb_id=item.get("tmdb_id", None),
-                    media_type=item.get("type", ""),
-                )
-                if suggestions:
-                    suggestions_str = "; ".join(s["message"] for s in suggestions[:MAX_SUGGESTIONS])
-            f.write(
-                f"{item['list_name']} | {item['type']} | {item['title']} | {item['year']} | "
-                f"{item['imdb_id']} | {reason} | {suggestions_str}\n"
+    report: List[str] = [
+        "List | Type | Title | Year | IMDb ID | Reason | Suggestions\n",
+        "-" * 150 + "\n",
+    ]
+    for item in missing_items:
+        reason = item.get("reason", "Not found in Plex library")
+        suggestions_str = ""
+        if suggester:
+            suggestions = suggester.get_suggestions(
+                title=item.get("title", ""),
+                year=item.get("year", ""),
+                imdb_id=item.get("imdb_id", ""),
+                tmdb_id=item.get("tmdb_id", None),
+                media_type=item.get("type", ""),
             )
+            if suggestions:
+                suggestions_str = "; ".join(s["message"] for s in suggestions[:MAX_SUGGESTIONS])
+        report.append(
+            f"{item['list_name']} | {item['type']} | {item['title']} | {item['year']} | "
+            f"{item['imdb_id']} | {reason} | {suggestions_str}\n"
+        )
+
+    # One write at the end, through a temporary file: the report is rebuilt on
+    # every run, so a failed write must not leave a half-written one (issue #23).
+    if not write_text_atomic(path, "".join(report)):
+        logger.error(f"Failed to write missing items to {file_path}")
+        return
 
     logger.info(f"Wrote {len(missing_items)} missing items to {file_path}")
 
@@ -1101,7 +1127,11 @@ def _collect_auth_code(auth_url: str, expected_state: Optional[str]) -> Optional
                     )
 
             def log_message(self, format, *args):  # noqa: A002 - match stdlib signature
-                logger.debug(f"Auth callback server: {format % args}")
+                # The request line carries ?code=...&state=..., i.e. a live
+                # authorization code, so the query string never reaches the log
+                # (issue #45). The pasted-code path already logs only a length.
+                message = re.sub(r"\?[^\s\"]*", "?<redacted>", format % args)
+                logger.debug(f"Auth callback server: {message}")
 
         try:
             server = ThreadingHTTPServer((cb.hostname, port), CallbackHandler)
@@ -1488,9 +1518,12 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
                     username = list_info.get("user", {}).get("username", "")
                     list_id = list_info.get("ids", {}).get("trakt", "")
 
-                    logger.info(f"Processing list: '{list_name}' (ID: {list_id}, user: {username})")
-                    print(f"\nProcessing list: {list_name}")
-                    print(f"   From user: {username}")
+                    logger.info(
+                        f"Processing list: '{sanitize_terminal_text(list_name)}' "
+                        f"(ID: {list_id}, user: {sanitize_terminal_text(username)})"
+                    )
+                    print(f"\nProcessing list: {sanitize_terminal_text(list_name)}")
+                    print(f"   From user: {sanitize_terminal_text(username)}")
 
                     result = process_list_parallel(
                         liked,

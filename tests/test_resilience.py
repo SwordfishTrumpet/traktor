@@ -9,6 +9,7 @@ import pytest
 from traktor.resilience import (
     CircuitBreaker,
     CircuitBreakerOpen,
+    HealthCheck,
     SyncProgress,
     retry_with_backoff,
 )
@@ -799,3 +800,115 @@ class TestEnvBackupRoundtrip:
 
         assert "TRAKT_ACCESS_TOKEN" not in manifest_text
         assert "tok1234567890" not in manifest_text
+
+
+# ---------------------------------------------------------------------------
+# Issue #42: a multi-file backup this build wrote must verify and restore
+# ---------------------------------------------------------------------------
+
+
+class TestBackupVerificationOrder:
+    """The checksum order must not depend on the file system (issue #42)."""
+
+    @pytest.fixture
+    def multi_file_env(self, tmp_path, monkeypatch):
+        import traktor.resilience as res
+
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"managed_playlists": ["a"]}', encoding="utf-8")
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        for index, name in enumerate(
+            [
+                "plex_library_cache.json.gz",
+                "plex_users.json",
+                "trakt_lists.json",
+                "watch_sync.json",
+                "official_lists.json",
+                "config_snapshot.json",
+            ]
+        ):
+            (cache_dir / name).write_text(json.dumps({"n": index}), encoding="utf-8")
+        env_file = tmp_path / ".env"
+        env_file.write_text("TRAKT_CLIENT_ID=x\n", encoding="utf-8")
+
+        monkeypatch.setattr(res, "CONFIG_FILE", config_file)
+        monkeypatch.setattr(res, "ENV_FILE", env_file)
+        monkeypatch.setattr(res, "CACHE_DIR", cache_dir)
+        return res, tmp_path
+
+    @pytest.mark.parametrize("compress", [True, False])
+    def test_backup_of_several_cache_files_restores(self, multi_file_env, compress):
+        import shutil
+
+        res, tmp_path = multi_file_env
+        manager = res.BackupManager(backup_dir=tmp_path / "backups", compress=compress)
+        backup_path = manager.create_backup(reason="test")
+
+        # The recovery path: the config is gone, the backup is all there is.
+        res.CONFIG_FILE.unlink()
+        shutil.rmtree(res.CACHE_DIR)
+
+        assert manager.restore_backup(backup_path) is True
+        assert res.CONFIG_FILE.exists()
+        assert len(list(res.CACHE_DIR.iterdir())) == 6
+
+
+# ---------------------------------------------------------------------------
+# Issue #59: one sample is enough to report a failure
+# ---------------------------------------------------------------------------
+
+
+class TestHealthCheckReportsTheFirstFailure:
+    """A one-shot process must not report a broken component as healthy (#59)."""
+
+    def test_first_failure_is_never_healthy(self):
+        checker = HealthCheck()
+        checker.register("config", lambda: False)
+
+        assert checker.check("config").value == "degraded"
+        assert checker.check_all()["status"] != "healthy"
+
+    def test_repeated_failures_escalate(self):
+        checker = HealthCheck()
+        checker.register("config", lambda: False)
+
+        statuses = [checker.check_all()["status"] for _ in range(3)]
+
+        assert statuses[0] == "degraded"
+        assert statuses[-1] == "unhealthy"
+
+    def test_a_raising_check_counts_as_a_failure(self):
+        checker = HealthCheck()
+
+        def explode():
+            raise RuntimeError("boom")
+
+        checker.register("cache", explode)
+
+        assert checker.check("cache").value == "degraded"
+
+    def test_recovery_returns_to_healthy(self):
+        checker = HealthCheck()
+        state = {"ok": False}
+        checker.register("cache", lambda: state["ok"])
+
+        assert checker.check("cache").value == "degraded"
+        state["ok"] = True
+        assert checker.check("cache").value == "healthy"
+
+
+# ---------------------------------------------------------------------------
+# Issue #23: an interrupted progress save keeps the previous file
+# ---------------------------------------------------------------------------
+
+
+def test_interrupted_progress_save_keeps_the_previous_file(tmp_path):
+    progress_file = tmp_path / "sync_progress.json"
+    progress_file.write_text(json.dumps({"completed": ["kept-list"]}), encoding="utf-8")
+    progress = SyncProgress(progress_file)
+
+    with patch("traktor.utils.os.fsync", side_effect=OSError(28, "No space left on device")):
+        progress.mark_completed("new-list")
+
+    assert json.loads(progress_file.read_text(encoding="utf-8")) == {"completed": ["kept-list"]}
