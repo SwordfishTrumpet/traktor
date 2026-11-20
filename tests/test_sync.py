@@ -557,6 +557,60 @@ def test_missing_item_suggester_none_cache():
     assert suggestions == []
 
 
+class _CountingList(list):
+    """Count how many entries the suggestion engine reads from the cache."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.visits = 0
+
+    def __iter__(self):
+        for item in super().__iter__():
+            self.visits += 1
+            yield item
+
+
+def test_missing_report_scans_the_library_once(tmp_path):
+    """The report indexes the library once, not once per missing item (#53)."""
+    library = [
+        {"title": f"Library Movie {index}", "year": 2000 + (index % 25), "ratingKey": index}
+        for index in range(500)
+    ]
+    counting = _CountingList(library)
+    cache = FakeCacheManager({"movies_list": counting})
+    missing = [
+        {
+            "list_name": "Favourites",
+            "type": "Movie",
+            "title": f"Missing Title {index} (US)",
+            "year": 2020,
+            "imdb_id": f"tt9{index:06d}",
+            "reason": "Not found in Plex library",
+        }
+        for index in range(50)
+    ]
+
+    sync.write_missing_report(missing, file_path=tmp_path / "missing.txt", cache_manager=cache)
+
+    assert counting.visits <= len(library)
+    assert len((tmp_path / "missing.txt").read_text(encoding="utf-8").splitlines()) == 52
+
+
+def test_missing_report_finds_a_title_far_down_a_large_library():
+    """Indexing must not lose the near match that sits at the end (#53)."""
+    library = [
+        {"title": f"Filler {index}", "year": 2000, "ratingKey": index} for index in range(400)
+    ]
+    library.append({"title": "The Office", "year": 2005, "ratingKey": 999})
+    suggester = sync.MissingItemSuggester(FakeCacheManager({"movies_list": library}))
+
+    suggestions = suggester.get_suggestions(
+        title="The Offcie", year=2005, imdb_id="", tmdb_id=None, media_type="Movie"
+    )
+
+    assert any(item["matched_title"] == "The Office" for item in suggestions)
+
+
 def test_write_missing_report_with_suggestions(tmp_path):
     """Test that report includes suggestions when cache manager is provided."""
     report_path = tmp_path / "missing.txt"
@@ -883,6 +937,34 @@ class TestSyncListsOrchestration:
         # process_list_parallel is mocked, but the orchestration should have
         # fetched liked lists and passed them through
         mocks["trakt_client"].get_liked_lists.assert_called_once()
+
+    def test_list_name_control_bytes_are_not_printed_raw(self, monkeypatch, tmp_path, capsys):
+        """A Trakt list name is remote text and must not drive the terminal (#43)."""
+        mocks = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "liked"])
+
+        hostile = "Favourites\x1b]52;c;c3RlYWw=\x07"
+        mocks["trakt_client"].get_liked_lists.return_value = [
+            {
+                "list": {
+                    "name": hostile,
+                    "user": {"username": "me\x1b[2J"},
+                    "ids": {"trakt": "123"},
+                },
+            }
+        ]
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+        monkeypatch.setattr(
+            sync,
+            "process_list_parallel",
+            lambda *a, **k: {"success": True, "matched": 1, "not_found": 0},
+        )
+
+        assert sync.sync_lists(args) == 0
+
+        out = capsys.readouterr().out
+        assert "\x1b" not in out
+        assert "\\x1b" in out
 
     def test_liked_list_result_output(self, monkeypatch, tmp_path, capsys):
         """Per-list console output matches the result shape (issue #2).
@@ -1291,6 +1373,33 @@ class TestCollectAuthCode:
         assert refused == 400
         assert accepted == 200
         assert result_box.get("code") == "real-code"
+
+    def test_callback_does_not_log_the_authorization_code(self, caplog):
+        """The callback request line carries the code, so it never hits the log (#45)."""
+        import logging
+        import threading
+
+        port = 47159
+        auth_url = (
+            "https://trakt.tv/oauth/authorize" f"?redirect_uri=http%3A%2F%2F127.0.0.1%3A{port}%2Fcb"
+        )
+        secret = "PROBE-AUTH-CODE-123456"
+        result_box: dict = {}
+        thread = threading.Thread(
+            target=lambda: result_box.setdefault(
+                "code", sync._collect_auth_code(auth_url, "st-expected")
+            ),
+            daemon=True,
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="traktor"):
+            thread.start()
+            delivered = self._deliver(port, f"code={secret}&state=st-expected")
+            thread.join(timeout=10)
+
+        assert delivered == 200
+        assert result_box.get("code") == secret
+        assert secret not in caplog.text
 
     def test_extract_auth_state(self):
         """_extract_auth_state reads the state out of pasted input."""
