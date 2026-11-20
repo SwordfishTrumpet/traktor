@@ -389,15 +389,19 @@ class TestHistoryPruning:
         assert mock_history_manager._item_index.get(1) is None
         assert mock_history_manager._item_index.get(2) is not None
 
-    def test_entries_without_timestamp_are_kept(self, mock_history_manager):
-        """Legacy entries predating updated_at are never dropped by age."""
+    def test_entries_without_any_timestamp_are_dropped(self, mock_history_manager):
+        """A legacy entry with no date at all cannot stay for ever (issue #68).
+
+        The pre-upgrade state file carries no updated_at, and treating that as
+        "keep" meant the documented retention window never expired it.
+        """
         mock_history_manager.add_or_update_synced_item(
             media_type="movie", imdb_id="tt1", plex_rating_key=1
         )
         del mock_history_manager.state["synced_items"][-1]["updated_at"]
 
-        assert mock_history_manager.prune_synced_items(max_age_days=180) == 0
-        assert len(mock_history_manager.state["synced_items"]) == 1
+        assert mock_history_manager.prune_synced_items(max_age_days=180) == 1
+        assert mock_history_manager.state["synced_items"] == []
 
     def test_zero_disables_pruning(self, mock_history_manager):
         from datetime import datetime, timedelta, timezone
@@ -420,13 +424,28 @@ class TestHistoryPruning:
 
         assert mock_history_manager.prune_synced_items() == 1
 
-    def test_invalid_timestamp_treated_as_keep(self, mock_history_manager):
+    def test_invalid_timestamp_falls_back_to_the_watch_date(self, mock_history_manager):
+        """An unparseable updated_at still has the watch date to age it (#68)."""
+        from datetime import datetime, timedelta, timezone
+
+        recent = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        mock_history_manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt1", plex_rating_key=1, last_watched_at_plex=recent
+        )
+        mock_history_manager.state["synced_items"][-1]["updated_at"] = "garbage"
+
+        assert mock_history_manager.prune_synced_items(max_age_days=180) == 0
+        assert len(mock_history_manager.state["synced_items"]) == 1
+
+    def test_invalid_timestamp_without_any_date_is_dropped(self, mock_history_manager):
+        """Nothing can date the entry, so retention drops it (issue #68)."""
         mock_history_manager.add_or_update_synced_item(
             media_type="movie", imdb_id="tt1", plex_rating_key=1
         )
         mock_history_manager.state["synced_items"][-1]["updated_at"] = "garbage"
 
-        assert mock_history_manager.prune_synced_items(max_age_days=1) == 0
+        assert mock_history_manager.prune_synced_items(max_age_days=1) == 1
+        assert mock_history_manager.state["synced_items"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -461,3 +480,84 @@ def test_interrupted_state_save_keeps_the_previous_file(temp_state_file, monkeyp
     assert Path(temp_state_file).read_text(encoding="utf-8") == before
     reloaded = history_manager.WatchHistoryManager()
     assert [item["imdb_id"] for item in reloaded.state["synced_items"]] == ["tt0113277"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #65: an overlapping run must not erase the other run's entries
+# ---------------------------------------------------------------------------
+
+
+class TestOverlappingRuns:
+    """Two runs load the state before either saves, so the save must merge."""
+
+    def _manager(self):
+        return history_manager.WatchHistoryManager(plex_server_id="shared-server")
+
+    def test_a_second_run_keeps_the_first_runs_entries(self, temp_state_file):
+        first = self._manager()
+        second = self._manager()
+
+        first.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt0000001", plex_rating_key=1, watched_plex=True
+        )
+        first.save_state()
+        second.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt0000002", plex_rating_key=2, watched_plex=True
+        )
+        second.save_state()
+
+        reloaded = self._manager()
+        assert sorted(item["imdb_id"] for item in reloaded.state["synced_items"]) == [
+            "tt0000001",
+            "tt0000002",
+        ]
+
+    def test_the_newer_entry_wins_a_conflict(self, temp_state_file):
+        first = self._manager()
+        first.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt0000001", plex_rating_key=1, watched_plex=False
+        )
+        first.save_state()
+
+        second = self._manager()
+        second.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt0000001", plex_rating_key=1, watched_plex=True
+        )
+        second.save_state()
+
+        reloaded = self._manager()
+        assert len(reloaded.state["synced_items"]) == 1
+        assert reloaded.state["synced_items"][0]["watched_plex"] is True
+
+    def test_a_pruned_entry_is_not_resurrected_by_the_next_save(self, temp_state_file):
+        """A removal this run recorded survives its own later saves (issue #65)."""
+        manager = self._manager()
+        manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt0000009", plex_rating_key=9
+        )
+        manager.state["synced_items"][-1]["updated_at"] = "2000-01-01T00:00:00+00:00"
+        manager.save_state()
+
+        assert manager.prune_synced_items(max_age_days=180) == 1
+        manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt0000010", plex_rating_key=10
+        )
+        manager.save_state()
+
+        reloaded = self._manager()
+        assert [item["imdb_id"] for item in reloaded.state["synced_items"]] == ["tt0000010"]
+
+    def test_a_file_from_another_server_is_replaced_not_merged(self, temp_state_file):
+        """Merging another server's rows would mix two libraries (issue #65)."""
+        other = self._manager()
+        other.add_or_update_synced_item(media_type="movie", imdb_id="tt0000003", plex_rating_key=3)
+        other.save_state()
+
+        manager = history_manager.WatchHistoryManager(plex_server_id="this-server")
+        manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt0000004", plex_rating_key=4
+        )
+        manager.save_state()
+
+        reloaded = history_manager.WatchHistoryManager(plex_server_id="this-server")
+        assert [item["imdb_id"] for item in reloaded.state["synced_items"]] == ["tt0000004"]

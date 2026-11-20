@@ -236,3 +236,24 @@ class TestSanitizeTerminalText:
 
     def test_none_renders_as_empty(self):
         assert sanitize_terminal_text(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# Issue #63: one converter owns the ru_maxrss platform split
+# ---------------------------------------------------------------------------
+
+
+class TestRusageMaxrssToMb:
+    """`ru_maxrss` is kilobytes on Linux and bytes on macOS."""
+
+    def test_darwin_bytes_are_divided_by_a_megabyte(self, monkeypatch):
+        import traktor.utils as utils_module
+
+        monkeypatch.setattr(utils_module.sys, "platform", "darwin")
+        assert utils_module.rusage_maxrss_to_mb(314572800) == 300.0
+
+    def test_linux_kilobytes_are_divided_by_1024(self, monkeypatch):
+        import traktor.utils as utils_module
+
+        monkeypatch.setattr(utils_module.sys, "platform", "linux")
+        assert utils_module.rusage_maxrss_to_mb(307200) == 300.0

@@ -12,6 +12,7 @@ import threading
 import time
 
 from .log import logger
+from .utils import rusage_maxrss_to_mb
 
 # Optional dependency for memory tracking; find_spec guard avoids try/except
 # import redefinition issues flagged by mypy.
@@ -109,11 +110,13 @@ class ResourceManager:
             except Exception:
                 return 0.0
 
-        # Fallback: use resource module (Unix only)
+        # Fallback: use resource module (Unix only). ru_maxrss is kilobytes on
+        # Linux and bytes on macOS; rusage_maxrss_to_mb() owns that split so
+        # this surface and PerformanceMonitor cannot disagree (issue #63).
         if sys.platform in ("linux", "darwin") and resource is not None:
             try:
                 usage = resource.getrusage(resource.RUSAGE_SELF)
-                return usage.ru_maxrss / KB_PER_MB  # KB to MB
+                return rusage_maxrss_to_mb(usage.ru_maxrss)
             except (AttributeError, OSError):
                 return 0.0
 

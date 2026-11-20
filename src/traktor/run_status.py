@@ -14,14 +14,12 @@ looking like a run still in progress.
 
 from __future__ import annotations
 
-import json
-import os
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
 from .log import logger
+from .utils import file_lock, read_json_object, write_json_atomic
 
 RUN_KEY = "run"
 RUN_STATUS_RUNNING = "running"
@@ -40,37 +38,29 @@ def _now() -> str:
 
 def _read(path: Path) -> Dict[str, Any]:
     """Read the progress file, returning an empty mapping when it is unusable."""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (FileNotFoundError, PermissionError, json.JSONDecodeError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return read_json_object(path)
 
 
-def _write(path: Path, data: Dict[str, Any]) -> None:
-    """Write the progress file atomically so a reader never sees half a record."""
-    tmp_name = None
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(path.parent), prefix=".sync_progress.", suffix=".tmp"
-        )
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp_name, path)
-        tmp_name = None
-    except (PermissionError, FileNotFoundError, OSError) as e:
-        # Recording the outcome is bookkeeping: never fail a sync over it.
-        logger.warning(f"Could not record sync run status: {e}")
-    finally:
-        if tmp_name is not None:
-            try:
-                os.unlink(tmp_name)
-            except OSError as e:
-                # A leftover temp file is harmless, but leaving no trace is how a
-                # failure hides: say what it was and where.
-                logger.debug(f"Could not remove temporary status file {tmp_name}: {e}")
+def _merge_run(path: Path, update: Dict[str, Any]) -> None:
+    """Merge ``update`` into the run record, keeping the keys beside it.
+
+    The read, the merge and the write happen under the same lock the resume
+    bookkeeping takes, so neither half of the file deletes the other when two
+    processes write at once (issues #13, #64). A key the update omits - such as
+    ``last_success_at`` when a run fails - keeps its previous value.
+
+    Args:
+        path: Sync progress file to update
+        update: Run-record keys to set
+    """
+    with file_lock(path):
+        data = _read(path)
+        previous = data.get(RUN_KEY)
+        previous = previous if isinstance(previous, dict) else {}
+        data[RUN_KEY] = {**previous, **update}
+        if not write_json_atomic(path, data, indent=None, mode=0o600):
+            # Recording the outcome is bookkeeping: never fail a sync over it.
+            logger.warning(f"Could not record sync run status in {path}")
 
 
 def _previous_run(path: Path) -> Dict[str, Any]:
@@ -85,15 +75,15 @@ def record_run_started(path: Path) -> None:
     Args:
         path: Sync progress file to record in
     """
-    data = _read(path)
-    data[RUN_KEY] = {
-        "status": RUN_STATUS_RUNNING,
-        "started_at": _now(),
-        "finished_at": None,
-        "last_success_at": _previous_run(path).get("last_success_at"),
-        "error": None,
-    }
-    _write(path, data)
+    _merge_run(
+        path,
+        {
+            "status": RUN_STATUS_RUNNING,
+            "started_at": _now(),
+            "finished_at": None,
+            "error": None,
+        },
+    )
 
 
 def record_run_succeeded(path: Path) -> None:
@@ -102,16 +92,16 @@ def record_run_succeeded(path: Path) -> None:
     Args:
         path: Sync progress file to record in
     """
-    data = _read(path)
     finished_at = _now()
-    data[RUN_KEY] = {
-        **(_previous_run(path)),
-        "status": RUN_STATUS_SUCCESS,
-        "finished_at": finished_at,
-        "last_success_at": finished_at,
-        "error": None,
-    }
-    _write(path, data)
+    _merge_run(
+        path,
+        {
+            "status": RUN_STATUS_SUCCESS,
+            "finished_at": finished_at,
+            "last_success_at": finished_at,
+            "error": None,
+        },
+    )
 
 
 def record_run_failed(path: Path, error: str) -> None:
@@ -121,14 +111,14 @@ def record_run_failed(path: Path, error: str) -> None:
         path: Sync progress file to record in
         error: Short reason shown by the status endpoint
     """
-    data = _read(path)
-    data[RUN_KEY] = {
-        **(_previous_run(path)),
-        "status": RUN_STATUS_FAILED,
-        "finished_at": _now(),
-        "error": error[:MAX_ERROR_CHARS],
-    }
-    _write(path, data)
+    _merge_run(
+        path,
+        {
+            "status": RUN_STATUS_FAILED,
+            "finished_at": _now(),
+            "error": error[:MAX_ERROR_CHARS],
+        },
+    )
 
 
 def read_run_status(path: Path) -> Dict[str, Any]:

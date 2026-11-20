@@ -2,10 +2,11 @@
 
 import json
 from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
 
 from .log import logger
 from .settings import DATA_DIR, HISTORY_RETENTION_DAYS
-from .utils import write_json_atomic
+from .utils import file_lock, parse_timestamp, read_json_object, write_json_atomic
 
 # Sync state file location
 WATCH_SYNC_FILE = DATA_DIR / ".traktor_watch_sync.json"
@@ -28,6 +29,12 @@ class WatchHistoryManager:
         self.sync_file = WATCH_SYNC_FILE
         self.state = self._load_state()
         self._build_index()
+        # Entries this run dropped. save_state() removes them from the file after
+        # merging, so a run that loaded an older snapshot cannot bring them back
+        # (issues #65, #68).
+        self._removed_keys: set = set()
+        # clear_all() and restore_from_backup() replace the file rather than merge.
+        self._replace_on_save = False
 
     def _build_index(self):
         """Build the plex_rating_key -> item index for O(1) lookups.
@@ -83,15 +90,117 @@ class WatchHistoryManager:
         return all(key in state for key in required_keys)
 
     def save_state(self):
-        """Save current sync state to disk.
+        """Merge this run's state into the file on disk and write it once (issue #65).
 
-        The file is replaced atomically: an interrupted save used to leave it
-        empty, and the next run then started from an empty state (issue #23).
+        Every run used to load the whole state and write it back in full, so a
+        run that started earlier silently erased the rows a run that started
+        after it had committed. The read-modify-write now runs under one lock
+        and merges: the item with the newer ``updated_at`` wins, entries this
+        run removed stay removed, and ``last_sync_timestamp`` only moves
+        forward. The file is still replaced atomically, so an interrupted save
+        leaves the previous file intact (issue #23).
         """
-        if write_json_atomic(self.sync_file, self.state):
-            logger.debug(f"Saved watch sync state to {self.sync_file}")
-        else:
+        with file_lock(self.sync_file):
+            merged = self._merge_with_disk()
+            written = write_json_atomic(self.sync_file, merged)
+        if not written:
             logger.error(f"Failed to save watch sync state: {self.sync_file}")
+            return
+        self.state = merged
+        self._build_index()
+        self._removed_keys.clear()
+        self._replace_on_save = False
+        logger.debug(f"Saved watch sync state to {self.sync_file}")
+
+    def _merge_with_disk(self) -> Dict[str, Any]:
+        """Return this run's state merged with what is on disk right now."""
+        on_disk = read_json_object(self.sync_file)
+        if self._replace_on_save or not self._mergeable(on_disk):
+            # Nothing to merge with, the file is unreadable, or it belongs to
+            # another Plex server: this run's state is the whole truth.
+            return dict(self.state)
+
+        merged_items: list = []
+        positions: Dict[Any, int] = {}
+        unkeyed: list = []
+        for item in on_disk.get("synced_items") or []:
+            if not isinstance(item, dict):
+                continue
+            key = self._item_key(item)
+            if key is None:
+                unkeyed.append(item)
+            else:
+                positions[key] = len(merged_items)
+                merged_items.append(item)
+
+        for item in self.state["synced_items"]:
+            key = self._item_key(item)
+            if key is None:
+                unkeyed.append(item)
+                continue
+            position = positions.get(key)
+            if position is None:
+                positions[key] = len(merged_items)
+                merged_items.append(item)
+            elif self._is_newer(item, merged_items[position]):
+                merged_items[position] = item
+
+        merged_items = [i for i in merged_items if self._item_key(i) not in self._removed_keys]
+        merged_items.extend(unkeyed)
+
+        merged = dict(on_disk)
+        merged["version"] = self.state.get("version", 1)
+        merged["plex_server_id"] = self.plex_server_id
+        merged["synced_items"] = merged_items
+        merged["last_sync_timestamp"] = self._later_timestamp(
+            on_disk.get("last_sync_timestamp"), self.state.get("last_sync_timestamp")
+        )
+        return merged
+
+    def _mergeable(self, on_disk: Dict[str, Any]) -> bool:
+        """Return True when ``on_disk`` can be merged with this run's state."""
+        if not on_disk or not self._validate_state(on_disk):
+            return False
+        return on_disk.get("plex_server_id") == self.plex_server_id
+
+    @staticmethod
+    def _item_key(item: Dict[str, Any]) -> Optional[Any]:
+        """Return the identity two runs must agree on for one entry.
+
+        The Plex rating key is exact. Without one the Trakt, TMDb or IMDb id is
+        used, in that order of specificity; episodes of one show share an IMDb
+        id, so an entry keyed only by it may take the place of a sibling.
+        """
+        rating_key = item.get("plex_rating_key")
+        if rating_key is not None:
+            return ("plex_rating_key", rating_key)
+        for field in ("trakt_id", "tmdb_id", "imdb_id"):
+            value = item.get(field)
+            if value:
+                return (field, str(value))
+        return None
+
+    @staticmethod
+    def _is_newer(candidate: Dict[str, Any], current: Dict[str, Any]) -> bool:
+        """Return True when ``candidate`` is the more recent version of an entry."""
+        candidate_at = WatchHistoryManager._parse_entry_timestamp(candidate.get("updated_at"))
+        current_at = WatchHistoryManager._parse_entry_timestamp(current.get("updated_at"))
+        if candidate_at is None:
+            return False
+        if current_at is None:
+            return True
+        return candidate_at > current_at
+
+    @staticmethod
+    def _later_timestamp(first: Any, second: Any) -> Optional[str]:
+        """Return the later of two ``last_sync_timestamp`` values."""
+        first_at = parse_timestamp(first)
+        second_at = parse_timestamp(second)
+        if first_at is None:
+            return second if second else first
+        if second_at is None:
+            return first
+        return second if second_at >= first_at else first
 
     def update_last_sync_timestamp(self):
         """Update the last sync timestamp to now."""
@@ -236,11 +345,10 @@ class WatchHistoryManager:
         kept = []
         removed = 0
         for item in self.state["synced_items"]:
-            updated_at = self._parse_entry_timestamp(item.get("updated_at"))
-            if updated_at is not None and updated_at < cutoff:
+            age = self._entry_age_timestamp(item)
+            if age is None or age < cutoff:
                 removed += 1
-                if item.get("plex_rating_key") is not None:
-                    self._item_index.pop(item.get("plex_rating_key"), None)
+                self._forget(item)
             else:
                 kept.append(item)
 
@@ -252,17 +360,34 @@ class WatchHistoryManager:
         return removed
 
     @staticmethod
+    def _entry_age_timestamp(item: Dict[str, Any]) -> Optional[datetime]:
+        """Return the newest timestamp that can date an entry (issue #68).
+
+        ``updated_at`` arrives with the release that introduced it. State files
+        written before that carry none, and treating a missing stamp as "keep
+        forever" meant the documented retention window never expired pre-upgrade
+        history. The watch timestamps are the next evidence of age; an entry with
+        no usable timestamp at all is bookkeeping that cannot be dated, so
+        pruning drops it rather than keeping it for ever.
+        """
+        for field in ("updated_at", "last_watched_at_plex", "last_watched_at_trakt"):
+            parsed = WatchHistoryManager._parse_entry_timestamp(item.get(field))
+            if parsed is not None:
+                return parsed
+        return None
+
+    def _forget(self, item: Dict[str, Any]) -> None:
+        """Drop an entry from the index and record its removal for the save."""
+        if item.get("plex_rating_key") is not None:
+            self._item_index.pop(item.get("plex_rating_key"), None)
+        key = self._item_key(item)
+        if key is not None:
+            self._removed_keys.add(key)
+
+    @staticmethod
     def _parse_entry_timestamp(value):
-        """Parse an entry's updated_at ISO string; None if missing/invalid."""
-        if not value:
-            return None
-        try:
-            parsed = datetime.fromisoformat(value)
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed
-        except (ValueError, TypeError):
-            return None
+        """Parse an entry timestamp through the shared parser; None if unusable."""
+        return parse_timestamp(value)
 
     def remove_synced_item(self, imdb_id=None, tmdb_id=None, trakt_id=None, plex_rating_key=None):
         """Remove a synced item from the state.
@@ -289,8 +414,7 @@ class WatchHistoryManager:
 
             if match:
                 self.state["synced_items"].pop(i)
-                if item.get("plex_rating_key") is not None:
-                    self._item_index.pop(item.get("plex_rating_key"), None)
+                self._forget(item)
                 logger.debug(f"Removed synced item: {item.get('imdb_id') or item.get('tmdb_id')}")
                 self.save_state()
                 return True
@@ -324,6 +448,10 @@ class WatchHistoryManager:
         """Clear all synced items and reset state."""
         self.state = self._create_empty_state()
         self._build_index()
+        self._removed_keys.clear()
+        # An explicit clear replaces the file: merging would resurrect every
+        # entry it just dropped.
+        self._replace_on_save = True
         self.save_state()
         logger.info("Cleared all watch sync state")
 
@@ -370,6 +498,9 @@ class WatchHistoryManager:
                 return False
 
             self.state = state
+            self._build_index()
+            self._removed_keys.clear()
+            self._replace_on_save = True
             self.save_state()
             logger.info(f"Restored watch sync state from backup: {backup_path}")
             return True

@@ -199,8 +199,8 @@ class TestPerformanceMonitorMemoryPaths:
         import traktor.performance as perf
 
         monkeypatch.setattr(perf, "psutil", None)
-        monkeypatch.setattr(perf, "sys", __import__("sys"))
-        monkeypatch.setattr(perf.sys, "platform", "linux")
+        # The ru_maxrss platform split lives in utils.rusage_maxrss_to_mb (#63).
+        monkeypatch.setattr("traktor.utils.sys.platform", "linux")
 
         monitor = perf.PerformanceMonitor()
         monitor.record_memory_usage()
