@@ -15,6 +15,7 @@ from typing import Any
 import requests
 
 from .log import logger
+from .utils import sanitize_terminal_text
 
 # GitHub API URL for latest release
 UPDATE_CHECK_URL = "https://api.github.com/repos/SwordfishTrumpet/traktor/releases/latest"
@@ -135,23 +136,29 @@ class AutoUpdater:
 
 
 def check_and_print_update() -> int:
-    """Check for updates and print results."""
+    """Check for updates and print results.
+
+    Every field comes from a GitHub response, so each one is rendered through
+    :func:`sanitize_terminal_text` before it reaches stdout: a release body
+    carrying control bytes could otherwise rewrite the user's screen or set the
+    clipboard (issue #43).
+    """
     updater = AutoUpdater()
     result = updater.check_for_update()
 
     if "error" in result:
-        print(f"❌ Failed to check for updates: {result['error']}")
+        print(f"❌ Failed to check for updates: {sanitize_terminal_text(result['error'])}")
         return 1
 
-    print(f"Current version: {result['current_version']}")
-    print(f"Latest version:  {result['latest_version']}")
+    print(f"Current version: {sanitize_terminal_text(result['current_version'])}")
+    print(f"Latest version:  {sanitize_terminal_text(result['latest_version'])}")
 
     if result["update_available"]:
         print("\n🎉 A new version is available!")
-        print(f"Release URL: {result['release_url']}")
+        print(f"Release URL: {sanitize_terminal_text(result['release_url'])}")
         if result["release_notes"]:
             print("\nRelease notes:")
-            print(result["release_notes"])
+            print(sanitize_terminal_text(result["release_notes"]))
         print("\nTo update, run: uv pip install -U traktor")
         return 0
 
@@ -165,14 +172,17 @@ def apply_update_and_print() -> int:
     result = updater.check_for_update()
 
     if "error" in result:
-        print(f"❌ Failed to check for updates: {result['error']}")
+        print(f"❌ Failed to check for updates: {sanitize_terminal_text(result['error'])}")
         return 1
 
     if not result["update_available"]:
         print("✅ No update available.")
         return 0
 
-    print(f"Applying update from {result['current_version']} to {result['latest_version']}...")
+    print(
+        f"Applying update from {sanitize_terminal_text(result['current_version'])} "
+        f"to {sanitize_terminal_text(result['latest_version'])}..."
+    )
     success = updater.apply_update()
     if not success:
         print("❌ Auto-update is not implemented. Please update manually:")
