@@ -15,3 +15,23 @@
 21	uv run pytest -q tests/test_watch_sync.py tests/test_clients.py -k "DeltaEpisodeReuse or ShowCountersAndEpisodeSnapshots"	0	performance
 22	uv run pytest -q tests/test_watch_sync.py tests/test_sync.py -k "ShowReadFailuresAreSurfaced or failed_watch_sync"	0	reliability
 39	uv run pytest -q tests/test_watch_sync.py -k "UnwatchedShowsAreNotRead or DeltaEpisodeReuse"	0	performance
+41	uv run pytest -q tests/test_clients.py -k "CachedRatingKeyValidation"	0	security
+42	uv run pytest -q tests/test_resilience.py -k "BackupVerificationOrder"	0	data-integrity
+23	uv run pytest -q tests/test_utils.py tests/test_config.py tests/test_clients.py tests/test_history_manager.py tests/test_resilience.py -k "atomic or interrupted or failed_config_save"	0	data-integrity
+43	uv run pytest -q tests/test_auto_update.py tests/test_sync.py -k "control_bytes"	0	security
+44	uv run pytest -q tests/test_clients.py -k "rejected_refresh or other_refresh"	0	security
+45	uv run pytest -q tests/test_sync.py -k "does_not_log_the_authorization_code"	0	privacy
+46	uv run pytest -q tests/test_clients.py -k "page_count_is_unknown"	0	correctness
+47	uv run pytest -q tests/test_config.py -k "non_object_json"	0	correctness
+48	uv run pytest -q tests/test_config.py -k "partial_cli_plex"	0	correctness
+49	uv run pytest -q tests/test_config.py -k "c_locale"	0	portability
+50	uv run pytest -q tests/test_clients.py -k "duplicate_token_keys"	0	correctness
+51	uv run pytest -q tests/test_clients.py -k "retry_after"	0	correctness
+52	uv run pytest -q tests/test_main.py -k "exported_version"	0	correctness
+53	uv run pytest -q tests/test_sync.py -k "scans_the_library_once or far_down_a_large_library"	0	performance
+54	uv run pytest -q tests/test_clients.py tests/test_sync.py -k "first_episode"	0	performance
+55	uv run pytest -q tests/test_clients.py -k "reused_within_the_run"	0	performance
+56	uv run pytest -q tests/test_packaging.py -k "lock_file"	0	build
+57	uv run pytest -q tests/test_packaging.py -k "compose or clean_removes"	0	deployment
+58	uv run pytest -q tests/test_packaging.py -k "official_source or runtime_keys"	0	deployment
+59	uv run pytest -q tests/test_cli.py tests/test_resilience.py -k "health or first_failure"	0	observability
