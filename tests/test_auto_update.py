@@ -6,6 +6,7 @@ from traktor.auto_update import (
     AutoUpdater,
     apply_update_and_print,
     check_and_print_update,
+    release_wheel_url,
 )
 
 
@@ -337,3 +338,45 @@ def test_release_text_control_bytes_are_escaped(capsys):
     assert "\x1b" not in captured.out
     assert "\\x1b" in captured.out
     assert "v9.9.9" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Releases are distributed as GitHub Release assets, not through an index (#73)
+# ---------------------------------------------------------------------------
+
+
+def test_update_instruction_points_at_the_release_wheel(capsys):
+    """The update command must fetch the artifact the release workflow attaches."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "tag_name": "v9.9.9",
+        "html_url": "https://example.invalid/release",
+        "body": "notes",
+    }
+
+    with patch("traktor.auto_update.requests.get", return_value=fake_response):
+        assert check_and_print_update() == 0
+
+    out = capsys.readouterr().out
+    assert release_wheel_url("9.9.9") in out
+    assert "traktor-9.9.9-py3-none-any.whl" in out
+    assert "git pull && uv sync" in out
+    # Nothing is published to a package index, so this command would do nothing.
+    assert "pip install -U traktor" not in out
+
+
+def test_manual_update_path_prints_the_same_instruction(capsys):
+    """--apply-update is a stub, so the command it prints is the real update path."""
+    fake_response = MagicMock()
+    fake_response.json.return_value = {
+        "tag_name": "v9.9.9",
+        "html_url": "https://example.invalid/release",
+        "body": "notes",
+    }
+
+    with patch("traktor.auto_update.requests.get", return_value=fake_response):
+        assert apply_update_and_print() == 1
+
+    out = capsys.readouterr().out
+    assert release_wheel_url("9.9.9") in out
+    assert "pip install -U traktor" not in out

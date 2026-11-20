@@ -19,6 +19,10 @@ from .utils import sanitize_terminal_text
 
 # GitHub API URL for latest release
 UPDATE_CHECK_URL = "https://api.github.com/repos/SwordfishTrumpet/traktor/releases/latest"
+# Releases are distributed as the wheel attached to the GitHub Release, not
+# through a package index, so this is where an update is fetched from.
+RELEASE_DOWNLOAD_URL = "https://github.com/SwordfishTrumpet/traktor/releases/latest/download"
+WHEEL_NAME_TEMPLATE = "traktor-{version}-py3-none-any.whl"
 
 # Constants
 UPDATE_TIMEOUT_SECONDS = 10
@@ -31,6 +35,22 @@ elif importlib.util.find_spec("tomli"):
     tomllib = __import__("tomli")
 else:
     tomllib = None
+
+
+def release_wheel_url(version: str) -> str:
+    """Return the download URL of the wheel attached to a release.
+
+    A release here is a tag plus a GitHub Release whose assets are the built
+    wheel and sdist, so the wheel's URL is the update path a user can paste.
+
+    Args:
+        version: Release version, e.g. ``1.1.1`` or ``v1.1.1``
+
+    Returns:
+        Absolute URL of that release's wheel
+    """
+    bare = version[1:] if version.startswith("v") else version
+    return f"{RELEASE_DOWNLOAD_URL}/{WHEEL_NAME_TEMPLATE.format(version=bare)}"
 
 
 class AutoUpdater:
@@ -159,11 +179,27 @@ def check_and_print_update() -> int:
         if result["release_notes"]:
             print("\nRelease notes:")
             print(sanitize_terminal_text(result["release_notes"]))
-        print("\nTo update, run: uv pip install -U traktor")
+        print_update_commands(result["latest_version"])
         return 0
 
     print("\n✅ You are running the latest version.")
     return 0
+
+
+def print_update_commands(version: str) -> None:
+    """Print how to update to ``version``: pull a checkout, or install its wheel.
+
+    Releases are not published to a package index: the release workflow attaches
+    the wheel to the GitHub Release, so that artifact is what an update installs and
+    `uv pip install -U traktor` would fetch nothing.
+
+    Args:
+        version: Version to update to
+    """
+    safe_version = sanitize_terminal_text(version)
+    print("\nTo update a checkout of this repository: git pull && uv sync")
+    print("To install the release wheel instead:")
+    print(f'  uv pip install "{sanitize_terminal_text(release_wheel_url(safe_version))}"')
 
 
 def apply_update_and_print() -> int:
@@ -186,6 +222,6 @@ def apply_update_and_print() -> int:
     success = updater.apply_update()
     if not success:
         print("❌ Auto-update is not implemented. Please update manually:")
-        print("  uv pip install -U traktor")
+        print_update_commands(result["latest_version"])
         return 1
     return 0

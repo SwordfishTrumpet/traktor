@@ -1,5 +1,10 @@
 name: Release
 
+# A `v*` tag is the release. This workflow tests the tree, builds the wheel and
+# sdist, and attaches them to the GitHub Release it creates. That release is the
+# distribution channel: nothing is published to PyPI, so there is no package
+# index account, token or trusted publisher to configure.
+
 on:
   push:
     tags:
@@ -7,7 +12,6 @@ on:
 
 permissions:
   contents: write
-  id-token: write
 
 jobs:
   build-and-publish:
@@ -38,11 +42,6 @@ jobs:
 
       - name: Build package
         run: uv build
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
 
       - name: Generate release notes
         id: release_notes

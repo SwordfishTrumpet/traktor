@@ -157,6 +157,8 @@ cp .env.example .env  # then edit .env with your credentials
 
 `uv sync` installs the runtime and the development tools in one step, because they live in the project's dependency groups.
 
+That is the supported install: traktor is not published to a package index. A tagged release is a GitHub Release whose assets are the wheel and sdist that workflow built, so `uv pip install "https://github.com/SwordfishTrumpet/traktor/releases/latest/download/traktor-<version>-py3-none-any.whl"` also works when you want a specific release rather than a checkout.
+
 ## 7. Credentials
 
 **Trakt.** Create an application at [trakt.tv/oauth/applications](https://trakt.tv/oauth/applications) and copy its Client ID and Client Secret. `TRAKT_REDIRECT_URI` must exactly match the redirect URI you registered, or Trakt rejects the login with `invalid_redirect`. The default `urn:ietf:wg:oauth:2.0:oob` matches the "out of band" style app.

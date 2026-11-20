@@ -146,13 +146,11 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ### Releasing and rollback
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, which tests the tree, builds the wheel
-and sdist, publishes to PyPI and creates the GitHub Release from this section. The publish step
-does not work yet: the `release` environment carries no `PYPI_API_TOKEN` and PyPI has no trusted
-publisher for this repository, so the run fails there and the release is never created. This
-section is therefore prepared, not shipped - issue #73 tracks the fix. PyPI cannot unpublish a
-version, so the remedy for a bad release is to yank it and ship the next patch; that procedure
-is not documented yet either - issue #72.
+A `v*` tag is the release. `.github/workflows/release.yml` tests the tree, builds the wheel and
+sdist, and attaches both to the GitHub Release it creates from this section; nothing is
+published to PyPI, so no package-index account is involved. Updating means pulling a checkout
+(`git pull && uv sync`) or installing that release's wheel. Rolling back a release still has no
+written procedure - issue #72 tracks it.
 
 ### Every commit in this release
 
