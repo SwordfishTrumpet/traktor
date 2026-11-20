@@ -24,7 +24,7 @@ def test_exported_version_matches_the_package_metadata():
     declared = None
     for line in pyproject.read_text(encoding="utf-8").splitlines():
         if line.startswith("version"):
-            declared = line.split("\"")[1]
+            declared = line.split('"')[1]
             break
 
     assert declared is not None

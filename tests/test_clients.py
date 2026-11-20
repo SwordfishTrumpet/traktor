@@ -2232,9 +2232,7 @@ class TestCachedRatingKeyValidation:
             "movies_by_tmdb": {},
             "shows_by_imdb": {},
             "shows_by_tmdb": {},
-            "movies_list": [
-                {"title": "Injected", "year": 2026, "ratingKey": "@127.0.0.1:9/steal"}
-            ],
+            "movies_list": [{"title": "Injected", "year": 2026, "ratingKey": "@127.0.0.1:9/steal"}],
             "shows_list": [],
             "by_rating_key": {},
         }
@@ -2445,8 +2443,7 @@ class TestTokenFile:
     @pytest.mark.parametrize("status", [400, 401, 403])
     def test_rejected_refresh_removes_the_credential(self, status, env_file):
         env_file.write_text(
-            "TRAKT_ACCESS_TOKEN=revoked-access-0001\n"
-            "TRAKT_REFRESH_TOKEN=revoked-refresh-0001\n",
+            "TRAKT_ACCESS_TOKEN=revoked-access-0001\n" "TRAKT_REFRESH_TOKEN=revoked-refresh-0001\n",
             encoding="utf-8",
         )
         auth = clients.TraktAuth()
