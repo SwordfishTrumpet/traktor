@@ -3,6 +3,7 @@ import builtins
 import json
 import sys
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
@@ -227,3 +228,114 @@ class TestSaveConfigPermissions:
         config_module.save_config({"managed_playlists": ["x"]})
 
         assert (target.stat().st_mode & 0o777) == 0o600
+
+
+# ---------------------------------------------------------------------------
+# Issue #47: a config that is valid JSON but not an object
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ["[]", "null", "42", '"text"', "true"])
+def test_load_config_rejects_non_object_json(raw, tmp_path, monkeypatch):
+    """A non-object config is corrupt, not data, so defaults are used (#47)."""
+    target = tmp_path / "config.json"
+    target.write_text(raw, encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", target)
+
+    assert config.load_config() == {}
+
+
+def test_load_config_still_returns_an_object(tmp_path, monkeypatch):
+    target = tmp_path / "config.json"
+    target.write_text('{"managed_playlists": ["Café"]}', encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", target)
+
+    assert config.load_config() == {"managed_playlists": ["Café"]}
+
+
+# ---------------------------------------------------------------------------
+# Issue #49: config reads use UTF-8 whatever the ambient locale is
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_reads_utf8_under_a_c_locale(tmp_path):
+    """A non-UTF locale must not make a valid UTF-8 config unreadable (#49)."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    target = tmp_path / "config.json"
+    payload = {"managed_playlists": ["Café", "日本語"]}
+    target.write_text(json.dumps(payload), encoding="utf-8")
+
+    src_root = Path(__file__).resolve().parents[1] / "src"
+    env = {
+        **os.environ,
+        "LC_ALL": "C",
+        "LANG": "C",
+        "PYTHONUTF8": "0",
+        "PYTHONCOERCECLOCALE": "0",
+        "PYTHONPATH": str(src_root),
+    }
+    code = (
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "from traktor import config\n"
+        "config.CONFIG_FILE = Path(sys.argv[1])\n"
+        "print(json.dumps(config.load_config()))\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(target)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["managed_playlists"] == ["Café", "日本語"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #48: a lone --plex-url or --plex-token is a mistake
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        SimpleNamespace(plex_url="http://new-server:32400", plex_token=None),
+        SimpleNamespace(plex_url=None, plex_token="new-token"),
+    ],
+)
+def test_partial_cli_plex_credentials_are_rejected(args, monkeypatch, tmp_path):
+    """One flag alone must not silently fall back to the saved server (#48)."""
+    monkeypatch.delenv("PLEX_URL", raising=False)
+    monkeypatch.delenv("PLEX_TOKEN", raising=False)
+    saved = tmp_path / "config.json"
+    saved.write_text(
+        json.dumps({"plex_url": "http://old-server:32400", "plex_token": "old-token"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_FILE", saved)
+
+    with pytest.raises(ValueError, match="must be given together"):
+        config.get_plex_credentials(args)
+
+
+# ---------------------------------------------------------------------------
+# Issue #23: an interrupted config save keeps the previous file
+# ---------------------------------------------------------------------------
+
+
+def test_failed_config_save_keeps_the_previous_file(tmp_path, monkeypatch):
+    target = tmp_path / "config.json"
+    monkeypatch.setattr(config, "CONFIG_FILE", target)
+    config.save_config({"plex_url": "http://kept:32400"})
+    before = target.read_text(encoding="utf-8")
+
+    with patch("traktor.utils.os.fsync", side_effect=OSError(28, "No space left on device")):
+        config.save_config({"plex_url": "http://lost:32400"})
+
+    assert target.read_text(encoding="utf-8") == before
+    assert "kept" in before
