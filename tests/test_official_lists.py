@@ -579,3 +579,82 @@ class TestOfficialListsServiceEdgeCases:
             service = OfficialListsService(cache_dir=tmp_path)
             playlists = service.get_playlists_from_endpoints([], separate_playlists=True)
             assert len(playlists) == 0
+
+
+# ---------------------------------------------------------------------------
+# Issue #66: the cache is keyed by period, not just by endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestPeriodAwareCache:
+    """A monthly request must not be served the weekly answer."""
+
+    @pytest.fixture
+    def service(self, tmp_path):
+        with patch("traktor.trakt_official.TRAKT_CLIENT_ID", "test_client_id"):
+            return OfficialListsService(cache_dir=tmp_path)
+
+    def _items(self, period):
+        return [
+            {
+                "type": "movie",
+                "movie": {"title": f"{period} movie", "year": 2024, "ids": {"imdb": "tt1"}},
+                "score": 1,
+            }
+        ]
+
+    def test_each_period_is_fetched_once_and_cached_under_its_own_name(self, service):
+        """Weekly and monthly both reach the API and land in two files (#66)."""
+        calls = []
+
+        def fake_get_endpoint(endpoint_name, period="weekly"):
+            calls.append((endpoint_name, period))
+            return self._items(period)
+
+        service.client.get_endpoint = fake_get_endpoint
+
+        weekly = service.fetch_endpoint("movies.played", period="weekly")
+        monthly = service.fetch_endpoint("movies.played", period="monthly")
+
+        assert [period for _, period in calls] == ["weekly", "monthly"]
+        assert weekly[0]["movie"]["title"] == "weekly movie"
+        assert monthly[0]["movie"]["title"] == "monthly movie"
+        assert (service.cache_dir / "movies_played_weekly.json").exists()
+        assert (service.cache_dir / "movies_played_monthly.json").exists()
+
+    def test_a_cached_period_is_served_from_its_own_file(self, service):
+        """The second weekly call is a cache hit, not a third API call."""
+        calls = []
+
+        def fake_get_endpoint(endpoint_name, period="weekly"):
+            calls.append(period)
+            return self._items(period)
+
+        service.client.get_endpoint = fake_get_endpoint
+
+        service.fetch_endpoint("movies.played", period="weekly")
+        service.fetch_endpoint("movies.played", period="monthly")
+        again = service.fetch_endpoint("movies.played", period="weekly")
+
+        assert calls == ["weekly", "monthly"]
+        assert again[0]["movie"]["title"] == "weekly movie"
+
+    def test_endpoints_without_a_period_keep_their_plain_cache_name(self, service):
+        """Trending does not depend on the period, so its cache name is unchanged."""
+        service.client.get_endpoint = lambda endpoint_name, period="weekly": self._items(period)
+
+        service.fetch_endpoint("movies.trending", period="weekly")
+
+        assert service._get_cache_file("movies.trending").name == "movies_trending.json"
+        assert (service.cache_dir / "movies_trending.json").exists()
+
+    def test_clearing_one_period_leaves_the_other(self, service):
+        """Asking to clear monthly must not delete the weekly cache file."""
+        service.client.get_endpoint = lambda endpoint_name, period="weekly": self._items(period)
+        service.fetch_endpoint("movies.played", period="weekly")
+        service.fetch_endpoint("movies.played", period="monthly")
+
+        service.clear_cache("movies.played", period="monthly")
+
+        assert not (service.cache_dir / "movies_played_monthly.json").exists()
+        assert (service.cache_dir / "movies_played_weekly.json").exists()

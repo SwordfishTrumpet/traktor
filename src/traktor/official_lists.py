@@ -16,6 +16,11 @@ from .settings import CACHE_DIR
 from .trakt_official import TraktOfficialClient
 from .utils import write_json_atomic
 
+# Endpoints whose contents depend on the requested period. The cache file names
+# them by period, because a monthly request served from the weekly file filled
+# every monthly playlist with weekly items (issue #66).
+PERIOD_SENSITIVE_CATEGORIES = {"played", "watched", "collected"}
+
 
 class OfficialListsService:
     """Service for managing Trakt official curated lists.
@@ -39,20 +44,42 @@ class OfficialListsService:
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         logger.debug("OfficialListsService initialized")
 
-    def _get_cache_file(self, endpoint_name: str) -> Path:
-        """Get the cache file path for an endpoint."""
-        return self.cache_dir / f"{endpoint_name.replace('.', '_')}.json"
+    def _get_cache_file(self, endpoint_name: str, period: str = "weekly") -> Path:
+        """Get the cache file path for an endpoint.
 
-    def _is_cache_valid(self, endpoint_name: str) -> bool:
+        Stats endpoints answer differently per period, so the period is part of
+        their cache key; the others ignore it and keep their plain name
+        (issue #66).
+
+        Args:
+            endpoint_name: Name of the endpoint (e.g., "movies.trending")
+            period: Period the endpoint was (or will be) requested for
+
+        Returns:
+            Path of the cache file for that endpoint and period
+        """
+        stem = endpoint_name.replace(".", "_")
+        if self._is_period_sensitive(endpoint_name):
+            stem = f"{stem}_{period}"
+        return self.cache_dir / f"{stem}.json"
+
+    @staticmethod
+    def _is_period_sensitive(endpoint_name: str) -> bool:
+        """Return True when an endpoint's answer depends on the period."""
+        parts = endpoint_name.split(".")
+        return len(parts) > 1 and parts[1].lower() in PERIOD_SENSITIVE_CATEGORIES
+
+    def _is_cache_valid(self, endpoint_name: str, period: str = "weekly") -> bool:
         """Check if cache for an endpoint is still valid.
 
         Args:
             endpoint_name: Name of the endpoint
+            period: Period the cache must belong to
 
         Returns:
             True if cache is valid, False otherwise
         """
-        cache_file = self._get_cache_file(endpoint_name)
+        cache_file = self._get_cache_file(endpoint_name, period)
         if not cache_file.exists():
             return False
 
@@ -70,19 +97,20 @@ class OfficialListsService:
             logger.error(f"Error checking cache validity for {endpoint_name}: {e}")
             return False
 
-    def _load_cache(self, endpoint_name: str) -> Optional[List[Dict]]:
-        """Load cached data for an endpoint.
+    def _load_cache(self, endpoint_name: str, period: str = "weekly") -> Optional[List[Dict]]:
+        """Load cached data for an endpoint and period.
 
         Args:
             endpoint_name: Name of the endpoint
+            period: Period the cache must belong to
 
         Returns:
             List of cached items or None if not valid
         """
-        if not self._is_cache_valid(endpoint_name):
+        if not self._is_cache_valid(endpoint_name, period):
             return None
 
-        cache_file = self._get_cache_file(endpoint_name)
+        cache_file = self._get_cache_file(endpoint_name, period)
         try:
             with open(cache_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -92,29 +120,31 @@ class OfficialListsService:
             logger.error(f"Failed to load cache for {endpoint_name}: {e}")
             return None
 
-    def _save_cache(self, endpoint_name: str, items: List[Dict]):
-        """Save data to cache for an endpoint.
+    def _save_cache(self, endpoint_name: str, items: List[Dict], period: str = "weekly"):
+        """Save data to cache for an endpoint and period.
 
         Args:
             endpoint_name: Name of the endpoint
             items: List of items to cache
+            period: Period the items were requested for
         """
-        cache_file = self._get_cache_file(endpoint_name)
+        cache_file = self._get_cache_file(endpoint_name, period)
         if not write_json_atomic(cache_file, items, indent=None):
             logger.error(f"Failed to save cache for {endpoint_name}")
             return
         logger.debug(f"Saved {len(items)} items to cache for {endpoint_name}")
 
-    def _load_stale_cache(self, endpoint_name: str) -> Optional[List[Dict]]:
+    def _load_stale_cache(self, endpoint_name: str, period: str = "weekly") -> Optional[List[Dict]]:
         """Load stale cache as fallback when API request fails.
 
         Args:
             endpoint_name: Name of the endpoint
+            period: Period the stale cache must belong to
 
         Returns:
             List of cached items or None if not available/readable
         """
-        cache_file = self._get_cache_file(endpoint_name)
+        cache_file = self._get_cache_file(endpoint_name, period)
         if cache_file.exists():
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
@@ -225,9 +255,9 @@ class OfficialListsService:
         """
         # Try cache first
         if use_cache:
-            cached = self._load_cache(endpoint_name)
+            cached = self._load_cache(endpoint_name, period)
             if cached is not None:
-                logger.info(f"Using cached data for {endpoint_name}")
+                logger.info(f"Using cached data for {endpoint_name} ({period})")
                 return cached
 
         # Fetch from API
@@ -236,27 +266,27 @@ class OfficialListsService:
 
             # Save to cache
             if use_cache:
-                self._save_cache(endpoint_name, items)
+                self._save_cache(endpoint_name, items, period)
 
             return items
         except requests.exceptions.RequestException as e:
             logger.error(f"Network error fetching {endpoint_name}: {e}")
             if use_cache:
-                stale = self._load_stale_cache(endpoint_name)
+                stale = self._load_stale_cache(endpoint_name, period)
                 if stale is not None:
                     return stale
             return []
         except (KeyError, ValueError, TypeError) as e:
             logger.error(f"Data error fetching {endpoint_name}: {e}")
             if use_cache:
-                stale = self._load_stale_cache(endpoint_name)
+                stale = self._load_stale_cache(endpoint_name, period)
                 if stale is not None:
                     return stale
             return []
         except Exception as e:
             logger.error(f"Unexpected error fetching {endpoint_name}: {e}")
             if use_cache:
-                stale = self._load_stale_cache(endpoint_name)
+                stale = self._load_stale_cache(endpoint_name, period)
                 if stale is not None:
                     return stale
             return []
@@ -429,17 +459,24 @@ class OfficialListsService:
 
         return playlists
 
-    def clear_cache(self, endpoint_name: Optional[str] = None):
-        """Clear cache for an endpoint or all endpoints.
+    def clear_cache(self, endpoint_name: Optional[str] = None, period: Optional[str] = None):
+        """Clear cache for an endpoint (one period) or all endpoints.
 
         Args:
             endpoint_name: Specific endpoint to clear, or None for all
+            period: Period to clear for a stats endpoint; None removes every
+                period this endpoint cached
         """
         if endpoint_name:
-            cache_file = self._get_cache_file(endpoint_name)
-            if cache_file.exists():
-                cache_file.unlink()
-                logger.info(f"Cleared cache for {endpoint_name}")
+            if period is not None:
+                cache_files = [self._get_cache_file(endpoint_name, period)]
+            else:
+                stem = endpoint_name.replace(".", "_")
+                cache_files = sorted(self.cache_dir.glob(f"{stem}*.json"))
+            for cache_file in cache_files:
+                if cache_file.exists():
+                    cache_file.unlink()
+                    logger.info(f"Cleared cache for {cache_file.name}")
         else:
             # Clear all cache files
             for cache_file in self.cache_dir.glob("*.json"):
