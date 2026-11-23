@@ -851,7 +851,7 @@ class TestSyncListsOrchestration:
         trakt_client.get_liked_lists.return_value = []
         trakt_client.get_own_lists.return_value = []
         trakt_client.get_watched_movies.return_value = []
-        trakt_client.get_watched_shows.return_value = []
+        trakt_client.get_watched_episodes.return_value = []
 
         monkeypatch.setattr(sync, "PlexServer", lambda *a, **k: server)
         monkeypatch.setattr(sync, "CacheManager", lambda *a, **k: cache_mgr)

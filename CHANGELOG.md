@@ -6,6 +6,30 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ## [Unreleased]
 
+### Fixed
+
+- **Episodes watched on Trakt are marked watched in Plex again (high)**
+  - `GET /sync/watched/shows` stopped nesting `seasons`/`episodes`: it now returns one
+    show-level entry per show (`plays`, `last_watched_at`, `show`), with or without
+    `extended=full`. `_pull_from_trakt()` parsed that payload as an episode list, so every
+    run pulled **zero episodes** - an episode watched anywhere that scrobbles to Trakt
+    (Stremio, a phone, a TV) could never be marked watched in Plex. The log line that hid
+    it, `Retrieved 100 watched show(s) with 0 episode(s)`, was reported as an INFO count
+    and never checked
+  - Watched episodes now come from `GET /sync/history/episodes`, the only watched-episode
+    source that carries both halves of an episode's identity: the parent show's ids and the
+    episode's `season`/`number`. `TraktClient.get_watched_shows()` is replaced by
+    `get_watched_episodes()`, which paginates through `_paginated_get()`
+  - The same endpoint was also truncated: `get_watched_shows()` made a single unpaginated
+    request, so only the first 100 watched shows (of 297 here) were ever read. Live check:
+    `X-Pagination-Item-Count: 297`, `X-Pagination-Page-Count: 3`
+  - Rewatches arrive once per play, so the pull keeps the newest `watched_at` per
+    (show, season, episode) via `utils.parse_timestamp()` and counts the plays. Entries
+    without a show IMDb id are skipped and reported: their key would be shared by every
+    show lacking one, and matching one show's episode for another's is worse than a skip
+  - Live account: 3,714 plays collapse to 3,563 watched episodes, including the three
+    newest South Park episodes that had to be marked in Plex by hand
+
 ## [1.1.1] - 2026-11-20
 
 ### Added

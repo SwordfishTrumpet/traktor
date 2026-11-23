@@ -1762,29 +1762,38 @@ class TraktClient:
             logger.error(f"Failed to fetch watched movies: {e}", exc_info=True)
             raise
 
-    def get_watched_shows(self) -> List[Dict[str, Any]]:
-        """Get all watched shows with episodes from Trakt.
+    def get_watched_episodes(self) -> List[Dict[str, Any]]:
+        """Get every episode play the user has recorded, with its show.
+
+        ``GET /sync/history/episodes`` is the only watched-episode source that
+        carries both halves of an episode's identity: the parent show's ids and
+        the episode's own ``season``/``number`` (verified live 2026-11-23).
+
+        - ``GET /sync/watched/shows`` no longer nests ``seasons``/``episodes``.
+          It returns one show-level entry per show (``plays``,
+          ``last_watched_at``, ``show``), with or without ``extended=full``, so
+          it cannot say *which* episodes were watched.
+        - ``GET /sync/watched/episodes`` lists watched episodes but omits the
+          parent show entirely, even with ``extended=full``.
+
+        An episode appears once per play, so rewatches duplicate it; callers
+        dedupe by (show, season, number) and keep the newest ``watched_at``.
+        Trakt deletes an entry when a play is removed from history, so this list
+        is the watched state and not merely a log of past plays.
 
         Returns:
-            List of shows with seasons and episodes marked as watched
+            List of history entries, each with ``show``, ``episode``,
+            ``watched_at`` and ``action``
         """
-        logger.info("Fetching watched shows from Trakt...")
+        logger.info("Fetching watched episodes from Trakt...")
 
         try:
-            response = self._request("sync/watched/shows")
-            data = response.json()
-
-            # Count total episodes
-            episode_count = 0
-            for show in data:
-                for season in show.get("seasons", []):
-                    episode_count += len(season.get("episodes", []))
-
-            logger.info(f"Retrieved {len(data)} watched show(s) with {episode_count} episode(s)")
-            return data
+            all_items = self._paginated_get("sync/history/episodes")
+            logger.info(f"Retrieved {len(all_items)} watched episode play(s)")
+            return all_items
 
         except Exception as e:
-            logger.error(f"Failed to fetch watched shows: {e}", exc_info=True)
+            logger.error(f"Failed to fetch watched episodes: {e}", exc_info=True)
             raise
 
     def _post_with_token_refresh(self, url, payload, action_description="API request"):

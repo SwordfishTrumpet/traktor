@@ -1,5 +1,6 @@
 """Shared test fixtures for traktor tests."""
 
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
@@ -174,3 +175,37 @@ def mock_conflict_resolver():
     resolver.strategy = "newest_wins"
     resolver.resolve.return_value = "plex"  # Default to Plex wins
     return resolver
+
+
+# The real credential store of the machine running the tests. TraktorAuth
+# resolves `.env` from the working directory, so a test that forgets to redirect
+# it writes the developer's live Trakt tokens.
+_REAL_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
+
+
+@pytest.fixture(autouse=True)
+def protect_real_env_file():
+    """Fail a test that rewrites the developer's real .env, and undo the write.
+
+    ``TraktAuth.save_tokens()`` and ``clear_tokens()`` resolve the token store
+    from the working directory, so a test that calls either without redirecting
+    it silently edits ``./.env``. Two such tests wiped the tokens of the machine
+    they ran on, and nothing said so: the suite stayed green and the next run
+    failed authentication. The file is snapshotted here, restored if a test
+    touched it, and that test is failed by name.
+    """
+    if not _REAL_ENV_FILE.exists():
+        yield
+        return
+
+    before = _REAL_ENV_FILE.read_bytes()
+    yield
+    after = _REAL_ENV_FILE.read_bytes()
+
+    if after != before:
+        _REAL_ENV_FILE.write_bytes(before)
+        pytest.fail(
+            f"{_REAL_ENV_FILE} was rewritten by this test. Redirect the token store "
+            "(monkeypatch TraktAuth.env_file_path or chdir to tmp_path) instead of "
+            "editing the developer's real credentials."
+        )

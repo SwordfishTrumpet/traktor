@@ -78,6 +78,53 @@ class WatchSyncEngine:
         """
         return parse_timestamp(timestamp)
 
+    @staticmethod
+    def _trakt_episode_key(entry: Dict[str, Any]) -> Optional[tuple]:
+        """Build the episode key for one Trakt history entry.
+
+        Episode keys are ``("episode", show_imdb, season_num, episode_num)``
+        because that is what the Plex side can be keyed by: a Plex show's IMDb
+        ID is cached, while an individual episode's external IDs are not.
+
+        The show's IMDb ID is therefore the load-bearing part. Without it the
+        key would be ``("episode", None, season, episode)``, which every show
+        without an IMDb ID on either side shares - matching one show's episode
+        for another's. Such an entry is reported instead of guessed at.
+
+        Args:
+            entry: One ``/sync/history/episodes`` row
+
+        Returns:
+            The 4-tuple key, or None when the entry cannot identify an episode
+        """
+        show_ids = (entry.get("show") or {}).get("ids") or {}
+        episode = entry.get("episode") or {}
+        show_imdb = show_ids.get("imdb")
+        season_num = episode.get("season")
+        episode_num = episode.get("number")
+
+        if not show_imdb or season_num is None or episode_num is None:
+            return None
+
+        return ("episode", show_imdb, season_num, episode_num)
+
+    @staticmethod
+    def _is_newer(candidate, current) -> bool:
+        """True when ``candidate`` is a later timestamp than ``current``.
+
+        Both arrive as platform strings. The comparison goes through
+        :func:`utils.parse_timestamp` so a naive or differently-zoned value is
+        never compared against a UTC one (issue #20). An unparseable candidate
+        is not newer; an unparseable ``current`` is replaced.
+        """
+        candidate_dt = parse_timestamp(candidate)
+        if candidate_dt is None:
+            return False
+        current_dt = parse_timestamp(current)
+        if current_dt is None:
+            return True
+        return candidate_dt > current_dt
+
     def __init__(
         self,
         plex_client: Any,
@@ -900,7 +947,7 @@ class WatchSyncEngine:
             # start_at) because that would silently drop movies watched before
             # the last sync - e.g. movies watched on other services weeks or
             # months ago would never be marked as watched in Plex. This matches
-            # how shows are handled below (full get_watched_shows() list).
+            # how shows are handled below (full get_watched_episodes() list).
             # Delta filtering is still applied on the Plex side, where unwatched
             # items (no lastViewedAt) are never skipped, so the sync stays both
             # correct and cheap.
@@ -923,46 +970,60 @@ class WatchSyncEngine:
                         "plays": movie.get("plays", 1),
                     }
 
-            # Get watched shows/episodes (unless movies_only is True)
+            # Watched episodes (unless movies_only is True). Trakt's
+            # /sync/watched/shows stopped nesting seasons and episodes (verified
+            # live 2026-11-23): it returns one show-level entry per show, so
+            # reading it as an episode list yielded zero episodes and no episode
+            # watched on Trakt could ever be marked in Plex. The play history
+            # carries both the show's ids and the episode's season/number, so it
+            # is the source of both halves of the key. It is a full pull for the
+            # same reason as movies above: an episode watched months ago is
+            # still part of the watched state.
             if not movies_only:
-                watched_shows = self.trakt.get_watched_shows()
-                for show in watched_shows:
-                    show_ids = show.get("show", {}).get("ids", {})
-                    show_title = show.get("show", {}).get("title", "Unknown")
+                watched_episodes = self.trakt.get_watched_episodes()
+                unusable = 0
 
-                    for season in show.get("seasons", []):
-                        season_num = season.get("number")
-                        for episode in season.get("episodes", []):
-                            # Handle episode being either a dict or just an episode number
-                            if isinstance(episode, dict):
-                                episode_num = episode.get("number")
-                                ep_ids = episode.get("ids", {})
-                                last_watched_at = episode.get("last_watched_at")
-                                trakt_id = ep_ids.get("trakt")
-                            else:
-                                # Episode is just the episode number (int)
-                                episode_num = episode
-                                ep_ids = {}
-                                last_watched_at = None
-                                trakt_id = None
+                for entry in watched_episodes:
+                    episode_key = self._trakt_episode_key(entry)
+                    if episode_key is None:
+                        # No show IMDb id (or a season/episode number): the key
+                        # would be shared by unrelated shows, and matching one
+                        # Plex episode for another is worse than not syncing it.
+                        unusable += 1
+                        continue
 
-                            # Build unique key using show, season, and episode numbers
-                            key = (
-                                "episode",
-                                show_ids.get("imdb"),
-                                season_num,
-                                episode_num,
-                            )
+                    season_num = episode_key[2]
+                    episode_num = episode_key[3]
+                    episode = entry.get("episode") or {}
+                    show = entry.get("show") or {}
+                    show_title = show.get("title") or "Unknown"
+                    watched_at = entry.get("watched_at")
 
-                            trakt_state[key] = {
-                                "watched": True,
-                                "last_watched_at": last_watched_at,
-                                "trakt_id": trakt_id,
-                                "title": f"{show_title} S{season_num}E{episode_num}",
-                                "show_title": show_title,
-                                "season": season_num,
-                                "episode": episode_num,
-                            }
+                    existing = trakt_state.get(episode_key)
+                    if existing is None:
+                        trakt_state[episode_key] = {
+                            "watched": True,
+                            "last_watched_at": watched_at,
+                            "trakt_id": (episode.get("ids") or {}).get("trakt"),
+                            "title": f"{show_title} S{season_num}E{episode_num}",
+                            "show_title": show_title,
+                            "season": season_num,
+                            "episode": episode_num,
+                            "plays": 1,
+                        }
+                        continue
+
+                    # A rewatched episode arrives once per play: keep the newest
+                    # watch date, because that is the one the resolver compares.
+                    existing["plays"] += 1
+                    if self._is_newer(watched_at, existing["last_watched_at"]):
+                        existing["last_watched_at"] = watched_at
+
+                if unusable:
+                    logger.warning(
+                        f"Skipped {unusable} watched episode play(s) without a show IMDb id "
+                        f"or season/episode number; they cannot be matched to a Plex episode"
+                    )
 
             logger.info(f"Pulled {len(trakt_state)} item(s) from Trakt")
             return trakt_state

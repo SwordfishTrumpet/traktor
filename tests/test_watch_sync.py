@@ -27,7 +27,7 @@ def mock_trakt_client():
     """Create a mock Trakt client."""
     client = MagicMock()
     client.get_watched_movies = MagicMock(return_value=[])
-    client.get_watched_shows = MagicMock(return_value=[])
+    client.get_watched_episodes = MagicMock(return_value=[])
     client.add_to_history = MagicMock(return_value={"added": {"movies": 1, "episodes": 0}})
     client.remove_from_history = MagicMock(return_value={"deleted": {"movies": 1, "episodes": 0}})
     return client
@@ -352,32 +352,28 @@ class TestWatchSyncEngine:
 class TestEpisodeKeyUniqueness:
     """Tests for episode key uniqueness in watch sync."""
 
+    @staticmethod
+    def _play(show_imdb, season, number, watched_at, show_title="Test Show"):
+        """Build one /sync/history/episodes row."""
+        return {
+            "watched_at": watched_at,
+            "action": "scrobble",
+            "type": "episode",
+            "show": {"title": show_title, "ids": {"imdb": show_imdb, "trakt": 1}},
+            "episode": {
+                "season": season,
+                "number": number,
+                "ids": {"trakt": 100 + number},
+            },
+        }
+
     def test_episode_keys_are_unique_per_season_episode(self, sync_engine):
         """Test that multiple episodes from the same show have unique keys."""
-        # Mock Trakt response with multiple episodes from same show
-        sync_engine.trakt.get_watched_shows.return_value = [
-            {
-                "show": {
-                    "title": "Test Show",
-                    "ids": {"imdb": "tt1234567", "tmdb": 12345},
-                },
-                "seasons": [
-                    {
-                        "number": 1,
-                        "episodes": [
-                            {"number": 1, "last_watched_at": "2026-04-10T10:00:00Z"},
-                            {"number": 2, "last_watched_at": "2026-04-10T11:00:00Z"},
-                            {"number": 3, "last_watched_at": "2026-04-10T12:00:00Z"},
-                        ],
-                    },
-                    {
-                        "number": 2,
-                        "episodes": [
-                            {"number": 1, "last_watched_at": "2026-04-11T10:00:00Z"},
-                        ],
-                    },
-                ],
-            }
+        sync_engine.trakt.get_watched_episodes.return_value = [
+            self._play("tt1234567", 1, 1, "2026-04-10T10:00:00Z"),
+            self._play("tt1234567", 1, 2, "2026-04-10T11:00:00Z"),
+            self._play("tt1234567", 1, 3, "2026-04-10T12:00:00Z"),
+            self._play("tt1234567", 2, 1, "2026-04-11T10:00:00Z"),
         ]
 
         trakt_state = sync_engine._pull_from_trakt(movies_only=True, shows_only=False)
@@ -408,64 +404,80 @@ class TestEpisodeKeyUniqueness:
         }
         assert set(keys) == expected_keys
 
-    def test_episode_type_handling_dict_vs_int(self, sync_engine):
-        """Test that episodes work whether they are dicts or just episode numbers."""
-        # Mock with mixed episode formats (dicts and ints)
-        sync_engine.trakt.get_watched_shows.return_value = [
+    def test_rewatch_keeps_newest_watch_date_and_counts_plays(self, sync_engine):
+        """Trakt lists one row per play; the state keeps the newest date."""
+        sync_engine.trakt.get_watched_episodes.return_value = [
+            self._play("tt1234567", 1, 1, "2026-04-10T10:00:00.000Z"),
+            # Older play listed after the newer one - order must not decide.
+            self._play("tt1234567", 1, 1, "2025-01-01T10:00:00.000Z"),
+            self._play("tt1234567", 1, 1, "2026-06-01T09:00:00.000Z"),
+        ]
+
+        trakt_state = sync_engine._pull_from_trakt(movies_only=False, shows_only=True)
+
+        item = trakt_state[("episode", "tt1234567", 1, 1)]
+        assert item["last_watched_at"] == "2026-06-01T09:00:00.000Z"
+        assert item["plays"] == 3
+
+    def test_episode_without_watch_date_is_still_watched(self, sync_engine):
+        """A play with no watched_at is watched state, not a skipped item."""
+        sync_engine.trakt.get_watched_episodes.return_value = [
             {
-                "show": {
-                    "title": "Test Show",
-                    "ids": {"imdb": "tt1234567"},
-                },
-                "seasons": [
-                    {
-                        "number": 1,
-                        "episodes": [
-                            {"number": 1, "last_watched_at": "2026-04-10T10:00:00Z"},
-                            2,  # Just the episode number (int)
-                            {"number": 3},  # Dict without timestamp
-                        ],
-                    },
-                ],
+                "episode": {"season": 1, "number": 1, "ids": {"trakt": 101}},
+                "show": {"title": "Test Show", "ids": {"imdb": "tt1234567"}},
             }
         ]
 
         trakt_state = sync_engine._pull_from_trakt(movies_only=False, shows_only=True)
 
-        # All 3 episodes should be present
-        assert len(trakt_state) == 3
+        assert trakt_state[("episode", "tt1234567", 1, 1)]["watched"] is True
+        assert trakt_state[("episode", "tt1234567", 1, 1)]["last_watched_at"] is None
 
-        # Verify all episodes have proper keys
-        assert ("episode", "tt1234567", 1, 1) in trakt_state
-        assert ("episode", "tt1234567", 1, 2) in trakt_state
-        assert ("episode", "tt1234567", 1, 3) in trakt_state
+    def test_show_level_watched_shows_response_yields_no_episodes(self, sync_engine):
+        """Regression: /sync/watched/shows no longer nests seasons/episodes.
 
-        # Verify episode with timestamp has it preserved
-        assert (
-            trakt_state[("episode", "tt1234567", 1, 1)]["last_watched_at"] == "2026-04-10T10:00:00Z"
-        )
+        Live payload (2026-11-23) is one show-level entry per show, with no
+        ``seasons`` key at all. Parsing it produced zero episodes, so nothing
+        watched on Trakt (Stremio scrobbles) could ever be marked in Plex. The
+        pull must not depend on that shape.
+        """
+        show_level_entry = {
+            "plays": 12,
+            "last_watched_at": "2026-11-23T22:18:00.000Z",
+            "last_updated_at": "2026-11-23T22:18:00.000Z",
+            "reset_at": None,
+            "show": {"title": "South Park", "ids": {"imdb": "tt0121955", "trakt": 34}},
+        }
+        sync_engine.trakt.get_watched_episodes.return_value = [
+            self._play("tt0121955", 29, 1, "2026-11-20T20:00:00.000Z", "South Park"),
+        ]
 
-        # Verify episode without timestamp has None
-        assert trakt_state[("episode", "tt1234567", 1, 2)]["last_watched_at"] is None
-        assert trakt_state[("episode", "tt1234567", 1, 3)]["last_watched_at"] is None
+        # Even if a caller still handed the pull show-level entries, the story
+        # is the same: episodes come from the play history, so they arrive.
+        sync_engine.trakt.get_watched_shows = MagicMock(return_value=[show_level_entry])
+
+        trakt_state = sync_engine._pull_from_trakt(movies_only=False, shows_only=True)
+
+        assert ("episode", "tt0121955", 29, 1) in trakt_state
+        sync_engine.trakt.get_watched_shows.assert_not_called()
+
+    def test_episode_without_show_imdb_is_skipped_and_counted(self, sync_engine, caplog):
+        """A key shared by every IMDb-less show would match the wrong episode."""
+        sync_engine.trakt.get_watched_episodes.return_value = [
+            self._play(None, 1, 1, "2026-04-10T10:00:00Z"),
+            self._play("tt1234567", 1, 2, "2026-04-10T11:00:00Z"),
+        ]
+
+        with caplog.at_level("WARNING"):
+            trakt_state = sync_engine._pull_from_trakt(movies_only=False, shows_only=True)
+
+        assert set(trakt_state) == {("episode", "tt1234567", 1, 2)}
+        assert "without a show IMDb id" in caplog.text
 
     def test_episode_key_includes_show_imdb_season_and_episode(self, sync_engine):
         """Test that episode keys properly include all identifying information."""
-        sync_engine.trakt.get_watched_shows.return_value = [
-            {
-                "show": {
-                    "title": "Test Show",
-                    "ids": {"imdb": "tt1234567"},
-                },
-                "seasons": [
-                    {
-                        "number": 1,
-                        "episodes": [
-                            {"number": 1},
-                        ],
-                    },
-                ],
-            }
+        sync_engine.trakt.get_watched_episodes.return_value = [
+            self._play("tt1234567", 1, 1, "2026-04-10T10:00:00Z"),
         ]
 
         trakt_state = sync_engine._pull_from_trakt(movies_only=False, shows_only=True)
@@ -478,6 +490,8 @@ class TestEpisodeKeyUniqueness:
         assert item["show_title"] == "Test Show"
         assert item["season"] == 1
         assert item["episode"] == 1
+        assert item["trakt_id"] == 101
+        assert item["title"] == "Test Show S1E1"
 
     def test_process_episode_batch_reads_state_directly(self, sync_engine):
         """Regression A1: episode watch state comes from the season.episodes()
@@ -1341,10 +1355,10 @@ class TestPullFailurePropagation:
         # Delta timestamp not advanced by the failed run
         assert sync_engine.history.get_last_sync_timestamp() is None
 
-    def test_trakt_shows_request_failure_aborts_sync(self, sync_engine):
-        """A raised exception from get_watched_shows() aborts before apply."""
+    def test_trakt_episodes_request_failure_aborts_sync(self, sync_engine):
+        """A raised exception from get_watched_episodes() aborts before apply."""
         sync_engine._pull_from_plex = MagicMock(return_value={})
-        sync_engine.trakt.get_watched_shows = MagicMock(
+        sync_engine.trakt.get_watched_episodes = MagicMock(
             side_effect=requests.exceptions.Timeout("timeout")
         )
         sync_engine._apply_changes = MagicMock()

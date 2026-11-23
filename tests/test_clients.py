@@ -519,27 +519,41 @@ class TestTraktClient:
         assert len(result) == 1
         assert result[0]["movie"]["title"] == "Test Movie"
 
-    def test_get_watched_shows(self, trakt_client, mock_auth):
-        """Test get_watched_shows method exists and can be mocked."""
+    def test_get_watched_episodes(self, trakt_client, mock_auth):
+        """Watched episodes come from the paginated play history.
+
+        /sync/watched/shows no longer nests seasons and episodes (verified live
+        2026-11-23), and /sync/watched/episodes omits the parent show, so the
+        history endpoint is the only source with both halves of the key.
+        """
         mock_response = MagicMock()
         mock_response.status_code = 200
+        mock_response.headers = {"X-Pagination-Page-Count": "1"}
         mock_response.json.return_value = [
             {
-                "show": {"title": "Test Show", "ids": {"imdb": "tt7654321"}},
-                "seasons": [
-                    {
-                        "number": 1,
-                        "episodes": [{"number": 1, "last_watched_at": "2026-04-10T12:00:00.000Z"}],
-                    }
-                ],
+                "watched_at": "2026-11-23T22:18:00.000Z",
+                "action": "scrobble",
+                "type": "episode",
+                "show": {"title": "Test Show", "ids": {"imdb": "tt7654321", "trakt": 1}},
+                "episode": {
+                    "season": 2,
+                    "number": 3,
+                    "title": "An Episode",
+                    "ids": {"trakt": 99, "imdb": "tt9999999"},
+                },
             }
         ]
 
-        with patch.object(trakt_client._session, "get", return_value=mock_response):
-            result = trakt_client.get_watched_shows()
+        with patch.object(trakt_client._session, "get", return_value=mock_response) as get:
+            result = trakt_client.get_watched_episodes()
 
         assert len(result) == 1
         assert result[0]["show"]["title"] == "Test Show"
+        assert result[0]["episode"]["season"] == 2
+        # The endpoint is requested with explicit pagination, so a page cap can
+        # never truncate the watched state.
+        assert get.call_args.kwargs["params"]["page"] == 1
+        assert "page" in get.call_args.kwargs["params"]
 
     def test_add_to_history(self, trakt_client, mock_auth):
         """Test adding items to Trakt history."""
@@ -1412,8 +1426,18 @@ class TestTraktClientRetryLogic:
 class TestTraktAuthRefresh:
     """Tests for TraktAuth token refresh behavior."""
 
-    def test_refresh_access_token_clears_tokens_on_400(self, monkeypatch):
-        """Test that refresh failure with 400 clears stored tokens."""
+    def test_refresh_access_token_clears_tokens_on_400(self, monkeypatch, tmp_path):
+        """Test that refresh failure with 400 clears stored tokens.
+
+        The token store is redirected at a temp file: ``clear_tokens()`` resolves
+        ``.env`` from the working directory, so an unredirected test rewrites the
+        credentials of the machine it runs on.
+        """
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "TRAKT_ACCESS_TOKEN=old-access\nTRAKT_REFRESH_TOKEN=old-refresh\n", encoding="utf-8"
+        )
+        monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(clients, "TRAKT_CLIENT_ID", "test-client-id")
         monkeypatch.setattr(clients, "TRAKT_CLIENT_SECRET", "test-client-secret")
         monkeypatch.setattr(clients, "TRAKT_REDIRECT_URI", "urn:ietf:wg:oauth:2.0:oob")
@@ -1433,6 +1457,8 @@ class TestTraktAuthRefresh:
         assert result is False
         assert auth.access_token is None
         assert auth.refresh_token is None
+        # The dead credential is gone from the store, not only from memory.
+        assert "old-access" not in env_file.read_text(encoding="utf-8")
 
 
 class TestTraktClientPagination:
@@ -1587,8 +1613,18 @@ class TestTraktAuthRefreshPaths:
         assert result is True
         assert auth.access_token == "a" * 32
 
-    def test_refresh_400_clears_tokens(self, monkeypatch):
-        """HTTP 400 clears stored tokens to force re-auth."""
+    def test_refresh_400_clears_tokens(self, monkeypatch, tmp_path):
+        """HTTP 400 clears stored tokens to force re-auth.
+
+        ``.env`` is resolved from the working directory, so the temp dir keeps
+        this test away from the real token store.
+        """
+        env_file = tmp_path / ".env"
+        env_file.write_text(
+            "TRAKT_ACCESS_TOKEN=old-access\nTRAKT_REFRESH_TOKEN=expired-refresh\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
         monkeypatch.setattr(clients, "TRAKT_ACCESS_TOKEN", None)
         monkeypatch.setattr(clients, "TRAKT_REFRESH_TOKEN", None)
         monkeypatch.setattr(clients, "TRAKT_CLIENT_ID", "cid")
@@ -1608,6 +1644,7 @@ class TestTraktAuthRefreshPaths:
         assert result is False
         assert auth.access_token is None
         assert auth.refresh_token is None
+        assert "expired-refresh" not in env_file.read_text(encoding="utf-8")
 
     def test_refresh_other_status_returns_false(self, monkeypatch):
         """Other non-200/400 status returns False without clearing tokens."""
