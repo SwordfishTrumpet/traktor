@@ -3014,3 +3014,42 @@ class TestCacheContainerTypes:
 
         assert cache.load_cache() is False
         assert isinstance(cache.memory_cache.get("movies_by_imdb", {}), dict)
+
+
+# ---------------------------------------------------------------------------
+# Issue #120: authenticate() claimed success when the tokens were not saved
+# ---------------------------------------------------------------------------
+
+
+def test_authenticate_reports_a_refused_token_save(monkeypatch):
+    auth = clients.TraktAuth()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "access_token": "access-token-value-1234",
+        "refresh_token": "refresh-token-value-1234",
+    }
+
+    session = MagicMock()
+    session.post.return_value = response
+    monkeypatch.setattr(clients.requests, "Session", lambda: session)
+    monkeypatch.setattr(clients.TraktAuth, "save_tokens", lambda self: False)
+
+    assert auth.authenticate("a-code") is False
+
+
+def test_authenticate_reports_a_completed_token_save(monkeypatch):
+    auth = clients.TraktAuth()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "access_token": "access-token-value-1234",
+        "refresh_token": "refresh-token-value-1234",
+    }
+
+    session = MagicMock()
+    session.post.return_value = response
+    monkeypatch.setattr(clients.requests, "Session", lambda: session)
+    monkeypatch.setattr(clients.TraktAuth, "save_tokens", lambda self: True)
+
+    assert auth.authenticate("a-code") is True

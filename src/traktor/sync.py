@@ -1260,7 +1260,13 @@ def authenticate_trakt(auth, force=False):
     logger.debug(f"Received auth code (length: {len(auth_code)})")
 
     try:
-        auth.authenticate(auth_code)
+        if not auth.authenticate(auth_code):
+            # The exchange worked but the tokens were not written, so the
+            # next run has to authenticate again (issue #120).
+            logger.error("Trakt authentication succeeded but the tokens were not saved")
+            print("Authenticated with Trakt, but the tokens could not be saved.")
+            print("Set TRAKT_ACCESS_TOKEN and TRAKT_REFRESH_TOKEN in .env and retry.")
+            return False
         logger.info("Trakt authentication successful")
         print("Successfully authenticated with Trakt!")
         return True

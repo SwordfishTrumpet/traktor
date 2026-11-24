@@ -1315,8 +1315,11 @@ class TraktAuth:
             logger.debug(f"Expires in: {data.get('expires_in', 'unknown')} seconds")
             logger.debug(f"Created at: {data.get('created_at', 'unknown')}")
 
-            self.save_tokens()
-            return True
+            # The save can refuse (no .env, unreadable .env) and the tokens
+            # then live only in this process. The caller must know, or it
+            # tells the user the credential is stored when it is not
+            # (issue #120).
+            return self.save_tokens()
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Authentication request failed: {e}", exc_info=True)
