@@ -248,9 +248,19 @@ the tag; if prompted, pass nothing - the tag stays).
 2. Re-run the workflow on the same tag from the Actions tab, or
    `gh workflow run release.yml --ref "v$VERSION"`. It rebuilds from the tagged tree and
    recreates the release.
-3. Verify: `gh release download "v$VERSION"`, then
-   `uv pip install --python /tmp/venv/bin/python dist/traktor-$VERSION-py3-none-any.whl` in a
-   scratch environment, and `uv run traktor --version`.
+3. Verify in a scratch environment: create it, download the asset into `dist/`, install that
+   exact file, then check the version:
+
+   ```bash
+   python3 -m venv /tmp/venv
+   gh release download "v$VERSION" --dir dist
+   uv pip install --python /tmp/venv/bin/python "dist/traktor-$VERSION-py3-none-any.whl"
+   uv run traktor --version
+   ```
+
+   `gh release download` writes into the current directory unless `--dir` says otherwise, so
+   the download and the install must name the same path - a stale wheel left in `dist/` from
+   an earlier local build is not the release asset (issue #118).
 
 **Never** move or re-point the tag, and never `--force` the push that created it: the tag is
 what makes the tarball auditable. If the tagged tree itself is wrong, that is case 3.

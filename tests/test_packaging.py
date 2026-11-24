@@ -290,3 +290,17 @@ def test_ci_runs_the_suite_the_way_the_readme_says():
     makefile = (root / "Makefile").read_text(encoding="utf-8")
     test_target = makefile.split("test:", 1)[1].split("\n\n", 1)[0]
     assert "-W error" in test_target, test_target
+
+
+def test_the_runbook_downloads_the_wheel_where_it_installs_it():
+    """gh release download needs --dir, or the install path is empty (#118)."""
+    import pathlib
+
+    root = pathlib.Path(__file__).parent.parent
+    runbook = (root / "RUNBOOK.md").read_text(encoding="utf-8")
+    case2 = runbook.split("### Case 2", 1)[1].split("### Case 3", 1)[0]
+
+    downloads = [line for line in case2.splitlines() if "gh release download" in line]
+    assert downloads, "Case 2 has no download step"
+    assert all("--dir" in line for line in downloads), downloads
+    assert "dist/traktor-$VERSION-py3-none-any.whl" in case2 or "dist/" in case2

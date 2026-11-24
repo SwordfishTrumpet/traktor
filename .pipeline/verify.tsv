@@ -86,3 +86,4 @@
 116	uv run pytest -q tests/test_diagnose.py -k config_check	0	observability
 116	uv run pytest -q tests/test_packaging.py -k healthcheck	0	observability
 117	uv run pytest -q tests/test_packaging.py -k readme_says	0	build
+118	uv run pytest -q tests/test_packaging.py -k downloads_the_wheel	0	build
