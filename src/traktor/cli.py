@@ -6,6 +6,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import __version__
 from .auto_update import apply_update_and_print, check_and_print_update
 from .diagnose import run_diagnosis
 from .health_server import HealthServer
@@ -41,6 +42,9 @@ def parse_args():
         help="Plex token (can also use PLEX_TOKEN env var)",
         default=None,
     )
+    # The release runbook checks a rolled-back install with `traktor --version`,
+    # and the flag did not exist (issue #90).
+    parser.add_argument("--version", action="version", version=f"traktor {__version__}")
     parser.add_argument(
         "--force-auth", action="store_true", help="Force re-authentication with Trakt"
     )

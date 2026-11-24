@@ -5,10 +5,14 @@ name: Release
 # distribution channel: nothing is published to PyPI, so there is no package
 # index account, token or trusted publisher to configure.
 
+# workflow_dispatch: RUNBOOK.md recovers a broken release with
+# `gh workflow run release.yml --ref v<version>`, which needs a dispatchable
+# trigger or GitHub answers 422 (issue #90).
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write

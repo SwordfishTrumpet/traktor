@@ -50,7 +50,10 @@ RUN chown -R traktor:traktor /app/.venv
 USER traktor
 
 # Set the entrypoint
-ENTRYPOINT ["uv", "run", "--python", "/usr/local/bin/python", "traktor"]
+# --no-dev: without it, uv treats the dev group the build step deliberately
+# skipped as a required sync and installs pytest/mypy at container start
+# (issue #86).
+ENTRYPOINT ["uv", "run", "--no-dev", "--python", "/usr/local/bin/python", "traktor"]
 
 # Default command (can be overridden)
 CMD []
