@@ -10,11 +10,13 @@ from dotenv import load_dotenv
 # 2. /app/.env (for Docker with volume mount)
 # 3. Parent of current file (for various runtime contexts)
 _env_loaded = False
+_env_file_loaded: Path | None = None
 for env_path in [".env", "/app/.env", str(Path(__file__).parent.parent.parent / ".env")]:
     path = Path(env_path)
     if path.exists():
         load_dotenv(path)
         _env_loaded = True
+        _env_file_loaded = path.resolve()
         break
 
 if not _env_loaded:
@@ -53,10 +55,23 @@ else:
 
 SYNC_PROGRESS_FILE = CACHE_DIR / "sync_progress.json"
 
+# Backups: the directory snapshots are written to and how many are kept. Both are
+# documented in RUNBOOK.md, so both must be read here; they used to be hardcoded
+# and the documented names did nothing (issue #89).
+_backup_dir_env = os.getenv("TRAKTOR_BACKUP_DIR", "").strip()
+TRAKTOR_BACKUP_DIR = Path(_backup_dir_env).expanduser() if _backup_dir_env else None
+TRAKTOR_MAX_BACKUPS = int(os.getenv("TRAKTOR_MAX_BACKUPS", "10"))
+
 # Active .env file location - the canonical Trakt token store since the .env
 # persistence change (legacy TOKEN_FILE below is no longer written by current
-# code). Resolution mirrors TraktAuth.save_tokens(): Docker mount wins, then CWD.
-ENV_FILE = Path("/app/.env") if Path("/app/.env").exists() else Path(".env").resolve()
+# code). This is the file this process actually loaded: the Docker mount wins,
+# then the file found by the search above (which includes the checkout root, so
+# a run from a subdirectory loads the same tokens it later has to clear).
+ENV_FILE = (
+    Path("/app/.env")
+    if Path("/app/.env").exists()
+    else (_env_file_loaded or Path(".env").resolve())
+)
 
 
 def ensure_dirs():
