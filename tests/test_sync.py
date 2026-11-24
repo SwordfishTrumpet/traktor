@@ -2145,3 +2145,57 @@ class TestNonInteractivePrompts:
             sync.sync_lists(args)
 
         assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #108: one refused official playlist aborted the rest and the run was
+# recorded as a success
+# ---------------------------------------------------------------------------
+
+
+class TestOfficialPlaylistIsolation:
+    def _args(self, monkeypatch, argv):
+        import sys
+
+        from traktor import cli
+
+        monkeypatch.setattr(sys, "argv", ["traktor", *argv])
+        return cli.parse_args()
+
+    def test_a_refused_official_playlist_does_not_abort_the_rest(
+        self, monkeypatch, tmp_path
+    ):
+        from plexapi.exceptions import BadRequest
+
+        from tests.test_sync import TestSyncListsFeatureSections
+
+        env = TestSyncListsFeatureSections._setup(
+            TestSyncListsFeatureSections, monkeypatch, tmp_path
+        )
+        args = self._args(monkeypatch, ["--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.trending"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        official_service = MagicMock()
+        official_service.get_playlists_from_endpoints.return_value = [
+            {"name": "Trending Movies", "items": [], "description": ""},
+            {"name": "Popular Movies", "items": [], "description": ""},
+        ]
+        official_service.failed_endpoints = set()
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+
+        attempted = []
+
+        def create(name, items, description=None, **kwargs):
+            attempted.append(name)
+            if name == "Trending Movies":
+                raise BadRequest("no items to add")
+            return MagicMock()
+
+        env["plex_client"].create_or_update_playlist.side_effect = create
+
+        assert sync.sync_lists(args) == 1
+        assert attempted == ["Trending Movies", "Popular Movies"]

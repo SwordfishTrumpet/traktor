@@ -808,6 +808,22 @@ def process_official_list_parallel(
             "not_found": items_not_found,
             "warning": "no_matches",
         }
+    except requests.exceptions.RequestException as e:
+        # One refused playlist must not abandon the rest, and it must reach the
+        # exit code: the outer handler used to log and carry on, so the run
+        # reported success while the remaining playlists were never touched
+        # (issue #108).
+        logger.error(f"API request failed for official list '{list_name}': {e}")
+        stats["lists_failed"] += 1
+        return {"list_name": list_name, "success": False, "error": f"API error: {e}"}
+    except (ValueError, KeyError, TypeError) as e:
+        logger.error(f"Data processing failed for official list '{list_name}': {e}")
+        stats["lists_failed"] += 1
+        return {"list_name": list_name, "success": False, "error": f"Data error: {e}"}
+    except Exception as e:
+        logger.error(f"Unexpected failure for official list '{list_name}': {e}", exc_info=True)
+        stats["lists_failed"] += 1
+        return {"list_name": list_name, "success": False, "error": str(e)}
     finally:
         list_elapsed = time.time() - list_start_time
         performance_monitor.record_api_call(f"official_list:{list_name}", list_elapsed)
@@ -1625,8 +1641,12 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
                 print("   No official playlists to process")
 
         except Exception as e:
+            # A failure in this section means the official playlists were not
+            # updated, so the run failed even though it carries on to the rest
+            # of the sync (issue #108).
             logger.error(f"Official lists sync failed: {e}", exc_info=True)
             print(f"\nOfficial lists sync failed: {e}")
+            stats["lists_failed"] += 1
 
         _check_memory(resource_manager)
 
