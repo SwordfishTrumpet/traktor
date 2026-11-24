@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
+from plexapi.video import Show
 
 from traktor import clients
 
@@ -2681,3 +2682,215 @@ def test_the_account_fingerprint_is_not_the_credential():
     assert len(fingerprint) == 16
     assert "secret-token-value" not in fingerprint
     assert clients.plex_account_fingerprint(None, "token") is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #81: the cache file is untrusted and must be read within a size bound
+# ---------------------------------------------------------------------------
+
+
+def _write_cache_meta(cache, age_minutes=30):
+    """Write a metadata stamp that makes the cache look fresh and valid.
+
+    The stamp is ``age_minutes`` old, which is the window an incremental update
+    looks back over.
+    """
+    from datetime import timedelta
+
+    stamp = datetime.now(timezone.utc) - timedelta(minutes=age_minutes)
+    cache.cache_meta_file.parent.mkdir(parents=True, exist_ok=True)
+    cache.cache_file.parent.mkdir(parents=True, exist_ok=True)
+    cache.cache_meta_file.write_text(
+        json.dumps(
+            {
+                "version": clients.CACHE_VERSION,
+                "created": stamp.isoformat(),
+                "library_hash": cache._get_library_hash(),
+                "last_update": stamp.isoformat(),
+            }
+        )
+    )
+
+
+def test_a_cache_that_expands_past_the_bound_is_rebuilt(tmp_path, monkeypatch):
+    """A small doctored cache file must not be expanded into memory (issue #81)."""
+    monkeypatch.setattr(clients, "CACHE_DIR", tmp_path / "cache")
+    server = MagicMock()
+    server.library.sections.return_value = []
+    cache = clients.CacheManager(server)
+
+    cache.cache_file.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(cache.cache_file, "wb", compresslevel=9) as f:
+        f.write(json.dumps({"blob": "0" * (256 * 1024)}).encode("utf-8"))
+    _write_cache_meta(cache)
+
+    assert cache.load_cache() is False  # rebuilt, not loaded
+    assert "blob" not in cache.memory_cache
+
+
+# ---------------------------------------------------------------------------
+# Issue #91: reading a show's counters must not reload the show from Plex
+# ---------------------------------------------------------------------------
+
+
+class CountingShow(Show):
+    """A real PlexAPI Show that counts the reloads its attributes trigger."""
+
+    reloads = 0
+
+    def _reload(self, **kwargs):
+        type(self).reloads += 1
+        return self
+
+
+def _show_from_xml(rating_key, watched):
+    from xml.etree.ElementTree import fromstring
+
+    attrs = (
+        f'ratingKey="{rating_key}" key="/library/metadata/{rating_key}" '
+        f'title="Show {rating_key}" type="show" year="2020" '
+        f'leafCount="10" viewedLeafCount="{1 if watched else 0}"'
+    )
+    if watched:
+        attrs += ' lastViewedAt="1700000000"'
+    return CountingShow(
+        None, fromstring(f"<Directory {attrs} />"), initpath=f"/library/metadata/{rating_key}"
+    )
+
+
+def test_reading_show_counters_does_not_reload_each_show():
+    """An unwatched show has no lastViewedAt, and that used to cost a request (issue #91)."""
+    CountingShow.reloads = 0
+    shows = [_show_from_xml(index, index == 0) for index in range(50)]
+
+    counters = [clients.PlexClient.show_counters(show) for show in shows]
+
+    assert CountingShow.reloads == 0
+    assert counters[0]["viewedLeafCount"] == 1
+    assert counters[1]["lastViewedAt"] is None
+
+
+# ---------------------------------------------------------------------------
+# Issue #93: a capped recentlyAdded read must not be recorded as complete
+# ---------------------------------------------------------------------------
+
+
+class _FakeItem:
+    def __init__(self, index, added_at):
+        self.ratingKey = index
+        self.title = f"Movie {index}"
+        self.year = 2020
+        self.guid = f"plex://movie/{index}"
+        self.guids = []
+        self.lastViewedAt = None
+        self.isWatched = False
+        self.addedAt = added_at
+
+
+class _PagedSection:
+    """A movie section whose recentlyAdded honours maxresults."""
+
+    type = "movie"
+    title = "Films"
+
+    def __init__(self, items):
+        self.items = items
+
+    def recentlyAdded(self, maxresults=50, **kwargs):
+        return self.items[:maxresults]
+
+
+class _CappedSection(_PagedSection):
+    """A section that keeps returning a full page, so completeness is unprovable."""
+
+    def recentlyAdded(self, maxresults=50, **kwargs):
+        return self.items[:maxresults][:maxresults]
+
+
+def _incremental_cache(tmp_path, monkeypatch, section):
+    monkeypatch.setattr(clients, "CACHE_DIR", tmp_path / "cache")
+    server = MagicMock()
+    server.library.sections.return_value = [section]
+    cache = clients.CacheManager(server)
+    _empty_cache(cache)
+    return cache
+
+
+def test_incremental_update_reads_past_a_thousand_new_items(tmp_path, monkeypatch):
+    """A bulk import of more than 1,000 titles must all reach the cache (issue #93)."""
+    from datetime import timedelta
+
+    now = datetime.now(timezone.utc)
+    items = [_FakeItem(i, now - timedelta(seconds=i)) for i in range(1500)]
+    cache = _incremental_cache(tmp_path, monkeypatch, _PagedSection(items))
+    _write_cache_meta(cache)
+
+    assert cache._incremental_cache_update() is True
+
+    cached = {row["ratingKey"] for row in cache.memory_cache["movies_list"]}
+    assert cached == set(range(1500))
+
+
+def test_a_capped_incremental_read_does_not_advance_the_stamp(tmp_path, monkeypatch):
+    """When completeness cannot be shown, the next run must try again (issue #93)."""
+    from datetime import timedelta
+
+    monkeypatch.setattr(clients, "DEFAULT_RECENTLY_ADDED_MAXRESULTS", 2)
+    monkeypatch.setattr(clients, "MAX_RECENTLY_ADDED_MAXRESULTS", 4)
+    now = datetime.now(timezone.utc)
+    items = [_FakeItem(i, now - timedelta(seconds=i)) for i in range(10)]
+    cache = _incremental_cache(tmp_path, monkeypatch, _CappedSection(items))
+    _write_cache_meta(cache)
+    stamp_before = cache._get_last_update_timestamp()
+
+    assert cache._incremental_cache_update() is False
+    assert cache._get_last_update_timestamp() == stamp_before
+    assert cache.memory_cache["movies_list"] == []
+
+
+# ---------------------------------------------------------------------------
+# Issue #94: playback progress must read each item once per run
+# ---------------------------------------------------------------------------
+
+
+class _ProgressItem:
+    def __init__(self, rating_key):
+        self.ratingKey = rating_key
+        self.viewOffset = 1000
+        self.duration = 100000
+        self.title = f"Item {rating_key}"
+        self.updates = 0
+
+    def updateProgress(self, value):
+        self.updates += 1
+        self.viewOffset = value
+
+
+class _CountingServer:
+    def __init__(self):
+        self.items = {}
+        self.fetch_calls = 0
+
+    def fetchItem(self, rating_key):
+        self.fetch_calls += 1
+        key = int(rating_key)
+        return self.items.setdefault(key, _ProgressItem(key))
+
+
+def test_playback_progress_reads_each_item_once():
+    """The setter reuses the object the getter fetched (issue #94)."""
+    from types import SimpleNamespace
+
+    server = _CountingServer()
+    plex = clients.PlexClient.__new__(clients.PlexClient)
+    plex.server = server
+    plex.cache = SimpleNamespace(_plex_objects={})
+
+    for key in range(20):
+        plex.get_playback_progress(key)
+    plex.batch_set_playback_progress(
+        [{"rating_key": key, "view_offset_ms": 2000} for key in range(20)]
+    )
+
+    assert server.fetch_calls == 20
+    assert sum(item.updates for item in server.items.values()) == 20

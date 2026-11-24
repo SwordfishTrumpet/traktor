@@ -1,5 +1,6 @@
 """Shared utility functions for traktor."""
 
+import gzip
 import importlib.util
 import json
 import os
@@ -362,3 +363,75 @@ def format_trakt_timestamp(value) -> Optional[str]:
     if parsed is None:
         return None
     return parsed.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+# A gzip stream can expand a small file past what the host has (issue #81), so
+# every reader here states how much decompressed data it will accept before it
+# parses or copies anything. The ceiling is generous on purpose: the library
+# cache of a large server is tens of megabytes, and a backup carries that cache.
+MAX_DECOMPRESSED_BYTES = 256 * BYTES_PER_MB
+# A small, highly repetitive file is normal, so an expansion ratio is only a
+# bomb signal once the payload is already large.
+RATIO_GUARDED_MIN_BYTES = 32 * BYTES_PER_MB
+MAX_DECOMPRESSION_RATIO = 200
+DECOMPRESS_CHUNK_BYTES = 1024 * 1024
+
+
+class DecompressionLimitError(ValueError):
+    """A gzip payload expands past the configured limit (issue #81)."""
+
+
+def _refuse_oversized_decompression(
+    compressed_bytes: int, decompressed_bytes: int, source: Any, max_bytes: int
+) -> None:
+    """Raise when a decompressed payload is past the size or ratio limit."""
+    if decompressed_bytes > max_bytes:
+        raise DecompressionLimitError(
+            f"{source} expands past {max_bytes} bytes "
+            f"({decompressed_bytes} from {compressed_bytes} compressed)"
+        )
+    if compressed_bytes > 0 and decompressed_bytes >= RATIO_GUARDED_MIN_BYTES:
+        ratio = decompressed_bytes / compressed_bytes
+        if ratio > MAX_DECOMPRESSION_RATIO:
+            raise DecompressionLimitError(
+                f"{source} expands {ratio:.0f}x ({decompressed_bytes} bytes from "
+                f"{compressed_bytes} compressed), past the {MAX_DECOMPRESSION_RATIO}x limit"
+            )
+
+
+def iter_gzip_bounded(path, max_bytes: Optional[int] = None) -> Iterator[bytes]:
+    """Yield a gzip file's contents in chunks, refusing an oversized payload.
+
+    Args:
+        path: Path to the gzip file
+        max_bytes: Decompressed size ceiling for this read; defaults to
+            :data:`MAX_DECOMPRESSED_BYTES`
+
+    Yields:
+        Decompressed chunks
+
+    Raises:
+        DecompressionLimitError: The payload is past the size or ratio limit
+    """
+    if max_bytes is None:
+        max_bytes = MAX_DECOMPRESSED_BYTES
+    compressed_bytes = Path(path).stat().st_size
+    total = 0
+    with gzip.open(path, "rb") as stream:
+        while True:
+            chunk = stream.read(DECOMPRESS_CHUNK_BYTES)
+            if not chunk:
+                break
+            total += len(chunk)
+            _refuse_oversized_decompression(compressed_bytes, total, path, max_bytes)
+            yield chunk
+
+
+def read_gzip_bytes(path, max_bytes: Optional[int] = None) -> bytes:
+    """Read a whole gzip file, bounded by :data:`MAX_DECOMPRESSED_BYTES`."""
+    return b"".join(iter_gzip_bounded(path, max_bytes))
+
+
+def read_gzip_text(path, max_bytes: Optional[int] = None, encoding: str = "utf-8") -> str:
+    """Read a whole gzip file as text, bounded by :data:`MAX_DECOMPRESSED_BYTES`."""
+    return read_gzip_bytes(path, max_bytes).decode(encoding)

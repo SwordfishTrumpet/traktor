@@ -1099,3 +1099,83 @@ def test_documented_backup_settings_are_used(tmp_path, monkeypatch):
     assert manager.max_backups == 1
     assert wanted.exists()
     assert len(list(wanted.iterdir())) == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #81: a doctored backup must not expand past the size bound on restore
+# ---------------------------------------------------------------------------
+
+
+class TestBackupRestoreIsBounded:
+    """A backup archive is input from disk, and a small one can be a bomb."""
+
+    @pytest.fixture
+    def restore_env(self, tmp_path, monkeypatch):
+        import traktor.resilience as res
+
+        config_file = tmp_path / "config.json"
+        env_file = tmp_path / ".env"
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        monkeypatch.setattr(res, "CONFIG_FILE", config_file)
+        monkeypatch.setattr(res, "ENV_FILE", env_file)
+        monkeypatch.setattr(res, "CACHE_DIR", cache_dir)
+        return res, tmp_path, cache_dir
+
+    @staticmethod
+    def _doctored_backup(tmp_path, payload_size):
+        import hashlib
+        from datetime import datetime, timezone
+
+        backup = tmp_path / "doctored_backup"
+        (backup / "cache").mkdir(parents=True)
+        raw = b"0" * payload_size
+        with gzip.open(backup / "cache" / "bomb.json.gz", "wb", compresslevel=9) as f:
+            f.write(raw)
+        manifest = {
+            "created": datetime.now(timezone.utc).isoformat(),
+            "reason": "manual",
+            "version": "1.0.0",
+            "items": {
+                "cache": {
+                    "source": str(tmp_path / "cache"),
+                    "checksum": hashlib.sha256(raw).hexdigest(),
+                    "compressed": True,
+                }
+            },
+        }
+        (backup / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return backup
+
+    def test_a_bomb_is_refused_before_anything_is_restored(self, restore_env, monkeypatch):
+        import traktor.utils as utils
+
+        monkeypatch.setattr(utils, "MAX_DECOMPRESSED_BYTES", 4096)
+        res, tmp_path, cache_dir = restore_env
+        backup = self._doctored_backup(tmp_path, 256 * 1024)
+        manager = res.BackupManager(backup_dir=tmp_path / "backups", compress=True)
+
+        assert manager.restore_backup(backup) is False
+        assert cache_dir.exists()
+        assert list(cache_dir.iterdir()) == []
+
+    def test_a_bomb_that_skips_verification_leaves_no_partial_file(self, restore_env, monkeypatch):
+        import traktor.utils as utils
+
+        monkeypatch.setattr(utils, "MAX_DECOMPRESSED_BYTES", 4096)
+        res, tmp_path, cache_dir = restore_env
+        backup = self._doctored_backup(tmp_path, 256 * 1024)
+        manager = res.BackupManager(backup_dir=tmp_path / "backups", compress=True)
+
+        assert manager.restore_backup(backup, verify=False) is False
+        assert list(cache_dir.iterdir()) == []
+
+    def test_an_ordinary_backup_still_restores(self, restore_env):
+        res, tmp_path, cache_dir = restore_env
+        cache_dir.joinpath("plex_library_cache.json.gz").write_text("{}", encoding="utf-8")
+        manager = res.BackupManager(backup_dir=tmp_path / "backups", compress=True)
+        backup = manager.create_backup(reason="test")
+        cache_dir.joinpath("plex_library_cache.json.gz").unlink()
+
+        assert manager.restore_backup(backup) is True
+        assert cache_dir.joinpath("plex_library_cache.json.gz").exists()
