@@ -274,3 +274,19 @@ def test_the_compose_healthcheck_uses_the_check_that_can_fail():
     healthcheck = [line for line in text.splitlines() if "--health-check" in line]
     assert healthcheck, "the compose healthcheck does not run --health-check"
     assert "--diagnose" not in text.split("healthcheck:")[1].split("networks:")[0]
+
+
+def test_ci_runs_the_suite_the_way_the_readme_says():
+    """README promises warnings-as-errors in CI; the step has to carry it (#117)."""
+    import pathlib
+
+    root = pathlib.Path(__file__).parent.parent
+    ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    pytest_steps = [line for line in ci.splitlines() if "pytest" in line and "run:" in line]
+
+    assert pytest_steps, "ci.yml has no pytest step"
+    assert all("-W error" in line for line in pytest_steps), pytest_steps
+
+    makefile = (root / "Makefile").read_text(encoding="utf-8")
+    test_target = makefile.split("test:", 1)[1].split("\n\n", 1)[0]
+    assert "-W error" in test_target, test_target
