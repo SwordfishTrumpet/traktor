@@ -106,3 +106,36 @@ class TestSettings:
 
             importlib.reload(settings)
             assert settings.TRAKTOR_MAX_MEMORY_MB == 1024
+
+    def test_env_file_is_the_file_the_loader_opened(self, tmp_path, monkeypatch):
+        """ENV_FILE names the file the tokens came from, not a guess (issue #103)."""
+        import importlib
+
+        (tmp_path / ".env").write_text("TRAKT_CLIENT_ID=abc\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        importlib.reload(settings)
+
+        assert settings.ENV_FILE == (tmp_path / ".env").resolve()
+
+
+class TestTokenStoreResolution:
+    """The token store the client clears is the one settings loaded (#103)."""
+
+    def test_clear_tokens_rewrites_the_configured_env_file(self, tmp_path, monkeypatch):
+        from traktor import clients
+
+        env_file = tmp_path / "checkout" / ".env"
+        env_file.parent.mkdir()
+        env_file.write_text(
+            "TRAKT_ACCESS_TOKEN=stale-access-value\nTRAKT_REFRESH_TOKEN=stale-refresh-value\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(clients, "ENV_FILE", env_file)
+
+        auth = clients.TraktAuth()
+        auth.clear_tokens("refresh was rejected by Trakt")
+
+        text = env_file.read_text(encoding="utf-8")
+        assert "TRAKT_ACCESS_TOKEN" not in text
+        assert "TRAKT_REFRESH_TOKEN" not in text
