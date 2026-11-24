@@ -1150,7 +1150,7 @@ class TestBackupRestoreIsBounded:
     def test_a_bomb_is_refused_before_anything_is_restored(self, restore_env, monkeypatch):
         import traktor.utils as utils
 
-        monkeypatch.setattr(utils, "MAX_DECOMPRESSED_BYTES", 4096)
+        monkeypatch.setattr(utils, "MAX_DECOMPRESSED_BYTES", 4096, raising=False)
         res, tmp_path, cache_dir = restore_env
         backup = self._doctored_backup(tmp_path, 256 * 1024)
         manager = res.BackupManager(backup_dir=tmp_path / "backups", compress=True)
@@ -1162,7 +1162,7 @@ class TestBackupRestoreIsBounded:
     def test_a_bomb_that_skips_verification_leaves_no_partial_file(self, restore_env, monkeypatch):
         import traktor.utils as utils
 
-        monkeypatch.setattr(utils, "MAX_DECOMPRESSED_BYTES", 4096)
+        monkeypatch.setattr(utils, "MAX_DECOMPRESSED_BYTES", 4096, raising=False)
         res, tmp_path, cache_dir = restore_env
         backup = self._doctored_backup(tmp_path, 256 * 1024)
         manager = res.BackupManager(backup_dir=tmp_path / "backups", compress=True)

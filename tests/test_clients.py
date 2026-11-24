@@ -2712,19 +2712,41 @@ def _write_cache_meta(cache, age_minutes=30):
     )
 
 
-def test_a_cache_that_expands_past_the_bound_is_rebuilt(tmp_path, monkeypatch):
+def test_a_cache_that_expands_past_the_bound_is_rebuilt(tmp_path, monkeypatch, caplog):
     """A small doctored cache file must not be expanded into memory (issue #81)."""
+    import logging
+
+    import traktor.utils as utils
+
+    # raising=False: on the pre-fix tree the constant does not exist, and the
+    # test must then fail on behaviour, not on the missing name.
+    monkeypatch.setattr(utils, "MAX_DECOMPRESSED_BYTES", 64 * 1024, raising=False)
     monkeypatch.setattr(clients, "CACHE_DIR", tmp_path / "cache")
     server = MagicMock()
     server.library.sections.return_value = []
     cache = clients.CacheManager(server)
 
+    # A structurally valid cache: without the bound it loads as a normal cache.
+    payload = {
+        "movies_by_imdb": {},
+        "movies_by_tmdb": {},
+        "shows_by_imdb": {},
+        "shows_by_tmdb": {},
+        "movies_list": [],
+        "shows_list": [],
+        "by_rating_key": {},
+        "show_episodes": {},
+        "blob": "0" * (256 * 1024),
+    }
     cache.cache_file.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(cache.cache_file, "wb", compresslevel=9) as f:
-        f.write(json.dumps({"blob": "0" * (256 * 1024)}).encode("utf-8"))
-    _write_cache_meta(cache)
+        f.write(json.dumps(payload).encode("utf-8"))
+    _write_cache_meta(cache, age_minutes=0)
 
-    assert cache.load_cache() is False  # rebuilt, not loaded
+    with caplog.at_level(logging.WARNING):
+        assert cache.load_cache() is False  # rebuilt, not loaded
+
+    assert any("Refusing this cache file" in record.getMessage() for record in caplog.records)
     assert "blob" not in cache.memory_cache
 
 
