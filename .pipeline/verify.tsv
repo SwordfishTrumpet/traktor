@@ -70,3 +70,5 @@
 94	uv run pytest -q tests/test_clients.py::test_playback_progress_reads_each_item_once	0	performance
 95	uv run pytest -q tests/test_history_manager.py::TestOverlappingRemovals	0	data-integrity
 96	uv run pytest -q tests/test_history_manager.py::TestUnkeyedRows	0	correctness
+105	uv run pytest -q tests/test_sync.py tests/test_official_lists.py -k fetch_keeps	0	correctness
+105	uv run pytest -q tests/test_official_lists.py -k failed_endpoint	0	correctness

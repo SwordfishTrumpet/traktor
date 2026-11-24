@@ -2,9 +2,10 @@
 
 import json
 import time
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from traktor.official_lists import OfficialListsService
 
@@ -768,3 +769,23 @@ class TestMergedPlaylistsAcrossPeriods:
         )
 
         assert [playlist["name"] for playlist in playlists] == ["Trakt Official - Movies"]
+
+
+class TestFailedEndpointTracking:
+    """A failed fetch must be distinguishable from an empty list (issue #105)."""
+
+    def test_fetch_endpoint_records_a_failed_endpoint(self, tmp_path):
+        service = OfficialListsService(cache_dir=tmp_path)
+        service.client = MagicMock()
+        service.client.get_endpoint.side_effect = requests.exceptions.ConnectionError("503")
+
+        assert service.fetch_endpoint("movies.trending", "weekly") == []
+        assert service.failed_endpoints == {"movies.trending"}
+
+    def test_a_cached_answer_is_not_a_failure(self, tmp_path):
+        service = OfficialListsService(cache_dir=tmp_path)
+        service.client = MagicMock()
+        service.client.get_endpoint.return_value = [{"type": "movie"}]
+
+        assert service.fetch_endpoint("movies.trending", "weekly") == [{"type": "movie"}]
+        assert service.failed_endpoints == set()

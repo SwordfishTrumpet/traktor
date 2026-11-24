@@ -7,7 +7,7 @@ caching, and deduplicating items from Trakt's official algorithmic lists.
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -42,6 +42,11 @@ class OfficialListsService:
         self.client = TraktOfficialClient(client_id)
         self.cache_dir = cache_dir or CACHE_DIR / "official_lists"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Endpoints whose fetch failed and had no cached answer to fall back on.
+        # The caller must not treat such an endpoint as "this list is gone": the
+        # empty result it returned is a failure, and acting on it deleted the
+        # playlist the endpoint owns (issue #105).
+        self.failed_endpoints: Set[str] = set()
         logger.debug("OfficialListsService initialized")
 
     def _get_cache_file(self, endpoint_name: str, period: str = "weekly") -> Path:
@@ -303,6 +308,7 @@ class OfficialListsService:
                 stale = self._load_stale_cache(endpoint_name, period)
                 if stale is not None:
                     return stale
+            self.failed_endpoints.add(endpoint_name)
             return []
         except (KeyError, ValueError, TypeError) as e:
             logger.error(f"Data error fetching {endpoint_name}: {e}")
@@ -310,6 +316,7 @@ class OfficialListsService:
                 stale = self._load_stale_cache(endpoint_name, period)
                 if stale is not None:
                     return stale
+            self.failed_endpoints.add(endpoint_name)
             return []
         except Exception as e:
             logger.error(f"Unexpected error fetching {endpoint_name}: {e}")
@@ -317,6 +324,7 @@ class OfficialListsService:
                 stale = self._load_stale_cache(endpoint_name, period)
                 if stale is not None:
                     return stale
+            self.failed_endpoints.add(endpoint_name)
             return []
 
     def fetch_multiple_endpoints(

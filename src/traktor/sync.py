@@ -691,6 +691,11 @@ def process_list_parallel(
         return {"list_name": list_name, "success": False, "error": "missing_info"}
 
     list_start_time = time.time()
+    # Active before the fetch: a list whose item read fails is still a list that
+    # exists on Trakt, and orphan cleanup deletes every managed playlist that is
+    # not active. Marking it after the fetch made one 5xx delete the user's
+    # playlist (issue #105).
+    updated_playlists.add(list_name)
     try:
         items = trakt.get_list_items(username, list_id)
         stats["items_total"] += len(items)
@@ -1553,6 +1558,7 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
         _check_memory(resource_manager)
 
     # Official lists sync (always enabled by default - no auth required)
+    official_service: Optional[Any] = None
     if args and _should_sync_official_lists(args):
         print("\n" + "=" * 60)
         print("Official Lists Sync")
@@ -1622,7 +1628,26 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
             logger.error(f"Official lists sync failed: {e}", exc_info=True)
             print(f"\nOfficial lists sync failed: {e}")
 
-    _check_memory(resource_manager)
+        _check_memory(resource_manager)
+
+    # A failed official fetch is not an empty official list: the endpoint's
+    # playlist still exists, so nothing may be pruned on this run, and the run
+    # is a failure (issue #105).
+    official_fetch_failed = False
+    if official_service is not None:
+        failed = sorted(official_service.failed_endpoints)
+        if failed:
+            official_fetch_failed = True
+            stats["lists_failed"] += len(failed)
+            logger.error(
+                "Official list fetch failed for %s; keeping the existing playlists "
+                "and recording this run as failed",
+                ", ".join(failed),
+            )
+            print(
+                f"\nOfficial list fetch failed for: {', '.join(failed)}. "
+                "Keeping the existing playlists."
+            )
 
     write_missing_report(missing_items, cache_manager=cache_manager)
 
@@ -1636,6 +1661,12 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
     # Skip orphaned playlist cleanup when in watch-only mode (no playlists created)
     if args and args.sync_watched_only:
         logger.info("Skipping orphaned playlist cleanup (--sync-watched-only mode)")
+    elif official_fetch_failed:
+        logger.warning(
+            "Skipping orphaned playlist cleanup: an official list fetch failed, so this "
+            "run does not know the full set of live playlists"
+        )
+        print("   Skipped orphaned playlist cleanup (an official list fetch failed)")
     else:
         print("\nChecking for orphaned playlists...")
 

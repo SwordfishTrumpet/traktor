@@ -1641,6 +1641,57 @@ class TestSyncListsFeatureSections:
         assert result == 0
         official_service.get_playlists_from_endpoints.assert_called_once()
 
+    def test_failed_list_fetch_keeps_its_playlist_active(self):
+        """A list whose items cannot be fetched still exists (#105).
+
+        Orphan cleanup deletes every managed playlist that is not in the active
+        set, so the name must be active before the fetch, not after it.
+        """
+        stats = {"items_total": 0, "items_not_found": 0, "lists_failed": 0}
+        updated: set = set()
+        trakt = MagicMock()
+        trakt.get_list_items.side_effect = _requests.exceptions.ConnectionError("503")
+
+        result = sync.process_list_parallel(
+            {
+                "list": {
+                    "name": "Favorites",
+                    "user": {"username": "me"},
+                    "ids": {"trakt": 7},
+                }
+            },
+            MagicMock(),
+            trakt,
+            2,
+            stats,
+            updated,
+            [],
+        )
+
+        assert result["success"] is False
+        assert stats["lists_failed"] == 1
+        assert "Favorites" in updated
+
+    def test_failed_official_fetch_keeps_playlists_and_fails_the_run(
+        self, monkeypatch, tmp_path
+    ):
+        """A failed official fetch is not an empty official list (#105)."""
+        env = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.trending"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        official_service = MagicMock()
+        official_service.get_playlists_from_endpoints.return_value = []
+        official_service.failed_endpoints = {"movies.trending"}
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+
+        assert sync.sync_lists(args) == 1
+        env["plex_client"].cleanup_orphaned_playlists.assert_not_called()
+
     def test_merged_official_mode_asks_for_every_period_at_once(self, monkeypatch, tmp_path):
         """Merged mode must aggregate the periods, not write one playlist each (#82)."""
         self._setup(monkeypatch, tmp_path)
