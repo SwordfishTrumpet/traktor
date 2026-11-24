@@ -62,6 +62,39 @@ _backup_dir_env = os.getenv("TRAKTOR_BACKUP_DIR", "").strip()
 TRAKTOR_BACKUP_DIR = Path(_backup_dir_env).expanduser() if _backup_dir_env else None
 TRAKTOR_MAX_BACKUPS = int(os.getenv("TRAKTOR_MAX_BACKUPS", "10"))
 
+
+def _parse_positive_env(name, default, cast):
+    """Read a positive number from the environment, or fall back.
+
+    RUNBOOK.md tells an operator to export the circuit breaker thresholds and
+    cooldowns, so these names must be read here. A value that is not a
+    positive number keeps the default instead of stopping the run
+    (issue #115).
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+# Circuit breaker tuning, documented in RUNBOOK.md under "Circuit breakers".
+TRAKTOR_TRAKT_FAILURE_THRESHOLD = _parse_positive_env(
+    "TRAKTOR_TRAKT_FAILURE_THRESHOLD", 5, int
+)
+TRAKTOR_TRAKT_COOLDOWN_SECONDS = _parse_positive_env(
+    "TRAKTOR_TRAKT_COOLDOWN_SECONDS", 60.0, float
+)
+TRAKTOR_PLEX_FAILURE_THRESHOLD = _parse_positive_env(
+    "TRAKTOR_PLEX_FAILURE_THRESHOLD", 3, int
+)
+TRAKTOR_PLEX_COOLDOWN_SECONDS = _parse_positive_env(
+    "TRAKTOR_PLEX_COOLDOWN_SECONDS", 30.0, float
+)
+
 # Active .env file location - the canonical Trakt token store since the .env
 # persistence change (legacy TOKEN_FILE below is no longer written by current
 # code). This is the file this process actually loaded: the Docker mount wins,

@@ -17,7 +17,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .log import logger
-from .settings import CACHE_DIR, CONFIG_FILE, ENV_FILE, TRAKTOR_BACKUP_DIR, TRAKTOR_MAX_BACKUPS
+from .settings import (
+    CACHE_DIR,
+    CONFIG_FILE,
+    ENV_FILE,
+    TRAKTOR_BACKUP_DIR,
+    TRAKTOR_MAX_BACKUPS,
+    TRAKTOR_PLEX_COOLDOWN_SECONDS,
+    TRAKTOR_PLEX_FAILURE_THRESHOLD,
+    TRAKTOR_TRAKT_COOLDOWN_SECONDS,
+    TRAKTOR_TRAKT_FAILURE_THRESHOLD,
+)
 from .utils import (
     DecompressionLimitError,
     file_lock,
@@ -1135,13 +1145,21 @@ class SyncProgress:
         }
 
 
-# Global instances for mission-critical components
+# Global instances for mission-critical components. The thresholds and
+# cooldowns are read from the variables RUNBOOK.md documents, so an operator
+# can make a failing dependency fail fast (issue #115).
 trakt_circuit_breaker = CircuitBreaker(
-    failure_threshold=5, success_threshold=2, cooldown_seconds=60.0, name="trakt_api"
+    failure_threshold=TRAKTOR_TRAKT_FAILURE_THRESHOLD,
+    success_threshold=2,
+    cooldown_seconds=TRAKTOR_TRAKT_COOLDOWN_SECONDS,
+    name="trakt_api",
 )
 
 plex_circuit_breaker = CircuitBreaker(
-    failure_threshold=3, success_threshold=2, cooldown_seconds=30.0, name="plex_api"
+    failure_threshold=TRAKTOR_PLEX_FAILURE_THRESHOLD,
+    success_threshold=2,
+    cooldown_seconds=TRAKTOR_PLEX_COOLDOWN_SECONDS,
+    name="plex_api",
 )
 
 health_checker = HealthCheck()

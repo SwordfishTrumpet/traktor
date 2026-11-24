@@ -1238,3 +1238,56 @@ class TestOverlappingBackups:
         monkeypatch.setattr(res.shutil, "rmtree", gone)
         manager._cleanup_old_backups()
         assert len(manager.list_backups()) == 3
+
+
+# ---------------------------------------------------------------------------
+# Issue #115: the runbook's circuit breaker variables were never read
+# ---------------------------------------------------------------------------
+
+
+def test_breaker_tuning_comes_from_the_documented_variables(monkeypatch):
+    import importlib
+
+    import traktor.resilience as resilience
+    import traktor.settings as settings
+
+    monkeypatch.setenv("TRAKTOR_TRAKT_FAILURE_THRESHOLD", "3")
+    monkeypatch.setenv("TRAKTOR_TRAKT_COOLDOWN_SECONDS", "120")
+    monkeypatch.setenv("TRAKTOR_PLEX_FAILURE_THRESHOLD", "5")
+    monkeypatch.setenv("TRAKTOR_PLEX_COOLDOWN_SECONDS", "60")
+    try:
+        importlib.reload(settings)
+        importlib.reload(resilience)
+
+        assert resilience.trakt_circuit_breaker.failure_threshold == 3
+        assert resilience.trakt_circuit_breaker.cooldown_seconds == 120.0
+        assert resilience.plex_circuit_breaker.failure_threshold == 5
+        assert resilience.plex_circuit_breaker.cooldown_seconds == 60.0
+    finally:
+        for name in (
+            "TRAKTOR_TRAKT_FAILURE_THRESHOLD",
+            "TRAKTOR_TRAKT_COOLDOWN_SECONDS",
+            "TRAKTOR_PLEX_FAILURE_THRESHOLD",
+            "TRAKTOR_PLEX_COOLDOWN_SECONDS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        importlib.reload(settings)
+        importlib.reload(resilience)
+
+
+def test_an_unreadable_breaker_variable_keeps_the_default(monkeypatch):
+    import importlib
+
+    import traktor.resilience as resilience
+    import traktor.settings as settings
+
+    monkeypatch.setenv("TRAKTOR_TRAKT_FAILURE_THRESHOLD", "not-a-number")
+    try:
+        importlib.reload(settings)
+        importlib.reload(resilience)
+
+        assert resilience.trakt_circuit_breaker.failure_threshold == 5
+    finally:
+        monkeypatch.delenv("TRAKTOR_TRAKT_FAILURE_THRESHOLD", raising=False)
+        importlib.reload(settings)
+        importlib.reload(resilience)
