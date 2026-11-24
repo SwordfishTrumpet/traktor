@@ -384,6 +384,7 @@ class OfficialListsService:
         period: str = "weekly",
         use_cache: bool = True,
         separate_playlists: bool = True,
+        periods: Optional[List[str]] = None,
     ) -> List[Dict]:
         """Generate playlist configurations from endpoints.
 
@@ -392,6 +393,12 @@ class OfficialListsService:
             period: Time period for stats endpoints
             use_cache: Whether to use caching
             separate_playlists: If True, create separate playlist per endpoint
+            periods: Every period the run covers, when the caller knows them; in
+                merged mode they all contribute to the same two playlists. When
+                omitted, this call is taken to cover ``period`` alone and the
+                merged playlist names carry that period, because a caller that
+                loops over periods would otherwise have each period's items
+                replace the previous period's (issue #82)
 
         Returns:
             List of playlist dicts with 'name', 'items', 'description'
@@ -447,9 +454,22 @@ class OfficialListsService:
 
                 logger.info(f"Created playlist '{playlist_name}' with {len(items)} items")
         else:
-            # Create aggregated playlists (one for movies, one for shows)
-            results = self.fetch_multiple_endpoints(endpoint_names, period, use_cache)
-            aggregated = self.aggregate_items(results)
+            # Create aggregated playlists (one for movies, one for shows). Every
+            # period this call covers contributes, so the second period's answer
+            # cannot replace the first period's items (issue #82).
+            all_items: List[Tuple[str, Dict]] = []
+            for covered_period in list(periods) if periods else [period]:
+                results = self.fetch_multiple_endpoints(endpoint_names, covered_period, use_cache)
+                for endpoint_name, items in results.items():
+                    for item in items:
+                        all_items.append((f"{endpoint_name} ({covered_period})", item))
+            aggregated = self._deduplicate_items(all_items)
+
+            # A caller that named every period gets the merged titles those runs
+            # have always written; one that did not gets a period-qualified
+            # title, so two such calls write two playlists instead of the second
+            # overwriting the first.
+            name_suffix = "" if periods else f" ({period.capitalize()})"
 
             if aggregated["movies"]:
                 # Sort movies by year descending (newest first)
@@ -458,7 +478,7 @@ class OfficialListsService:
                 )
                 playlists.append(
                     {
-                        "name": "Trakt Official - Movies",
+                        "name": f"Trakt Official - Movies{name_suffix}",
                         "items": aggregated["movies"],
                         "description": f"Curated from Trakt official lists ({len(endpoint_names)} sources). Updated automatically.",
                         "source": "aggregated.movies",
@@ -475,7 +495,7 @@ class OfficialListsService:
                 )
                 playlists.append(
                     {
-                        "name": "Trakt Official - Shows",
+                        "name": f"Trakt Official - Shows{name_suffix}",
                         "items": aggregated["shows"],
                         "description": f"Curated from Trakt official lists ({len(endpoint_names)} sources). Updated automatically.",
                         "source": "aggregated.shows",
