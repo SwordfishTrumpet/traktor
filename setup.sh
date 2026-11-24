@@ -35,6 +35,15 @@ echo ""
 echo "Installing dependencies..."
 uv sync || fail "dependency sync failed"
 
+# Create the file the next step names. An existing .env is never touched, and
+# the copy is owner-only because it will hold the Plex token (issue #121).
+if [ ! -f ".env" ]; then
+    [ -f ".env.example" ] || fail "no .env and no .env.example to copy"
+    cp .env.example .env || fail "could not create .env from .env.example"
+    chmod 600 .env 2>/dev/null || true
+    echo "Created .env from .env.example"
+fi
+
 echo ""
 echo "Setup complete!"
 echo ""

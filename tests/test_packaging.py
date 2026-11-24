@@ -352,3 +352,36 @@ def test_setup_fails_when_uv_cannot_be_installed(tmp_path):
 
     assert result.returncode != 0
     assert "Setup complete" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Issue #121: setup.sh told the user to edit a .env it never created
+# ---------------------------------------------------------------------------
+
+
+def test_setup_creates_the_env_it_tells_the_user_to_edit(tmp_path):
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "uv").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (stub / "uv").chmod(0o755)
+    (tmp_path / ".env.example").write_text("PLEX_URL=\\nPLEX_TOKEN=\\n", encoding="utf-8")
+
+    result = _run_setup(tmp_path, stub)
+
+    assert result.returncode == 0, result.stderr
+    created = tmp_path / ".env"
+    assert created.exists()
+    assert created.read_text(encoding="utf-8") == "PLEX_URL=\\nPLEX_TOKEN=\\n"
+    assert created.stat().st_mode & 0o777 == 0o600
+
+
+def test_setup_does_not_overwrite_an_existing_env(tmp_path):
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "uv").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (stub / "uv").chmod(0o755)
+    (tmp_path / ".env.example").write_text("PLEX_URL=\\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("PLEX_URL=http://mine:32400\\n", encoding="utf-8")
+
+    assert _run_setup(tmp_path, stub).returncode == 0
+    assert "mine" in (tmp_path / ".env").read_text(encoding="utf-8")

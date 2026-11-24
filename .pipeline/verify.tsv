@@ -89,3 +89,4 @@
 118	uv run pytest -q tests/test_packaging.py -k downloads_the_wheel	0	build
 119	uv run pytest -q tests/test_packaging.py -k setup_fails	0	deployment
 120	uv run pytest -q tests/test_clients.py -k authenticate_reports	0	compatibility
+121	uv run pytest -q tests/test_packaging.py -k creates_the_env	0	compatibility
