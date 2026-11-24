@@ -2,7 +2,7 @@
 
 import gzip
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1120,19 +1120,9 @@ class TestCacheManagerIncrementalUpdate:
 
     def test_incremental_update_adds_new_items(self, cache_manager, mock_plex_server, tmp_path):
         """Test that incremental update adds new items to cache."""
-        # Mock the cache meta file to have a recent timestamp
-        from datetime import datetime, timedelta
-
-        cache_manager.cache_meta_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_manager.cache_meta_file, "w") as f:
-            json.dump(
-                {
-                    "version": clients.CACHE_VERSION,
-                    "created": (datetime.now() - timedelta(hours=1)).isoformat(),
-                    "last_update": (datetime.now() - timedelta(hours=1)).isoformat(),
-                },
-                f,
-            )
+        # The meta stamp must be timezone-aware, or a machine east of Greenwich reads it
+        # as hours in the future and finds nothing (issue #104).
+        self._write_recent_meta(cache_manager)
 
         # Run incremental update
         result = cache_manager._incremental_cache_update()
@@ -1174,16 +1164,22 @@ class TestCacheManagerIncrementalUpdate:
 
     @staticmethod
     def _write_recent_meta(cache_manager):
-        """Write a cache meta file with a 1-hour-old timestamp."""
-        from datetime import datetime, timedelta
+        """Write a cache meta file with a 1-hour-old timestamp.
 
+        The stamp is timezone-aware: a naive one is read as UTC by design, so on a machine
+        east of Greenwich a naive "now" looked hours into the future and the update found
+        nothing (issue #104).
+        """
+        from datetime import datetime, timedelta, timezone
+
+        one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         cache_manager.cache_meta_file.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_manager.cache_meta_file, "w") as f:
             json.dump(
                 {
                     "version": clients.CACHE_VERSION,
-                    "created": (datetime.now() - timedelta(hours=1)).isoformat(),
-                    "last_update": (datetime.now() - timedelta(hours=1)).isoformat(),
+                    "created": one_hour_ago,
+                    "last_update": one_hour_ago,
                 },
                 f,
             )
@@ -2082,9 +2078,9 @@ class TestShowCountersAndEpisodeSnapshots:
         return show
 
     def test_show_counters_normalizes_last_viewed(self):
-        """plexapi returns a naive datetime; the snapshot stores UTC ISO."""
+        """An aware datetime is stored as the same instant in UTC ISO (issue #104)."""
         counters = clients.PlexClient.show_counters(
-            self._show(1, 2, 3, datetime(2024, 6, 15, 12, 0, 0))
+            self._show(1, 2, 3, datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc))
         )
 
         assert counters["viewedLeafCount"] == 2
