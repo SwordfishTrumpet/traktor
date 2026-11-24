@@ -13,7 +13,7 @@ import requests
 
 from .log import logger
 from .settings import CACHE_DIR
-from .trakt_official import TraktOfficialClient
+from .trakt_official import VALID_PERIODS, TraktOfficialClient
 from .utils import write_json_atomic
 
 # Endpoints whose contents depend on the requested period. The cache file names
@@ -51,6 +51,11 @@ class OfficialListsService:
         their cache key; the others ignore it and keep their plain name
         (issue #66).
 
+        The period is validated against the periods the Trakt client accepts
+        before it reaches the file name: interpolating it verbatim let a value
+        carrying path separators write, and let clear_cache delete, a file
+        outside the cache directory (issue #97).
+
         Args:
             endpoint_name: Name of the endpoint (e.g., "movies.trending")
             period: Period the endpoint was (or will be) requested for
@@ -60,8 +65,31 @@ class OfficialListsService:
         """
         stem = endpoint_name.replace(".", "_")
         if self._is_period_sensitive(endpoint_name):
-            stem = f"{stem}_{period}"
+            stem = f"{stem}_{self._valid_period(period)}"
         return self.cache_dir / f"{stem}.json"
+
+    @staticmethod
+    def _valid_period(period: Optional[str]) -> str:
+        """Return a period name safe to put in a file name.
+
+        ``TraktOfficialClient`` normalizes an unknown period to ``weekly``, so
+        the cache key does the same rather than inventing a second rule.
+
+        Args:
+            period: Requested period, possibly user-supplied
+
+        Returns:
+            One of the accepted period names
+        """
+        candidate = (period or "").strip().lower()
+        if candidate in VALID_PERIODS:
+            return candidate
+        if candidate:
+            logger.warning(
+                f"Ignoring unknown official-list period {period!r}; using the "
+                f"default 'weekly' of {sorted(VALID_PERIODS)}"
+            )
+        return "weekly"
 
     @staticmethod
     def _is_period_sensitive(endpoint_name: str) -> bool:

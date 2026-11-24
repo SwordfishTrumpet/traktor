@@ -110,7 +110,20 @@ class TestDiagnoseCommand:
         python_checks = [r for r in diagnose_cmd.results if "Python Version" in r.name]
         assert len(python_checks) == 1
         assert python_checks[0].status == "fail"
-        assert "3.8" in python_checks[0].suggestions[0]
+        assert "3.10" in python_checks[0].suggestions[0]
+
+    @patch("traktor.diagnose.sys.version_info")
+    def test_check_environment_reports_39_as_unsupported(self, mock_version, diagnose_cmd):
+        """The project requires 3.10, so a 3.9 interpreter is not supported (issue #85)."""
+        mock_version.major = 3
+        mock_version.minor = 9
+        mock_version.micro = 7
+
+        diagnose_cmd._check_environment()
+
+        python_checks = [r for r in diagnose_cmd.results if "Python Version" in r.name]
+        assert python_checks[0].status == "fail"
+        assert "3.9.7" in python_checks[0].message
 
     def test_check_environment_dependencies(self, diagnose_cmd):
         """Test dependency checks."""

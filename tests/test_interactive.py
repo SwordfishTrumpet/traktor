@@ -356,3 +356,12 @@ class TestUndoSnapshots:
         assert "timestamp" in snapshot
         assert "operation_type" in snapshot
         assert "data" in snapshot
+
+    def test_snapshot_file_is_owner_only(self, tmp_path, monkeypatch):
+        """A snapshot records viewing history, so other accounts cannot read it (#100)."""
+        monkeypatch.setattr(interactive, "DATA_DIR", tmp_path)
+
+        path = interactive.save_undo_snapshot("watch_sync", {"changes": {}})
+
+        assert path is not None
+        assert (path.stat().st_mode & 0o777) == 0o600

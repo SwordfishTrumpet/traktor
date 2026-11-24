@@ -42,6 +42,15 @@ class TestSetupLogging:
         assert fh.backupCount == 5
         assert fh.encoding == "utf-8"
 
+    def test_log_file_is_owner_only(self, tmp_path):
+        """The log records what the user watched, so other accounts cannot read it (#99)."""
+        log_file = tmp_path / "test.log"
+        with patch("traktor.log.LOG_FILE", log_file):
+            with patch("traktor.log.DOCKER_MODE", False):
+                setup_logging(verbose=False)
+
+        assert (log_file.stat().st_mode & 0o777) == 0o600
+
     def test_setup_logging_verbose_mode_enables_debug_console(self, tmp_path):
         """Test verbose mode sets console handler to DEBUG level."""
         log_file = tmp_path / "test.log"

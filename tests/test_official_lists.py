@@ -658,3 +658,31 @@ class TestPeriodAwareCache:
 
         assert not (service.cache_dir / "movies_played_monthly.json").exists()
         assert (service.cache_dir / "movies_played_weekly.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #97: an unvalidated period escaped the cache directory
+# ---------------------------------------------------------------------------
+
+
+def test_a_traversal_period_cannot_escape_the_cache_directory(tmp_path):
+    """A period is a name, not a path: anything else falls back to weekly (#97)."""
+    with patch("traktor.trakt_official.TRAKT_CLIENT_ID", "test_client_id"):
+        service = OfficialListsService(cache_dir=tmp_path / "cache")
+
+    cache_file = service._get_cache_file("movies.played", period="../../../outside")
+
+    assert cache_file.parent == service.cache_dir
+    assert cache_file.name == "movies_played_weekly.json"
+
+
+def test_clearing_a_traversal_period_cannot_delete_outside_the_cache(tmp_path):
+    """clear_cache unlinks the same confined path, so a victim file survives."""
+    with patch("traktor.trakt_official.TRAKT_CLIENT_ID", "test_client_id"):
+        service = OfficialListsService(cache_dir=tmp_path / "cache" / "official")
+        victim = tmp_path / "cache" / "victim.json"
+        victim.write_text("{}", encoding="utf-8")
+
+        service.clear_cache("movies.played", period="../../../victim")
+
+    assert victim.exists()
