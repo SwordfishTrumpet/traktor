@@ -83,3 +83,5 @@
 113	uv run pytest -q tests/test_clients.py -k TestCacheContainerTypes	0	security
 114	uv run pytest -q tests/test_auto_update.py -k wheel_install_reports	0	correctness
 115	uv run pytest -q tests/test_resilience.py -k documented_variables	0	deployment
+116	uv run pytest -q tests/test_diagnose.py -k config_check	0	observability
+116	uv run pytest -q tests/test_packaging.py -k healthcheck	0	observability

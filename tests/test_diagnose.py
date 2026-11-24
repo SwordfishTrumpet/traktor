@@ -434,3 +434,28 @@ class TestDiagnoseUsesSavedPlexCredentials:
         assert plex_calls, "diagnose never requested the saved Plex URL"
         connectivity = [r for r in diagnose_cmd.results if r.name == "Plex Server Connectivity"]
         assert connectivity[0].status == "pass"
+
+
+# ---------------------------------------------------------------------------
+# Issue #116: diagnose reported a corrupt config file as healthy
+# ---------------------------------------------------------------------------
+
+
+def test_the_config_check_fails_for_invalid_json(tmp_path, monkeypatch):
+    from traktor import diagnose as diagnose_module
+
+    config_file = tmp_path / ".traktor_config.json"
+    config_file.write_text("{not json", encoding="utf-8")
+    monkeypatch.setattr(diagnose_module, "CONFIG_FILE", config_file)
+
+    assert diagnose_module._config_file_is_readable() is False
+
+
+def test_the_config_check_passes_for_a_readable_object(tmp_path, monkeypatch):
+    from traktor import diagnose as diagnose_module
+
+    config_file = tmp_path / ".traktor_config.json"
+    config_file.write_text('{"managed_playlists": []}', encoding="utf-8")
+    monkeypatch.setattr(diagnose_module, "CONFIG_FILE", config_file)
+
+    assert diagnose_module._config_file_is_readable() is True

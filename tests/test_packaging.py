@@ -262,3 +262,15 @@ def test_compose_mounts_every_path_docker_mode_writes(monkeypatch):
     # The mount for the container home must exist by name, or a backup written
     # there still disappears with the container.
     assert "/home/traktor/.traktor_backups" in targets
+
+
+def test_the_compose_healthcheck_uses_the_check_that_can_fail():
+    """A healthcheck that cannot report a bad config is not a healthcheck (#116)."""
+    import pathlib
+
+    compose = pathlib.Path(__file__).parent.parent / "docker-compose.yml"
+    text = compose.read_text(encoding="utf-8")
+
+    healthcheck = [line for line in text.splitlines() if "--health-check" in line]
+    assert healthcheck, "the compose healthcheck does not run --health-check"
+    assert "--diagnose" not in text.split("healthcheck:")[1].split("networks:")[0]
