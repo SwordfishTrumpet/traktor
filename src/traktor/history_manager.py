@@ -1,5 +1,6 @@
 """Watch history tracking and sync state management."""
 
+import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -29,10 +30,12 @@ class WatchHistoryManager:
         self.sync_file = WATCH_SYNC_FILE
         self.state = self._load_state()
         self._build_index()
-        # Entries this run dropped. save_state() removes them from the file after
-        # merging, so a run that loaded an older snapshot cannot bring them back
-        # (issues #65, #68).
-        self._removed_keys: set = set()
+        # Entries this run dropped, each with the version of the entry it
+        # dropped. save_state() writes them to the file as tombstones, so an
+        # older run's save cannot resurrect a row a newer run removed, and a
+        # stale prune cannot erase a row a newer run just committed (issues
+        # #65, #95).
+        self._removed_keys: Dict[str, str] = {}
         # clear_all() and restore_from_backup() replace the file rather than merge.
         self._replace_on_save = False
 
@@ -82,6 +85,7 @@ class WatchHistoryManager:
             "last_sync_timestamp": None,
             "plex_server_id": self.plex_server_id,
             "synced_items": [],
+            "removed_items": {},
         }
 
     def _validate_state(self, state):
@@ -108,7 +112,8 @@ class WatchHistoryManager:
             return
         self.state = merged
         self._build_index()
-        self._removed_keys.clear()
+        # The tombstones now live on disk; this run's own list is spent.
+        self._removed_keys = {}
         self._replace_on_save = False
         logger.debug(f"Saved watch sync state to {self.sync_file}")
 
@@ -122,22 +127,16 @@ class WatchHistoryManager:
 
         merged_items: list = []
         positions: Dict[Any, int] = {}
-        unkeyed: list = []
+        removals = self._merge_removals(on_disk)
         for item in on_disk.get("synced_items") or []:
             if not isinstance(item, dict):
                 continue
             key = self._item_key(item)
-            if key is None:
-                unkeyed.append(item)
-            else:
-                positions[key] = len(merged_items)
-                merged_items.append(item)
+            positions[key] = len(merged_items)
+            merged_items.append(item)
 
         for item in self.state["synced_items"]:
             key = self._item_key(item)
-            if key is None:
-                unkeyed.append(item)
-                continue
             position = positions.get(key)
             if position is None:
                 positions[key] = len(merged_items)
@@ -145,17 +144,67 @@ class WatchHistoryManager:
             elif self._is_newer(item, merged_items[position]):
                 merged_items[position] = item
 
-        merged_items = [i for i in merged_items if self._item_key(i) not in self._removed_keys]
-        merged_items.extend(unkeyed)
+        # A removal only wins against a row it is at least as new as. The stale
+        # run's prune recorded the version of the row it dropped, so a row a
+        # newer run committed afterwards survives it (issue #95).
+        merged_items = [item for item in merged_items if not self._removal_wins(removals, item)]
 
         merged = dict(on_disk)
         merged["version"] = self.state.get("version", 1)
         merged["plex_server_id"] = self.plex_server_id
         merged["synced_items"] = merged_items
+        merged["removed_items"] = self._prune_tombstones(removals)
         merged["last_sync_timestamp"] = self._later_timestamp(
             on_disk.get("last_sync_timestamp"), self.state.get("last_sync_timestamp")
         )
         return merged
+
+    def _merge_removals(self, on_disk: Dict[str, Any]) -> Dict[str, str]:
+        """Union this run's removals with the tombstones already on disk."""
+        removals: Dict[str, str] = {}
+        on_disk_removals = on_disk.get("removed_items")
+        if isinstance(on_disk_removals, dict):
+            for key, version in on_disk_removals.items():
+                if isinstance(key, str) and isinstance(version, str):
+                    removals[key] = version
+        for key, version in self._removed_keys.items():
+            current = removals.get(key)
+            if current is None or self._later_timestamp(version, current) == version:
+                removals[key] = version
+        return removals
+
+    @staticmethod
+    def _removal_wins(removals: Dict[str, str], item: Dict[str, Any]) -> bool:
+        """Return True when a recorded removal outranks ``item``."""
+        key = WatchHistoryManager._item_key(item)
+        version = removals.get(WatchHistoryManager._removal_key(key))
+        if version is None:
+            return False
+        removed_at = WatchHistoryManager._parse_entry_timestamp(version)
+        if removed_at is None:
+            # A tombstone this build cannot date still means "dropped".
+            return True
+        item_at = WatchHistoryManager._entry_age_timestamp(item)
+        if item_at is None:
+            return True
+        return item_at <= removed_at
+
+    @staticmethod
+    def _prune_tombstones(removals: Dict[str, str]) -> Dict[str, str]:
+        """Drop tombstones old enough that no run can still hold the row.
+
+        A tombstone only has to outlive the row it removed, so it is kept for
+        twice the history retention window and then dropped.
+        """
+        if HISTORY_RETENTION_DAYS <= 0:
+            return dict(removals)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=HISTORY_RETENTION_DAYS * 2)
+        kept: Dict[str, str] = {}
+        for key, version in removals.items():
+            stamped = WatchHistoryManager._parse_entry_timestamp(version)
+            if stamped is None or stamped >= cutoff:
+                kept[key] = version
+        return kept
 
     def _mergeable(self, on_disk: Dict[str, Any]) -> bool:
         """Return True when ``on_disk`` can be merged with this run's state."""
@@ -164,12 +213,15 @@ class WatchHistoryManager:
         return on_disk.get("plex_server_id") == self.plex_server_id
 
     @staticmethod
-    def _item_key(item: Dict[str, Any]) -> Optional[Any]:
+    def _item_key(item: Dict[str, Any]) -> Any:
         """Return the identity two runs must agree on for one entry.
 
         The Plex rating key is exact. Without one the Trakt, TMDb or IMDb id is
         used, in that order of specificity; episodes of one show share an IMDb
-        id, so an entry keyed only by it may take the place of a sibling.
+        id, so an entry keyed only by it may take the place of a sibling. An
+        entry with no identifier at all is keyed by its content, which gives it
+        a stable identity: it cannot be duplicated by a second save, and a
+        removal can name it (issue #96).
         """
         rating_key = item.get("plex_rating_key")
         if rating_key is not None:
@@ -178,7 +230,24 @@ class WatchHistoryManager:
             value = item.get(field)
             if value:
                 return (field, str(value))
-        return None
+        return ("content", WatchHistoryManager._content_fingerprint(item))
+
+    @staticmethod
+    def _content_fingerprint(item: Dict[str, Any]) -> str:
+        """Hash an entry's content, ignoring its own ``updated_at``.
+
+        Two copies of the same viewing record hash alike, so they merge, and a
+        newer copy still wins through ``updated_at``.
+        """
+        payload = {key: value for key, value in item.items() if key != "updated_at"}
+        encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _removal_key(key: Any) -> str:
+        """Render an item key as the string a tombstone is stored under."""
+        field, value = key
+        return f"{field}:{value}"
 
     @staticmethod
     def _is_newer(candidate: Dict[str, Any], current: Dict[str, Any]) -> bool:
@@ -381,8 +450,8 @@ class WatchHistoryManager:
         if item.get("plex_rating_key") is not None:
             self._item_index.pop(item.get("plex_rating_key"), None)
         key = self._item_key(item)
-        if key is not None:
-            self._removed_keys.add(key)
+        stamped = self._entry_age_timestamp(item) or datetime.now(timezone.utc)
+        self._removed_keys[self._removal_key(key)] = stamped.isoformat()
 
     @staticmethod
     def _parse_entry_timestamp(value):
