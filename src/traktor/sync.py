@@ -1571,13 +1571,24 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
 
             all_official_playlists = []
 
-            # Fetch for each period
-            for period in periods:
-                # Get playlists from official service for this period
-                period_playlists = official_service.get_playlists_from_endpoints(
-                    endpoints, period=period, separate_playlists=separate_playlists
+            if separate_playlists:
+                # One playlist set per period, each titled with its period.
+                for period in periods:
+                    all_official_playlists.extend(
+                        official_service.get_playlists_from_endpoints(
+                            endpoints, period=period, separate_playlists=True
+                        )
+                    )
+            else:
+                # Merged mode: every period goes into one call, so the periods
+                # are aggregated into the same two playlists instead of each
+                # period's playlist replacing the previous period's (issue #82).
+                all_official_playlists = official_service.get_playlists_from_endpoints(
+                    endpoints,
+                    period=periods[0] if periods else "weekly",
+                    separate_playlists=False,
+                    periods=periods,
                 )
-                all_official_playlists.extend(period_playlists)
 
             if all_official_playlists:
                 stats["official_playlists_found"] = len(all_official_playlists)

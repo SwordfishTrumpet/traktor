@@ -282,7 +282,7 @@ docker compose build
 docker compose run --rm traktor
 ```
 
-The compose file mounts your `.env` into the container so the login can write refreshed tokens back, and binds `./data/logs` and `./data/config` for logs and cache. Inside the container `DOCKER_MODE=true` moves every path under `/data`.
+The compose file mounts your `.env` into the container so the login can write refreshed tokens back, and binds `./data` to `/data` and `./data/backups` to the snapshot directory in the container home. Inside the container `DOCKER_MODE=true` moves every path under `/data`.
 
 Scheduling inside Docker, the health server port and the volume layout are covered in [DOCKER.md](DOCKER.md).
 
@@ -304,7 +304,7 @@ Trakt publishes algorithmic lists (trending, popular, most played, box office, a
 
 This choice decides which playlists get built and nothing else: watch status reads your Trakt history and your Plex library, and works the same whichever source you pick. A list whose name is in `blacklisted_lists` is skipped from every source, and `own` needs the lists to carry a Trakt list ID, which lists created on trakt.tv always do.
 
-Official lists can be narrowed with `--official-endpoints` and widened across periods with `--official-periods`. `--official-playlist-mode=separate` (the default) writes one playlist per endpoint and period; `merged` combines them by media type, which keeps the playlist count down. The cache is kept per period for the endpoints that take one (`played`, `watched`, `collected`), so asking for weekly and monthly fetches both instead of serving the weekly answer twice.
+Official lists can be narrowed with `--official-endpoints` and widened across periods with `--official-periods`. `--official-playlist-mode=separate` (the default) writes one playlist per endpoint and period; `merged` combines them by media type, which keeps the playlist count down — every requested period goes into those same two playlists. The cache is kept per period for the endpoints that take one (`played`, `watched`, `collected`), so asking for weekly and monthly fetches both instead of serving the weekly answer twice.
 
 ## 14. Matching by ID
 
@@ -472,10 +472,11 @@ Everything here can live in `.env`.
 | Credentials | `.env` in the working directory | `/app/.env` |
 | Plex library cache | `~/.traktor_cache/` | `/data/config/.traktor_cache/` |
 | Watch-sync state | `~/.traktor_watch_sync.json` | `/data/.traktor_watch_sync.json` |
+| Undo snapshots | `~/.traktor/undo/` | `/data/.traktor/undo/` |
 | Run record | `~/.traktor_cache/sync_progress.json` | `/data/config/.traktor_cache/sync_progress.json` |
 | Log | `~/.traktor/traktor.log` | `/data/logs/traktor.log` |
 | Missing report | `~/.traktor/missing.txt` | `/data/logs/missing.txt` |
-| Backups | `~/.traktor_backups/` | the home directory in the container |
+| Backups | `~/.traktor_backups/` | `/home/traktor/.traktor_backups/` (Compose mounts `./data/backups` there) |
 
 Credentials live in the `.env` file, not in a separate token file, because that is the file traktor reads and writes on refresh.
 

@@ -27,16 +27,20 @@ services:
       # Optional: Additional settings
       - PYTHONUNBUFFERED=1
     
-    # Volume mounts for persistent data
+    # Volume mounts for persistent data. Everything DOCKER_MODE writes under
+    # /data lives under one mount: config, cache, logs, the watch-sync delta
+    # file and the undo snapshots. Mounting only /data/logs and /data/config
+    # threw the delta file and the snapshots away with the container (issue #87).
     volumes:
       # Mount your .env file (not read-only so tokens can be saved)
       - ./.env:/app/.env
-      
-      # Mount for logs (optional, defaults to container storage)
-      - ./data/logs:/data/logs
-      
-      # Mount for config/token storage (optional, defaults to container storage)
-      - ./data/config:/data/config
+
+      # Config, cache, logs and watch-sync state
+      - ./data:/data
+
+      # Snapshots default to the container home; without this mount every
+      # backup disappears when `docker compose run --rm` exits (issue #87).
+      - ./data/backups:/home/traktor/.traktor_backups
     
     # Interactive mode for authentication prompts
     stdin_open: true

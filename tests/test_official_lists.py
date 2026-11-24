@@ -686,3 +686,85 @@ def test_clearing_a_traversal_period_cannot_delete_outside_the_cache(tmp_path):
         service.clear_cache("movies.played", period="../../../victim")
 
     assert victim.exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #82: a merged playlist must not lose an earlier period's items
+# ---------------------------------------------------------------------------
+
+
+class TestMergedPlaylistsAcrossPeriods:
+    """Merged mode writes one playlist per media type, and titles key a playlist."""
+
+    PERIOD_ITEMS = {
+        "weekly": [
+            {
+                "type": "movie",
+                "movie": {"title": "Weekly Only", "year": 2020, "ids": {"imdb": "tt-weekly"}},
+                "score": 6,
+                "watchers": 10,
+            }
+        ],
+        "monthly": [
+            {
+                "type": "movie",
+                "movie": {"title": "Monthly Only", "year": 2021, "ids": {"imdb": "tt-monthly"}},
+                "score": 6,
+                "watchers": 10,
+            }
+        ],
+    }
+
+    @pytest.fixture
+    def service(self, tmp_path):
+        with patch("traktor.trakt_official.TRAKT_CLIENT_ID", "test_id"):
+            svc = OfficialListsService(cache_dir=tmp_path)
+        svc.client.get_endpoint = lambda name, period="weekly", limit=None: (
+            self.PERIOD_ITEMS[period]
+        )
+        return svc
+
+    def test_a_per_period_call_names_its_period(self, service):
+        """A caller looping periods must not have one period overwrite another."""
+        store = {}
+        for period in ("weekly", "monthly"):
+            for playlist in service.get_playlists_from_endpoints(
+                ["movies.played"], period=period, use_cache=False, separate_playlists=False
+            ):
+                store[playlist["name"]] = [
+                    item["movie"]["ids"]["imdb"] for item in playlist["items"]
+                ]
+
+        assert store == {
+            "Trakt Official - Movies (Weekly)": ["tt-weekly"],
+            "Trakt Official - Movies (Monthly)": ["tt-monthly"],
+        }
+
+    def test_a_caller_that_names_every_period_gets_one_merged_playlist(self, service):
+        """One call covering both periods keeps the stable name and every item."""
+        playlists = service.get_playlists_from_endpoints(
+            ["movies.played"],
+            period="weekly",
+            use_cache=False,
+            separate_playlists=False,
+            periods=["weekly", "monthly"],
+        )
+
+        assert len(playlists) == 1
+        assert playlists[0]["name"] == "Trakt Official - Movies"
+        assert {item["movie"]["ids"]["imdb"] for item in playlists[0]["items"]} == {
+            "tt-weekly",
+            "tt-monthly",
+        }
+
+    def test_one_period_keeps_the_plain_title(self, service):
+        """The default run is a single period, and its playlist name must not move."""
+        playlists = service.get_playlists_from_endpoints(
+            ["movies.played"],
+            period="weekly",
+            use_cache=False,
+            separate_playlists=False,
+            periods=["weekly"],
+        )
+
+        assert [playlist["name"] for playlist in playlists] == ["Trakt Official - Movies"]

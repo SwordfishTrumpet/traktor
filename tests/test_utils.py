@@ -257,3 +257,56 @@ class TestRusageMaxrssToMb:
 
         monkeypatch.setattr(utils_module.sys, "platform", "linux")
         assert utils_module.rusage_maxrss_to_mb(307200) == 300.0
+
+
+# ---------------------------------------------------------------------------
+# Issue #81: a gzip payload is untrusted input and must not expand unbounded
+# ---------------------------------------------------------------------------
+
+
+class TestBoundedGzipReads:
+    """A small gzip file can expand past what the host has."""
+
+    def test_a_normal_payload_reads_back_whole(self, tmp_path):
+        import gzip
+
+        path = tmp_path / "cache.json.gz"
+        with gzip.open(path, "wb") as f:
+            f.write(b'{"movies": []}')
+
+        assert utils.read_gzip_text(path) == '{"movies": []}'
+        assert utils.read_gzip_bytes(path) == b'{"movies": []}'
+
+    def test_a_payload_past_the_size_limit_is_refused(self, tmp_path):
+        import gzip
+
+        path = tmp_path / "bomb.json.gz"
+        with gzip.open(path, "wb", compresslevel=9) as f:
+            f.write(b"0" * (256 * 1024))
+
+        with pytest.raises(utils.DecompressionLimitError):
+            utils.read_gzip_text(path, max_bytes=4096)
+
+    def test_a_payload_past_the_ratio_limit_is_refused(self, tmp_path, monkeypatch):
+        import gzip
+
+        monkeypatch.setattr(utils, "RATIO_GUARDED_MIN_BYTES", 4096)
+        monkeypatch.setattr(utils, "MAX_DECOMPRESSION_RATIO", 20)
+        path = tmp_path / "bomb.json.gz"
+        with gzip.open(path, "wb", compresslevel=9) as f:
+            f.write(b"0" * (1024 * 1024))
+
+        with pytest.raises(utils.DecompressionLimitError, match="expands"):
+            utils.read_gzip_text(path)
+
+    def test_a_large_but_ordinary_payload_is_not_refused(self, tmp_path):
+        import gzip
+
+        path = tmp_path / "cache.json.gz"
+        # Repeated JSON keys compress far past 20x, so a ratio-only rule would
+        # refuse a legitimate cache: the size ceiling is what decides.
+        raw = b'{"title": "A Movie", "year": 2024}\n' * 20000
+        with gzip.open(path, "wb", compresslevel=9) as f:
+            f.write(raw)
+
+        assert utils.read_gzip_bytes(path) == raw

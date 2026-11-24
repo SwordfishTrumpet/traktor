@@ -1641,6 +1641,70 @@ class TestSyncListsFeatureSections:
         assert result == 0
         official_service.get_playlists_from_endpoints.assert_called_once()
 
+    def test_merged_official_mode_asks_for_every_period_at_once(self, monkeypatch, tmp_path):
+        """Merged mode must aggregate the periods, not write one playlist each (#82)."""
+        self._setup(monkeypatch, tmp_path)
+        args = self._args(
+            monkeypatch,
+            [
+                "--list-source",
+                "official",
+                "--official-playlist-mode",
+                "merged",
+                "--official-periods",
+                "weekly,monthly",
+            ],
+        )
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.played"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly", "monthly"])
+
+        official_service = MagicMock()
+        official_service.get_playlists_from_endpoints.return_value = []
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+
+        assert sync.sync_lists(args) == 0
+
+        official_service.get_playlists_from_endpoints.assert_called_once()
+        kwargs = official_service.get_playlists_from_endpoints.call_args.kwargs
+        assert kwargs["periods"] == ["weekly", "monthly"]
+        assert kwargs["separate_playlists"] is False
+
+    def test_separate_official_mode_asks_once_per_period(self, monkeypatch, tmp_path):
+        """Separate mode keeps one titled playlist set per period (#82)."""
+        self._setup(monkeypatch, tmp_path)
+        args = self._args(
+            monkeypatch,
+            [
+                "--list-source",
+                "official",
+                "--official-playlist-mode",
+                "separate",
+                "--official-periods",
+                "weekly,monthly",
+            ],
+        )
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.played"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly", "monthly"])
+
+        official_service = MagicMock()
+        official_service.get_playlists_from_endpoints.return_value = []
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+
+        assert sync.sync_lists(args) == 0
+
+        assert official_service.get_playlists_from_endpoints.call_count == 2
+        periods_called = [
+            call.kwargs["period"]
+            for call in official_service.get_playlists_from_endpoints.call_args_list
+        ]
+        assert periods_called == ["weekly", "monthly"]
+
     def test_official_playlists_none(self, monkeypatch, tmp_path):
         """No official playlists -> graceful message, exit 0."""
         self._setup(monkeypatch, tmp_path)

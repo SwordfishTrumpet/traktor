@@ -27,8 +27,20 @@ When `DOCKER_MODE=true`, the app uses:
 - `/data/config/.traktor_trakt_token.json`
 - `/data/config/.traktor_cache`
 - `/data/logs/traktor.log`
+- `/data/.traktor_watch_sync.json` (the delta window the watch sync reuses)
+- `/data/.traktor/undo/` (undo snapshots)
+- `/home/traktor/.traktor_backups/` (snapshots, unless `TRAKTOR_BACKUP_DIR` says otherwise)
 
-In this repository, those map to the checked-in `data/` folder when you mount it through Compose.
+`docker-compose.yml` mounts exactly two directories for these: `./data` on `/data` and
+`./data/backups` on `/home/traktor/.traktor_backups`. Everything the container persists lives
+under one of them, so `docker compose run --rm` does not discard it.
+
+Compose creates a missing host directory as `root`, and the container runs as user `traktor`
+(uid 1000), so create them yourself once:
+
+```bash
+mkdir -p data/backups && sudo chown -R 1000:1000 data
+```
 
 ## Common commands
 
@@ -57,9 +69,11 @@ Example cron entry:
 - auth loop: rerun with `--force-auth`
 - stale matches: rerun with `--refresh-cache`
 - logs: inspect `data/logs/traktor.log`
+- snapshots: `data/backups/` on the host, `/home/traktor/.traktor_backups` in the container
 
 ## Security notes
 
 - mount `.env` read-only when possible
 - do not commit real `.env`, token files, cache files, or logs
 - treat `data/config` as secret-bearing runtime state
+- `data/` also holds the watch-sync delta file, undo snapshots and snapshots; treat it the same

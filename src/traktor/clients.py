@@ -32,8 +32,10 @@ from .settings import (
     TRAKT_REFRESH_TOKEN,
 )
 from .utils import (
+    DecompressionLimitError,
     normalize_tmdb_id,
     parse_timestamp,
+    read_gzip_text,
     restrict_to_owner,
     write_bytes_atomic,
     write_json_atomic,
@@ -66,6 +68,9 @@ CONTAINER_SIZE = 500  # Items per page when fetching all library items
 # API pagination and data fetching constants
 DEFAULT_API_PAGE_SIZE = 100  # Default items per page for API requests
 DEFAULT_RECENTLY_ADDED_MAXRESULTS = 1000  # Max results for recentlyAdded API
+# A capped read cannot prove it saw every new item, so the page doubles until
+# one comes back short. This is the safety stop for that loop.
+MAX_RECENTLY_ADDED_MAXRESULTS = 32 * DEFAULT_RECENTLY_ADDED_MAXRESULTS
 
 
 def count_trakt_items(value: Any) -> int:
@@ -604,8 +609,9 @@ class CacheManager:
         if not force_refresh and self._is_cache_valid():
             logger.info("Loading library cache from disk...")
             try:
-                with gzip.open(self.cache_file, "rt", encoding="utf-8") as f:
-                    self.memory_cache = json.load(f)
+                # The cache file is untrusted on disk: a small gzip payload can
+                # expand past the host's memory (issue #81).
+                self.memory_cache = json.loads(read_gzip_text(self.cache_file))
                 logger.info(f"Loaded cache with {len(self.memory_cache)} entries")
 
                 # Validate structure - if corrupt, rebuild
@@ -629,6 +635,8 @@ class CacheManager:
                 return True
             except gzip.BadGzipFile:
                 logger.warning("Cache file is corrupted, will rebuild")
+            except DecompressionLimitError as e:
+                logger.warning(f"Refusing this cache file, will rebuild: {e}")
             except Exception as e:
                 logger.error(f"Failed to load cache: {e}")
                 # Fall through to build fresh cache
@@ -691,7 +699,8 @@ class CacheManager:
 
         return ids
 
-    def _safe_get_attr(self, item, attr, default=None):
+    @staticmethod
+    def _safe_get_attr(item, attr, default=None):
         """Safely access a PlexAPI attribute without triggering a server reload.
 
         PlexAPI's __getattribute__ triggers _reload() when an attribute value
@@ -867,6 +876,56 @@ class CacheManager:
         """
         return parse_timestamp(added_at)
 
+    def _new_items_since(self, section, cutoff_time: datetime) -> Optional[List[Any]]:
+        """Return the items ``section`` gained after ``cutoff_time``.
+
+        ``recentlyAdded`` answers at most ``maxresults`` items, and the old code
+        asked for a fixed 1,000 and then recorded the cache as complete, so
+        everything past the first 1,000 stayed out of the cache while the
+        metadata claimed otherwise (issue #93). A page that comes back full
+        proves nothing, so the page doubles until one comes back short: PlexAPI
+        stops early only when it has ``maxresults`` items or the library has no
+        more, so a short page is the one honest signal.
+
+        Args:
+            section: Plex library section
+            cutoff_time: Only items added after this instant are returned
+
+        Returns:
+            The new items, or None when the read failed or could not be shown
+            to be complete - the caller must then leave ``last_update`` alone
+        """
+        page = DEFAULT_RECENTLY_ADDED_MAXRESULTS
+        while True:
+            try:
+                recent_items = section.recentlyAdded(maxresults=page)
+            except Exception as e:
+                logger.warning(
+                    f"  Could not get recentlyAdded for section "
+                    f"'{getattr(section, 'title', 'unknown')}': {e}"
+                )
+                return None
+
+            if len(recent_items) != page:
+                # Short (or, from a section that ignores maxresults, longer):
+                # the section gave everything it had for this read.
+                new_items = []
+                for item in recent_items:
+                    added_at = self._normalize_added_at(self._safe_get_attr(item, "addedAt", None))
+                    if added_at is not None and added_at > cutoff_time:
+                        new_items.append(item)
+                return new_items
+
+            if page >= MAX_RECENTLY_ADDED_MAXRESULTS:
+                logger.warning(
+                    f"  '{getattr(section, 'title', 'unknown')}' returned {page} items added "
+                    f"since the last cache update; leaving the cache stamp unchanged "
+                    f"rather than record a partial read"
+                )
+                return None
+
+            page = min(page * 2, MAX_RECENTLY_ADDED_MAXRESULTS)
+
     def _incremental_cache_update(self) -> bool:
         """Update cache incrementally using recentlyAdded API.
 
@@ -907,20 +966,13 @@ class CacheManager:
                 )
 
                 try:
-                    # Get recently added items (fetch more to filter by date)
-                    recent_items = section.recentlyAdded(
-                        maxresults=DEFAULT_RECENTLY_ADDED_MAXRESULTS
-                    )
-
-                    # Filter items by added date
                     cutoff_time = datetime.now(timezone.utc) - time_since_update
-                    new_items = []
-                    for item in recent_items:
-                        added_at = self._normalize_added_at(
-                            self._safe_get_attr(item, "addedAt", None)
-                        )
-                        if added_at is not None and added_at > cutoff_time:
-                            new_items.append(item)
+                    new_items = self._new_items_since(section, cutoff_time)
+                    if new_items is None:
+                        # An incomplete read must not advance last_update: that
+                        # stamp is what told the next run the items were cached
+                        # (issue #93).
+                        return False
 
                     if new_items:
                         logger.info(f"  Found {len(new_items)} new {section.type}(s)")
@@ -2385,10 +2437,13 @@ class PlexClient:
         Returns:
             Dict with the three counters, timestamps as ISO-8601 UTC or None
         """
-        last_viewed = parse_timestamp(getattr(show, "lastViewedAt", None))
+        # Plain getattr here reloads the whole show from Plex whenever a value is
+        # absent - which is every unwatched show - so a 4,600-show library cost
+        # one request per unwatched show (issue #91).
+        last_viewed = parse_timestamp(CacheManager._safe_get_attr(show, "lastViewedAt"))
         return {
-            "viewedLeafCount": getattr(show, "viewedLeafCount", None),
-            "leafCount": getattr(show, "leafCount", None),
+            "viewedLeafCount": CacheManager._safe_get_attr(show, "viewedLeafCount"),
+            "leafCount": CacheManager._safe_get_attr(show, "leafCount"),
             "lastViewedAt": last_viewed.isoformat() if last_viewed else None,
         }
 
@@ -2897,7 +2952,11 @@ class PlexClient:
             Tuple of (view_offset_ms, total_duration_ms) or (None, None) if not available
         """
         try:
-            item = self.server.fetchItem(rating_key)
+            # The item is read once per run: the setter below reuses what this
+            # read fetched instead of asking Plex for it again (issue #94).
+            item = self._get_plex_item(rating_key)
+            if item is None:
+                return None, None
             view_offset = getattr(item, "viewOffset", None)
             duration = getattr(item, "duration", None)
 
@@ -2927,7 +2986,9 @@ class PlexClient:
         logger.info(f"Setting playback progress in Plex: {rating_key} -> {view_offset_ms}ms")
 
         try:
-            item = self.server.fetchItem(rating_key)
+            item = self._get_plex_item(rating_key)
+            if item is None:
+                return False
 
             if hasattr(item, "updateProgress"):
                 item.updateProgress(view_offset_ms)

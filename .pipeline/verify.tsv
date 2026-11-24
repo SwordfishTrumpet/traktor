@@ -62,3 +62,11 @@
 102	uv run pytest -q tests/test_clients.py -k "another_plex_account or fingerprint"	0	security
 103	uv run pytest -q tests/test_settings.py -k configured_env_file	0	security
 104	uv run pytest -q tests/test_clients.py -k "incremental_update or show_counters"	0	testing
+81	uv run pytest -q tests/test_utils.py::TestBoundedGzipReads tests/test_resilience.py::TestBackupRestoreIsBounded tests/test_clients.py::test_a_cache_that_expands_past_the_bound_is_rebuilt	0	security
+82	uv run pytest -q tests/test_official_lists.py::TestMergedPlaylistsAcrossPeriods tests/test_sync.py::TestSyncListsFeatureSections::test_merged_official_mode_asks_for_every_period_at_once tests/test_sync.py::TestSyncListsFeatureSections::test_separate_official_mode_asks_once_per_period	0	domain
+87	uv run pytest -q tests/test_packaging.py::test_compose_mounts_every_path_docker_mode_writes	0	deployment
+91	uv run pytest -q tests/test_clients.py::test_reading_show_counters_does_not_reload_each_show	0	performance
+93	uv run pytest -q tests/test_clients.py::test_incremental_update_reads_past_a_thousand_new_items tests/test_clients.py::test_a_capped_incremental_read_does_not_advance_the_stamp	0	performance
+94	uv run pytest -q tests/test_clients.py::test_playback_progress_reads_each_item_once	0	performance
+95	uv run pytest -q tests/test_history_manager.py::TestOverlappingRemovals	0	data-integrity
+96	uv run pytest -q tests/test_history_manager.py::TestUnkeyedRows	0	correctness

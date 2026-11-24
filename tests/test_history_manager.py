@@ -561,3 +561,111 @@ class TestOverlappingRuns:
 
         reloaded = history_manager.WatchHistoryManager(plex_server_id="this-server")
         assert [item["imdb_id"] for item in reloaded.state["synced_items"]] == ["tt0000004"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #95: an overlapping run's removal must not beat a newer run's row
+# ---------------------------------------------------------------------------
+
+
+class TestOverlappingRemovals:
+    """Removals are merged by version, not applied blindly."""
+
+    def _manager(self):
+        return history_manager.WatchHistoryManager(plex_server_id="shared-server")
+
+    def test_a_stale_prune_keeps_a_row_a_newer_run_committed(self, temp_state_file):
+        seed = self._manager()
+        seed.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt0000001", plex_rating_key=1, watched_plex=False
+        )
+        seed.state["synced_items"][0]["updated_at"] = "2000-01-01T00:00:00+00:00"
+        seed.save_state()
+
+        older_run = self._manager()
+        newer_run = self._manager()
+        newer_run.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt0000001", plex_rating_key=1, watched_plex=True
+        )
+        newer_run.save_state()
+
+        assert older_run.prune_synced_items(max_age_days=180) == 1
+        older_run.save_state()
+
+        after = self._manager().state["synced_items"]
+        assert len(after) == 1
+        assert after[0]["watched_plex"] is True
+
+    def test_an_older_save_does_not_resurrect_a_removed_row(self, temp_state_file):
+        seed = self._manager()
+        seed.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt0000002", plex_rating_key=2, watched_plex=True
+        )
+        seed.save_state()
+
+        older_run = self._manager()
+        newer_run = self._manager()
+        newer_run.remove_synced_item(plex_rating_key=2)
+        older_run.save_state()
+
+        assert self._manager().state["synced_items"] == []
+
+    def test_a_tombstone_does_not_outlive_its_row_for_ever(self, temp_state_file):
+        """Tombstones are dropped after twice the retention window."""
+        manager = self._manager()
+        manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt0000003", plex_rating_key=3
+        )
+        manager.remove_synced_item(plex_rating_key=3)
+
+        saved = json.loads(temp_state_file.read_text())
+        assert saved["removed_items"] == {}
+
+        manager._removed_keys = {"plex_rating_key:3": "2000-01-01T00:00:00+00:00"}
+        manager.save_state()
+
+        assert json.loads(temp_state_file.read_text())["removed_items"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Issue #96: a row with no identifier must not duplicate or resist retention
+# ---------------------------------------------------------------------------
+
+
+class TestUnkeyedRows:
+    """An entry with no Plex/Trakt/TMDb/IMDb id still needs a stable identity."""
+
+    def test_repeated_saves_do_not_duplicate_an_unkeyed_row(self, temp_state_file):
+        manager = history_manager.WatchHistoryManager(plex_server_id="shared-server")
+        manager.add_or_update_synced_item(media_type="movie")
+
+        counts = []
+        for _ in range(4):
+            manager.save_state()
+            counts.append(len(json.loads(temp_state_file.read_text())["synced_items"]))
+
+        assert counts == [1, 1, 1, 1]
+
+    def test_a_pruned_unkeyed_row_stays_pruned(self, temp_state_file):
+        manager = history_manager.WatchHistoryManager(plex_server_id="shared-server")
+        manager.add_or_update_synced_item(media_type="movie")
+        manager.state["synced_items"][0]["updated_at"] = "2000-01-01T00:00:00+00:00"
+        manager.save_state()
+
+        assert manager.prune_synced_items(max_age_days=180) == 1
+        manager.save_state()
+
+        reloaded = history_manager.WatchHistoryManager(plex_server_id="shared-server")
+        assert reloaded.state["synced_items"] == []
+
+    def test_two_different_unkeyed_rows_stay_two(self, temp_state_file):
+        manager = history_manager.WatchHistoryManager(plex_server_id="shared-server")
+        manager.add_or_update_synced_item(media_type="movie")
+        manager.add_or_update_synced_item(media_type="episode")
+        manager.save_state()
+
+        reloaded = history_manager.WatchHistoryManager(plex_server_id="shared-server")
+        assert sorted(item["media_type"] for item in reloaded.state["synced_items"]) == [
+            "episode",
+            "movie",
+        ]

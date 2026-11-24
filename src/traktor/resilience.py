@@ -19,7 +19,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from .log import logger
 from .settings import CACHE_DIR, CONFIG_FILE, ENV_FILE, TRAKTOR_BACKUP_DIR, TRAKTOR_MAX_BACKUPS
 from .utils import (
+    DecompressionLimitError,
     file_lock,
+    iter_gzip_bounded,
+    read_gzip_text,
     read_json_object,
     restrict_to_owner,
     write_json_atomic,
@@ -633,7 +636,11 @@ class BackupManager:
                     shutil.rmtree(dest)
 
             # Restore
-            self._restore_item(source, dest, compressed=bool(info.get("compressed", self.compress)))
+            if not self._restore_item(
+                source, dest, compressed=bool(info.get("compressed", self.compress))
+            ):
+                logger.error(f"Restore of '{name}' failed; {dest} may be incomplete")
+                return False
 
             if name == "env":
                 # Restrictive permissions on restored credential material
@@ -664,8 +671,10 @@ class BackupManager:
                 # Single file
                 file_path = backup_item if backup_item.exists() else backup_item.with_suffix(".gz")
                 if compressed:
-                    with gzip.open(file_path, "rb") as f:
-                        sha256.update(f.read())
+                    # Bounded: a small archive must not expand past the limit
+                    # while it is being hashed (issue #81).
+                    for chunk in iter_gzip_bounded(file_path):
+                        sha256.update(chunk)
                 else:
                     with open(file_path, "rb") as f:
                         sha256.update(f.read())
@@ -678,18 +687,18 @@ class BackupManager:
                     # name: an uncompressed backup of the library cache carries
                     # a plain "*.json.gz" file (issue #42).
                     if compressed and file_path.suffix == ".gz":
-                        with gzip.open(file_path, "rb") as f:
-                            sha256.update(f.read())
+                        for chunk in iter_gzip_bounded(file_path):
+                            sha256.update(chunk)
                     else:
                         with open(file_path, "rb") as f:
                             sha256.update(f.read())
-        except (OSError, EOFError) as e:
+        except (OSError, EOFError, DecompressionLimitError) as e:
             logger.error(f"Failed to verify backup item {backup_item}: {e}")
             return False
 
         return sha256.hexdigest() == expected_checksum
 
-    def _restore_item(self, source: Path, dest: Path, compressed: bool = True) -> None:
+    def _restore_item(self, source: Path, dest: Path, compressed: bool = True) -> bool:
         """Restore a single item from backup.
 
         Args:
@@ -698,34 +707,54 @@ class BackupManager:
             compressed: Whether the backup appended ``.gz`` to every file, as the
                 manifest records; a plain file that happens to end in ``.gz``
                 must not be decompressed (issue #42)
+
+        Returns:
+            True when the item was restored. A compressed item that expands past
+            the size bound (issue #81) stops part way and its partial output is
+            removed, so a doctored archive cannot fill the disk.
         """
-        if source.is_file() or source.with_suffix(".gz").exists():
-            file_path = source if source.exists() else source.with_suffix(".gz")
-            dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if source.is_file() or source.with_suffix(".gz").exists():
+                file_path = source if source.exists() else source.with_suffix(".gz")
+                dest.parent.mkdir(parents=True, exist_ok=True)
 
-            if compressed:
-                with gzip.open(file_path, "rb") as f_in:
-                    with open(dest, "wb") as f_out:
-                        f_out.write(f_in.read())
+                if compressed:
+                    self._write_gzip_bounded(file_path, dest)
+                else:
+                    shutil.copy2(file_path, dest)
             else:
-                shutil.copy2(file_path, dest)
-        else:
-            # Directory
-            dest.mkdir(parents=True, exist_ok=True)
-            for item in source.rglob("*"):
-                if item.is_file():
-                    rel_path = item.relative_to(source)
-                    item_dest = dest / rel_path
-                    item_dest.parent.mkdir(parents=True, exist_ok=True)
+                # Directory
+                dest.mkdir(parents=True, exist_ok=True)
+                for item in source.rglob("*"):
+                    if item.is_file():
+                        rel_path = item.relative_to(source)
+                        item_dest = dest / rel_path
+                        item_dest.parent.mkdir(parents=True, exist_ok=True)
 
-                    if compressed:
-                        with gzip.open(item, "rb") as f_in:
+                        if compressed:
                             # Remove .gz suffix
-                            final_dest = item_dest.with_suffix("")
-                            with open(final_dest, "wb") as f_out:
-                                f_out.write(f_in.read())
-                    else:
-                        shutil.copy2(item, item_dest)
+                            self._write_gzip_bounded(item, item_dest.with_suffix(""))
+                        else:
+                            shutil.copy2(item, item_dest)
+        except (OSError, EOFError, DecompressionLimitError) as e:
+            logger.error(f"Failed to restore {source}: {e}")
+            return False
+        return True
+
+    @staticmethod
+    def _write_gzip_bounded(source: Path, dest: Path) -> None:
+        """Write one compressed backup file to ``dest``, bounded while copying.
+
+        The payload is streamed rather than read whole, and a partial file is
+        removed before the limit error propagates (issue #81).
+        """
+        try:
+            with open(dest, "wb") as f_out:
+                for chunk in iter_gzip_bounded(source):
+                    f_out.write(chunk)
+        except (OSError, EOFError, DecompressionLimitError):
+            dest.unlink(missing_ok=True)
+            raise
 
     def _cleanup_old_backups(self) -> None:
         """Remove old backups exceeding max_backups limit.
@@ -917,15 +946,17 @@ class IntegrityChecker:
         """
         try:
             if cache_file.name.endswith(".gz"):
-                with gzip.open(cache_file, "rt", encoding="utf-8") as f:
-                    json.load(f)
+                # Same bound as CacheManager.load_cache: the integrity check
+                # must not expand a doctored cache either (issue #81).
+                json.loads(read_gzip_text(cache_file))
             else:
                 with open(cache_file, encoding="utf-8") as f:
                     json.load(f)
         except json.JSONDecodeError:
             return False
-        except (OSError, EOFError):
-            # Covers truncated/invalid gzip streams (BadGzipFile, EOFError) and read errors
+        except (OSError, EOFError, DecompressionLimitError):
+            # Covers truncated/invalid gzip streams (BadGzipFile, EOFError), read
+            # errors and a payload past the decompression bound
             return False
         else:
             return True
