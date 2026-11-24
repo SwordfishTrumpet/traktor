@@ -2968,3 +2968,49 @@ def test_orphan_cleanup_keeps_a_config_saved_during_the_run(tmp_path, monkeypatc
     saved = json.loads(config_file.read_text(encoding="utf-8"))
     assert saved["plex_url"] == "http://plex.example:32400"
     assert saved["managed_playlists"] == ["My Trakt List"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #113: the structure check accepted either container for every key
+# ---------------------------------------------------------------------------
+
+
+class TestCacheContainerTypes:
+    @pytest.mark.parametrize(
+        "key, wrong_value",
+        [
+            ("movies_by_imdb", []),
+            ("movies_by_tmdb", []),
+            ("shows_by_imdb", []),
+            ("shows_by_tmdb", []),
+            ("by_rating_key", []),
+            ("movies_list", {}),
+            ("shows_list", {}),
+        ],
+    )
+    def test_a_wrong_container_type_is_not_a_valid_cache(self, server, key, wrong_value):
+        cache = clients.CacheManager(server)
+        _empty_cache(cache)
+        cache.memory_cache[key] = wrong_value
+
+        assert cache._validate_cache_structure() is False
+
+    def test_load_cache_rebuilds_instead_of_loading_a_wrong_container(
+        self, server, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(clients, "CACHE_DIR", tmp_path)
+        wrong = {
+            "movies_by_imdb": [],
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+            "shows_by_tmdb": {},
+            "movies_list": [],
+            "shows_list": [],
+            "by_rating_key": {},
+        }
+        (tmp_path / "plex_library_cache.json").write_text(json.dumps(wrong), encoding="utf-8")
+
+        cache = clients.CacheManager(server)
+
+        assert cache.load_cache() is False
+        assert isinstance(cache.memory_cache.get("movies_by_imdb", {}), dict)

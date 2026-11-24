@@ -576,22 +576,34 @@ class CacheManager:
             logger.warning("Cache is not a dict, rebuilding...")
             return False
 
-        required_keys = [
+        # Each key has exactly one shape: the five indexes are mappings and the
+        # two snapshot lists are lists. Accepting either container let a cache
+        # with a list in an index slot pass the check and then raise
+        # AttributeError in the first lookup, which stopped every run until the
+        # cache was deleted (issue #113).
+        required_mappings = [
             "movies_by_imdb",
             "movies_by_tmdb",
             "shows_by_imdb",
             "shows_by_tmdb",
-            "movies_list",
-            "shows_list",
             "by_rating_key",
         ]
+        required_lists = ["movies_list", "shows_list"]
 
-        for key in required_keys:
+        for key in required_mappings:
             if key not in self.memory_cache:
                 logger.warning(f"Cache missing required key '{key}', rebuilding...")
                 return False
-            if not isinstance(self.memory_cache[key], (dict, list)):
-                logger.warning(f"Cache key '{key}' has wrong type, rebuilding...")
+            if not isinstance(self.memory_cache[key], dict):
+                logger.warning(f"Cache key '{key}' must be a mapping, rebuilding...")
+                return False
+
+        for key in required_lists:
+            if key not in self.memory_cache:
+                logger.warning(f"Cache missing required key '{key}', rebuilding...")
+                return False
+            if not isinstance(self.memory_cache[key], list):
+                logger.warning(f"Cache key '{key}' must be a list, rebuilding...")
                 return False
 
         self._sanitize_cached_items()
