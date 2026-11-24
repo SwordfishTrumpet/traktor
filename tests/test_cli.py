@@ -579,3 +579,15 @@ def test_serve_health_registers_checks_before_the_server_answers(monkeypatch, tm
 
     assert seen["started"] is True
     assert seen["components_at_start"] == {"cache", "config"}
+
+
+def test_version_flag_prints_the_package_version(capsys, monkeypatch):
+    """The release runbook verifies a rollback with `traktor --version` (issue #90)."""
+    from traktor import __version__
+
+    monkeypatch.setattr(sys, "argv", ["traktor", "--version"])
+    with pytest.raises(SystemExit) as exit_info:
+        cli.parse_args()
+
+    assert exit_info.value.code == 0
+    assert __version__ in capsys.readouterr().out

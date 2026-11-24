@@ -79,7 +79,10 @@ class DiagnoseCommand:
         python_version = sys.version_info
         version_str = f"{python_version.major}.{python_version.minor}.{python_version.micro}"
 
-        if python_version.major == 3 and python_version.minor >= 8:
+        # The floor is the project's own: pyproject.toml declares
+        # requires-python = ">=3.10" and README.md says 3.10 or newer, so a 3.9
+        # interpreter must be reported as unsupported (issue #85).
+        if python_version.major == 3 and python_version.minor >= 10:
             self._add_result(
                 "Python Version",
                 "pass",
@@ -89,8 +92,8 @@ class DiagnoseCommand:
             self._add_result(
                 "Python Version",
                 "fail",
-                f"Python {version_str} (requires 3.8+)",
-                suggestions=["Upgrade to Python 3.8 or higher"],
+                f"Python {version_str} (requires 3.10+)",
+                suggestions=["Upgrade to Python 3.10 or higher"],
             )
 
         # Check required dependencies

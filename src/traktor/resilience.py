@@ -7,6 +7,7 @@ and integrity checks for production deployments.
 import gzip
 import hashlib
 import json
+import os
 import shutil
 import threading
 import time
@@ -16,13 +17,39 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .log import logger
-from .settings import CACHE_DIR, CONFIG_FILE, ENV_FILE
-from .utils import file_lock, read_json_object, write_json_atomic, write_text_atomic
+from .settings import CACHE_DIR, CONFIG_FILE, ENV_FILE, TRAKTOR_BACKUP_DIR, TRAKTOR_MAX_BACKUPS
+from .utils import (
+    file_lock,
+    read_json_object,
+    restrict_to_owner,
+    write_json_atomic,
+    write_text_atomic,
+)
 
 # A backup directory name carries microseconds, so two backups in the same
 # second land in two directories. The retry covers the pathological case where
 # even that collides (issue #67).
 BACKUP_PATH_ATTEMPTS = 5
+
+# Backup directories this build creates. Retention deletes only these: it used
+# to delete every directory under the backup location, including folders the
+# user kept there (issue #84).
+BACKUP_DIR_PREFIX = "traktor_backup_"
+
+
+def _is_backup_dir(path: Path) -> bool:
+    """Return True when ``path`` is a backup directory this build created.
+
+    Args:
+        path: Candidate directory under the backup location
+
+    Returns:
+        True only for a directory whose name this build produces
+    """
+    try:
+        return path.is_dir() and path.name.startswith(BACKUP_DIR_PREFIX)
+    except OSError:
+        return False
 
 
 class CircuitState(Enum):
@@ -316,18 +343,22 @@ class BackupManager:
     def __init__(
         self,
         backup_dir: Optional[Path] = None,
-        max_backups: int = 10,
+        max_backups: Optional[int] = None,
         compress: bool = True,
     ):
         """Initialize backup manager.
 
         Args:
-            backup_dir: Directory for backups (default: ~/.traktor_backups)
-            max_backups: Maximum number of backups to retain
+            backup_dir: Directory for backups (default: TRAKTOR_BACKUP_DIR, else
+                ~/.traktor_backups)
+            max_backups: Maximum number of backups to retain (default:
+                TRAKTOR_MAX_BACKUPS, else 10)
             compress: Whether to gzip compress backups
         """
         if backup_dir is None:
-            backup_dir = Path.home() / ".traktor_backups"
+            backup_dir = TRAKTOR_BACKUP_DIR or Path.home() / ".traktor_backups"
+        if max_backups is None:
+            max_backups = TRAKTOR_MAX_BACKUPS
         self.backup_dir = Path(backup_dir)
         self.backup_dir.mkdir(parents=True, exist_ok=True)
         self.max_backups = max_backups
@@ -379,10 +410,10 @@ class BackupManager:
                 "checksum": checksum,
                 "compressed": self.compress,
             }
-            if name == "env":
-                # Restrictive permissions on the archived credential material
-                archived = dest_path.with_suffix(".gz") if self.compress else dest_path
-                archived.chmod(0o600)
+            # Every archive is owner-only: config holds the Plex token and the
+            # cache holds what the user watched, so the copy must not be more
+            # readable than the file it came from (issue #98).
+            self._restrict_archive_permissions(dest_path)
 
         # Write manifest
         manifest_path = backup_path / "manifest.json"
@@ -411,16 +442,48 @@ class BackupManager:
         for attempt in range(BACKUP_PATH_ATTEMPTS):
             timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
             suffix = f"_{attempt}" if attempt else ""
-            candidate = self.backup_dir / f"traktor_backup_{timestamp}_{reason}{suffix}"
+            candidate = self.backup_dir / f"{BACKUP_DIR_PREFIX}{timestamp}_{reason}{suffix}"
             try:
                 candidate.mkdir(parents=True, exist_ok=False)
             except FileExistsError:
                 continue
+            # The snapshot holds credentials and viewing history, so the
+            # directory is owner-only rather than umask-dependent (issue #98).
+            try:
+                os.chmod(candidate, 0o700)
+            except OSError as e:
+                logger.warning(f"Could not restrict permissions on {candidate}: {e}")
             return candidate
         raise FileExistsError(
             f"Could not create a unique backup directory under {self.backup_dir} "
             f"after {BACKUP_PATH_ATTEMPTS} attempts"
         )
+
+    def _restrict_archive_permissions(self, archived: Path) -> None:
+        """Make a backup archive readable only by its owner (issue #98).
+
+        The archive is created by ``gzip.open``/``copy2`` under the process
+        umask, so a 022 umask left the copy of the config and of the cache at
+        0644 while the live files are 0600.
+
+        Args:
+            archived: Path of the archive just created (file or directory)
+        """
+        try:
+            if archived.is_dir():
+                os.chmod(archived, 0o700)
+                for path in archived.rglob("*"):
+                    if path.is_dir():
+                        os.chmod(path, 0o700)
+                    else:
+                        restrict_to_owner(path)
+                return
+        except OSError as e:
+            logger.warning(f"Could not restrict permissions on {archived}: {e}")
+            return
+        target = archived.with_suffix(".gz") if self.compress else archived
+        if target.exists() and not restrict_to_owner(target):
+            logger.warning(f"Could not restrict permissions on {target}")
 
     @staticmethod
     def _files_in_order(root: Path, strip_compression_suffix: bool = False) -> List[Path]:
@@ -665,9 +728,14 @@ class BackupManager:
                         shutil.copy2(item, item_dest)
 
     def _cleanup_old_backups(self) -> None:
-        """Remove old backups exceeding max_backups limit."""
+        """Remove old backups exceeding max_backups limit.
+
+        Only directories this build created are candidates. The cleanup used to
+        consider every directory under the backup location, so a folder the user
+        kept there was deleted once the count passed the limit (issue #84).
+        """
         backups = sorted(
-            [d for d in self.backup_dir.iterdir() if d.is_dir()],
+            [d for d in self.backup_dir.iterdir() if _is_backup_dir(d)],
             key=lambda p: p.stat().st_mtime,
             reverse=True,
         )
@@ -686,18 +754,31 @@ class BackupManager:
                 continue
 
             manifest_path = backup_dir / "manifest.json"
-            if manifest_path.exists():
+            if not manifest_path.exists():
+                continue
+            try:
                 with open(manifest_path) as f:
                     manifest = json.load(f)
-                backups.append(
-                    {
-                        "name": backup_dir.name,
-                        "path": str(backup_dir),
-                        "created": manifest.get("created"),
-                        "reason": manifest.get("reason"),
-                        "version": manifest.get("version"),
-                    }
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+                # An older release wrote the manifest with a plain json.dump, so
+                # an interrupted backup can hold a half-written one. Skipping it
+                # keeps the readable backups listable (issue #83).
+                logger.warning(
+                    f"Skipping backup with an unreadable manifest {backup_dir.name}: {e}"
                 )
+                continue
+            if not isinstance(manifest, dict):
+                logger.warning(f"Skipping backup with a malformed manifest: {backup_dir.name}")
+                continue
+            backups.append(
+                {
+                    "name": backup_dir.name,
+                    "path": str(backup_dir),
+                    "created": manifest.get("created"),
+                    "reason": manifest.get("reason"),
+                    "version": manifest.get("version"),
+                }
+            )
 
         return backups
 

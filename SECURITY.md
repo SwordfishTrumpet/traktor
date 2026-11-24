@@ -44,7 +44,9 @@ Instead, please send an email to the repository maintainers with the following i
 
 This tool handles sensitive authentication data:
 
-- Trakt OAuth tokens are stored in `~/.traktor_trakt_token.json` with 0600 permissions
+- Trakt OAuth tokens are stored in the `.env` file (Docker: `/app/.env`,
+  otherwise `.env` in the working directory) with 0600 permissions. The legacy
+  `~/.traktor_trakt_token.json` file is no longer written
 - Plex tokens are read from environment variables or `.env` files
 - Tokens are logged at debug level only (truncated)
 - No analytics or telemetry is collected

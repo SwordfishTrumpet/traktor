@@ -48,3 +48,17 @@
 70	uv run pytest -q tests/test_resilience.py -k IntegrityCheckerGzipCache	0	maintainability
 71	uv run pytest -q tests/test_packaging.py -k make_lint	0	build
 72	uv run pytest -q tests/test_packaging.py -k "rollback or pypi"	0	documentation
+80	uv run pytest -q tests/test_clients.py -k "episode_row or episode_snapshot"	0	security
+83	uv run pytest -q tests/test_resilience.py -k truncated_manifest	0	domain
+84	uv run pytest -q tests/test_resilience.py -k foreign_directory	0	domain
+85	uv run pytest -q tests/test_diagnose.py -k "python_version or 39_as_unsupported"	0	domain
+86	uv run pytest -q tests/test_packaging.py -k container_entrypoint	0	deployment
+88	uv run pytest -q tests/test_packaging.py -k redirect_uri	0	deployment
+89	uv run pytest -q tests/test_resilience.py -k documented_backup_settings	0	deployment
+90	uv run pytest -q tests/test_cli.py::test_version_flag_prints_the_package_version tests/test_packaging.py::test_release_workflow_can_be_dispatched_by_hand	0	deployment
+92	uv run pytest -q tests/test_clients.py -k read_from_every_page	0	performance
+97	uv run pytest -q tests/test_official_lists.py -k traversal_period	0	security
+98	uv run pytest -q tests/test_resilience.py -k every_backup_archive_is_owner_only	0	privacy
+102	uv run pytest -q tests/test_clients.py -k "another_plex_account or fingerprint"	0	security
+103	uv run pytest -q tests/test_settings.py -k configured_env_file	0	security
+104	uv run pytest -q tests/test_clients.py -k "incremental_update or show_counters"	0	testing

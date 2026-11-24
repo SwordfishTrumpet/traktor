@@ -94,9 +94,18 @@ def setup_logging(verbose=False, structured=False):
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # Imported here, not at module scope: traktor.utils imports this logger, so a
+    # module-level import would be circular.
+    from .utils import restrict_to_owner
+
     file_handler = RotatingFileHandler(
         LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8"
     )
+    # The file records what the user watched, so keep it owner-only: the
+    # handler used to create it at the process umask, which left it 0644 and
+    # readable by every local account (issue #99).
+    if not restrict_to_owner(LOG_FILE):
+        logger.warning(f"Could not restrict permissions on {LOG_FILE}")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(file_formatter)
     logger.addHandler(file_handler)

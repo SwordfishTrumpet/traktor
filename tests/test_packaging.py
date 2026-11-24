@@ -152,3 +152,59 @@ def test_runbook_rollback_does_not_promise_a_pypi_yank():
 
     assert "uv publish --yank" not in section
     assert "nothing is published to PyPI" in section
+
+
+# ---------------------------------------------------------------------------
+# Issue #86: the container entrypoint installed the dev group at start
+# ---------------------------------------------------------------------------
+
+
+def test_container_entrypoint_skips_the_dev_group():
+    """`uv run` without --no-dev re-syncs the tools the build left out (issue #86)."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    entrypoint = next(
+        line for line in dockerfile.splitlines() if line.strip().upper().startswith("ENTRYPOINT")
+    )
+
+    assert "--no-dev" in entrypoint
+
+
+# ---------------------------------------------------------------------------
+# Issue #88: .env.example blanked the documented redirect URI default
+# ---------------------------------------------------------------------------
+
+
+def test_env_example_keeps_the_documented_redirect_uri():
+    """A blank value overrides the default, so the login sent no redirect_uri."""
+    from dotenv import dotenv_values
+
+    values = dotenv_values(ROOT / ".env.example")
+
+    assert values.get("TRAKT_REDIRECT_URI") == "urn:ietf:wg:oauth:2.0:oob"
+
+
+# ---------------------------------------------------------------------------
+# Issue #90: the rollback steps of the release runbook could not run
+# ---------------------------------------------------------------------------
+
+
+def test_release_workflow_can_be_dispatched_by_hand():
+    """RUNBOOK recovers a broken release with `gh workflow run` (issue #90)."""
+    workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    triggers = workflow.split("on:", 1)[1].split("\npermissions:", 1)[0]
+
+    assert "workflow_dispatch" in triggers
+
+
+# ---------------------------------------------------------------------------
+# Issue #101: SECURITY.md named a token file the product no longer writes
+# ---------------------------------------------------------------------------
+
+
+def test_security_policy_names_the_token_store_the_code_writes():
+    """The policy must describe the .env store, not the retired JSON file."""
+    policy = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+    settings = (ROOT / "src" / "traktor" / "settings.py").read_text(encoding="utf-8")
+
+    assert "ENV_FILE" in settings
+    assert "Trakt OAuth tokens are stored in the `.env` file" in policy

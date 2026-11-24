@@ -23,6 +23,7 @@ from .settings import (
     CACHE_DIR,
     CACHE_MAX_AGE_HOURS,
     CACHE_VERSION,
+    ENV_FILE,
     TRAKT_ACCESS_TOKEN,
     TRAKT_API_URL,
     TRAKT_CLIENT_ID,
@@ -203,11 +204,42 @@ class RateLimiter:
             self._last_request_time = time.time()
 
 
+def plex_account_fingerprint(plex_url: Optional[str], plex_token: Optional[str]) -> Optional[str]:
+    """Identify the Plex account a credentials pair belongs to (issue #102).
+
+    The cached library holds per-user ``isWatched`` and ``lastViewedAt`` values,
+    so a cache is only valid for the account that built it. The fingerprint is a
+    truncated SHA-256 over the URL and token: enough to tell two accounts apart,
+    and not the credential itself.
+
+    Args:
+        plex_url: Plex server URL the client connected to
+        plex_token: Plex token used for that connection
+
+    Returns:
+        A short stable identifier, or None when either value is missing
+    """
+    if not plex_url or not plex_token:
+        return None
+    material = f"{plex_url}\n{plex_token}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()[:16]
+
+
 class CacheManager:
     """Manages caching of Plex library data for fast lookups."""
 
-    def __init__(self, plex_server: Any) -> None:
+    def __init__(self, plex_server: Any, account_fingerprint: Optional[str] = None) -> None:
+        """Initialize the cache manager.
+
+        Args:
+            plex_server: Connected PlexAPI server
+            account_fingerprint: Identifier of the Plex account this cache
+                belongs to, from :func:`plex_account_fingerprint`. The cached
+                isWatched/lastViewedAt values are per user, so a cache built for
+                one account must not be served to another (issue #102)
+        """
         self.plex_server = plex_server
+        self.account_fingerprint = account_fingerprint
         self.cache_file = CACHE_DIR / "plex_library_cache.json.gz"
         self.cache_meta_file = CACHE_DIR / "cache_metadata.json"
         self.memory_cache: Dict[str, Any] = {}
@@ -381,6 +413,15 @@ class CacheManager:
                 logger.debug("Cache expired")
                 return False
 
+            # The watched flags in this cache belong to the Plex account that
+            # built it. A cache with no fingerprint, or one from another
+            # account, is rebuilt instead of reused (issue #102).
+            if self.account_fingerprint is not None:
+                cached_account = meta.get("account_fingerprint")
+                if cached_account != self.account_fingerprint:
+                    logger.info("Library cache belongs to a different Plex account, rebuilding")
+                    return False
+
             current_hash = self._get_library_hash()
             if current_hash != meta.get("library_hash"):
                 logger.debug("Library changed, cache invalid")
@@ -471,12 +512,52 @@ class CacheManager:
                 dropped += len(items) - len(kept)
                 self.memory_cache[list_name] = kept
 
+        dropped += self._sanitize_show_episodes()
+
         if dropped:
             logger.warning(
                 f"Dropped {dropped} cached entr{'y' if dropped == 1 else 'ies'} whose rating key "
                 f"is not an integer; a rating key is used to build a Plex request URL"
             )
         return dropped
+
+    def _sanitize_show_episodes(self) -> int:
+        """Drop episode snapshots that would send Plex a non-integer rating key.
+
+        The snapshot rows are replayed straight into PlexAPI lookups, so a row
+        whose third field is a URL redirects the next request - and the Plex
+        token with it (issues #41, #80). A snapshot with a single bad row is
+        dropped whole: a partial snapshot would silently lose watch state on
+        every later run (issue #21).
+
+        Returns:
+            Number of snapshots dropped
+        """
+        snapshots = self.memory_cache.get("show_episodes")
+        if snapshots is None:
+            return 0
+        if not isinstance(snapshots, dict):
+            logger.warning("Cached episode snapshots are not a mapping; dropping them")
+            self.memory_cache["show_episodes"] = {}
+            return 1
+
+        dropped = 0
+        for key in list(snapshots.keys()):
+            snapshot = snapshots[key]
+            rows = snapshot.get("episodes") if isinstance(snapshot, dict) else None
+            if not isinstance(rows, list) or not self._episode_rows_are_safe(rows):
+                del snapshots[key]
+                dropped += 1
+        return dropped
+
+    def _episode_rows_are_safe(self, rows: List[Any]) -> bool:
+        """Return True when every snapshot row carries a plain rating key."""
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) != 5:
+                return False
+            if self.valid_rating_key(row[2]) is None:
+                return False
+        return True
 
     def _validate_cache_structure(self) -> bool:
         """Validate that loaded cache has required structure.
@@ -730,6 +811,7 @@ class CacheManager:
                 "created": datetime.now(timezone.utc).isoformat(),
                 "library_hash": self._get_library_hash(),
                 "last_update": datetime.now(timezone.utc).isoformat(),
+                "account_fingerprint": self.account_fingerprint,
                 "compression": {
                     "uncompressed_bytes": uncompressed_size,
                     "compressed_bytes": compressed_size,
@@ -964,11 +1046,13 @@ class TraktAuth:
     def env_file_path() -> Path:
         """Return the ``.env`` file that holds the Trakt tokens.
 
-        The Docker mount wins over the working directory, matching the
-        resolution :data:`traktor.settings.ENV_FILE` documents.
+        This is :data:`traktor.settings.ENV_FILE`, the file this process loaded
+        its tokens from. Recomputing "the Docker mount, else the working
+        directory" here meant a run started in a subdirectory loaded the
+        checkout's root ``.env`` but cleared nothing: the revoked credential
+        survived and every later run reused it (issue #103).
         """
-        app_env = Path("/app/.env")
-        return app_env if app_env.exists() else Path(".env")
+        return ENV_FILE
 
     @staticmethod
     def _rewrite_token_lines(lines: List[str], values: Dict[str, Optional[str]]) -> List[str]:
@@ -1465,8 +1549,10 @@ class TraktClient:
         logger.info("Fetching liked lists from Trakt...")
 
         try:
-            response = self._request("users/likes/lists")
-            data = response.json()
+            # Paginated like every other list read: Trakt answers ten items per
+            # page by default, so an unpaginated read dropped every liked list
+            # past the first ten (issue #92).
+            data = self._paginated_get("users/likes/lists")
 
             logger.info(f"Successfully fetched {len(data)} liked list(s)")
             for i, liked in enumerate(data, 1):
@@ -1581,8 +1667,7 @@ class TraktClient:
         logger.info(f"Fetching {media_type} collection from Trakt...")
 
         try:
-            response = self._request(f"sync/collection/{media_type}")
-            data = response.json()
+            data = self._paginated_get(f"sync/collection/{media_type}")
 
             # Transform collection format to match list items format
             items = []
@@ -1625,8 +1710,7 @@ class TraktClient:
 
         try:
             params = {"type": media_type} if media_type else None
-            response = self._request("sync/watchlist", params=params)
-            data = response.json()
+            data = self._paginated_get("sync/watchlist", params_base=params)
 
             # Transform watchlist format to match list items format
             items = []
@@ -1718,10 +1802,12 @@ class TraktClient:
 
             all_items.extend(data)
 
-            # Trakt reports the page count in a header. When it is missing or
-            # unreadable the count is unknown, so only a short page or the
-            # safety limit can end the walk: falling back to the current page
-            # number ended every list after its first full page (issue #46).
+            # Trakt reports the page count in a header. When it is present, it
+            # is the answer: several endpoints cap a page below the limit they
+            # were asked for, so a short page is not evidence of the last page
+            # and stopping there lost everything past the first ten (issues #46,
+            # #92). Only when the header is missing or unreadable does a short
+            # page or the safety limit end the walk.
             page_count: Optional[int] = None
             raw_page_count = response.headers.get("X-Pagination-Page-Count")
             if raw_page_count is not None:
@@ -1733,7 +1819,10 @@ class TraktClient:
                         f"continuing until a short page"
                     )
 
-            if (page_count is not None and page >= page_count) or len(data) < page_size:
+            if page_count is not None:
+                if page >= page_count:
+                    break
+            elif len(data) < page_size:
                 break
 
             page += 1
@@ -2006,8 +2095,7 @@ class TraktClient:
 
         try:
             endpoint = f"sync/playback/{media_type}" if media_type else "sync/playback"
-            response = self._request(endpoint)
-            data = response.json()
+            data = self._paginated_get(endpoint)
 
             progress = {}
             for item in data:

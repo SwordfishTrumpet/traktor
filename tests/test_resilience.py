@@ -990,3 +990,112 @@ def test_two_backups_in_the_same_second_keep_both_snapshots(tmp_path, monkeypatc
         assert json.load(f) == {"version": 1}
     with gzip.open(second / "config.gz", "rt", encoding="utf-8") as f:
         assert json.load(f) == {"version": 2}
+
+
+# ---------------------------------------------------------------------------
+# Issue #84: retention deleted any directory under the backup location
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_leaves_a_foreign_directory_in_the_backup_location(tmp_path, monkeypatch):
+    """Only directories this build created are candidates for deletion."""
+    import traktor.resilience as res
+
+    monkeypatch.setattr(res, "CONFIG_FILE", tmp_path / "missing-config.json")
+    monkeypatch.setattr(res, "ENV_FILE", tmp_path / "missing.env")
+    monkeypatch.setattr(res, "CACHE_DIR", tmp_path / "missing-cache")
+    backup_dir = tmp_path / "backups"
+    manager = res.BackupManager(backup_dir=backup_dir, max_backups=1)
+
+    mine = backup_dir / "my-notes"
+    mine.mkdir()
+    (mine / "important.txt").write_text("keep me", encoding="utf-8")
+
+    for run in range(3):
+        manager.create_backup(reason=f"run{run}")
+
+    assert (mine / "important.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #83: one truncated manifest hid every readable backup
+# ---------------------------------------------------------------------------
+
+
+def test_list_backups_skips_a_truncated_manifest(tmp_path, monkeypatch):
+    """A half-written manifest is skipped instead of aborting the listing."""
+    import traktor.resilience as res
+
+    monkeypatch.setattr(res, "CONFIG_FILE", tmp_path / "config.json")
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(res, "ENV_FILE", tmp_path / "missing.env")
+    monkeypatch.setattr(res, "CACHE_DIR", tmp_path / "missing-cache")
+    backup_dir = tmp_path / "backups"
+    manager = res.BackupManager(backup_dir=backup_dir, max_backups=10)
+    manager.create_backup(reason="first")
+    manager.create_backup(reason="second")
+
+    broken = backup_dir / "traktor_backup_20200101_000000_000000_broken"
+    broken.mkdir()
+    (broken / "manifest.json").write_text('{"created": "2020-01-01T00:00:0', encoding="utf-8")
+
+    backups = manager.list_backups()
+
+    assert {backup["reason"] for backup in backups} == {"first", "second"}
+
+
+# ---------------------------------------------------------------------------
+# Issue #98: backup archives were readable by every local account
+# ---------------------------------------------------------------------------
+
+
+def test_every_backup_archive_is_owner_only(tmp_path, monkeypatch):
+    """The config archive holds the Plex token and must not be world-readable."""
+    import traktor.resilience as res
+
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"plex_token": "fixture"}', encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / "plex_library_cache.json").write_text('{"movies_list": []}', encoding="utf-8")
+    monkeypatch.setattr(res, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(res, "ENV_FILE", tmp_path / "missing.env")
+    monkeypatch.setattr(res, "CACHE_DIR", cache_dir)
+    manager = res.BackupManager(backup_dir=tmp_path / "backups", compress=True)
+
+    backup_path = manager.create_backup(reason="pre_sync")
+
+    for archive in (
+        backup_path / "config.gz",
+        backup_path / "cache" / "plex_library_cache.json.gz",
+    ):
+        assert archive.exists()
+        assert (archive.stat().st_mode & 0o777) == 0o600
+    assert (backup_path.stat().st_mode & 0o777) == 0o700
+
+
+# ---------------------------------------------------------------------------
+# Issue #89: the documented backup settings did nothing
+# ---------------------------------------------------------------------------
+
+
+def test_documented_backup_settings_are_used(tmp_path, monkeypatch):
+    """TRAKTOR_BACKUP_DIR and TRAKTOR_MAX_BACKUPS reach the manager."""
+    import traktor.resilience as res
+
+    wanted = tmp_path / "var-backups"
+    monkeypatch.setattr(res, "TRAKTOR_BACKUP_DIR", wanted)
+    monkeypatch.setattr(res, "TRAKTOR_MAX_BACKUPS", 1)
+    monkeypatch.setattr(res, "CONFIG_FILE", tmp_path / "config.json")
+    (tmp_path / "config.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(res, "ENV_FILE", tmp_path / "missing.env")
+    monkeypatch.setattr(res, "CACHE_DIR", tmp_path / "missing-cache")
+
+    manager = res.BackupManager()
+    for run in range(3):
+        manager.create_backup(reason=f"run{run}")
+
+    assert manager.backup_dir == wanted
+    assert manager.max_backups == 1
+    assert wanted.exists()
+    assert len(list(wanted.iterdir())) == 1

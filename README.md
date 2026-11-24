@@ -341,7 +341,7 @@ The practical result: a network outage costs you one skipped run, and the next r
 
 ## 18. Caching and rate limits
 
-The Plex library cache is a JSON file in the cache directory, versioned so an old format is rebuilt rather than misread. It expires after 24 hours, is invalidated when the library hash changes, and can be refreshed on demand with `--refresh-cache` after you add titles.
+The Plex library cache is a JSON file in the cache directory, versioned so an old format is rebuilt rather than misread. It expires after 24 hours, is invalidated when the library hash changes or when it was built for a different Plex account, and can be refreshed on demand with `--refresh-cache` after you add titles.
 
 Trakt's API allows 1000 requests per 5 minutes, so traktor keeps at least 0.3 seconds between requests and retries 429 and 5xx responses with exponential backoff. Official-list calls are limited to about one per second. Batch endpoints are used where Trakt offers them: history writes go 100 items at a time.
 
@@ -366,6 +366,7 @@ applies to the `PLEX_URL`/`PLEX_TOKEN` environment pair.
 | `--workers N`, `-w N` | Parallel workers for matching (default 8) |
 | `--verbose`, `-v` | Debug logging to the console |
 | `--refresh-cache` | Rebuild the Plex library cache |
+| `--version` | Print the version and exit |
 | `--force-auth` | Re-run the Trakt login |
 | `--list-source {official,liked,own,both,all}` | Which list sources to sync |
 | `--official-lists`, `--no-official-lists` | Enable or disable official lists |
@@ -456,6 +457,8 @@ Everything here can live in `.env`.
 | `WATCH_SYNC_CONFLICT_RESOLUTION` | `newest_wins` | `newest_wins`, `plex_wins`, `trakt_wins` |
 | `TRAKTOR_HISTORY_RETENTION_DAYS` | `180` | Prune synced-item bookkeeping older than this; `0` disables pruning |
 | `TRAKTOR_BACKUP_BEFORE_SYNC` | `false` | Write a backup before each sync |
+| `TRAKTOR_BACKUP_DIR` | `~/.traktor_backups` | Where snapshots are written |
+| `TRAKTOR_MAX_BACKUPS` | `10` | How many snapshots are kept; older ones are deleted |
 | `TRAKTOR_MAX_MEMORY_MB` | `512` | Warning threshold, not a hard limit |
 | `TRAKTOR_HEALTH_PORT` | `8080` | Port for the health server |
 | `TRAKTOR_HEALTH_HOST` | all interfaces | Bind address; set `127.0.0.1` for local only |

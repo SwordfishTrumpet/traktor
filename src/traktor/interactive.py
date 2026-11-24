@@ -10,6 +10,7 @@ from typing import Any
 
 from .log import logger
 from .settings import DATA_DIR
+from .utils import write_json_atomic
 
 # Constants
 MAX_UNDO_SNAPSHOTS = 5
@@ -196,8 +197,12 @@ def save_undo_snapshot(
     try:
         undo_dir = _get_undo_dir()
         snapshot_file = undo_dir / _generate_snapshot_filename()
-        with snapshot_file.open("w", encoding="utf-8") as f:
-            json.dump(snapshot, f, indent=2)
+        # A snapshot holds the viewing history this run would change, so it is
+        # written owner-only (0600) rather than at the process umask, which left
+        # it readable by every local account (issue #100).
+        if not write_json_atomic(snapshot_file, snapshot, mode=0o600):
+            logger.error(f"Failed to save undo snapshot: {snapshot_file}")
+            return None
         logger.info(f"Saved undo snapshot: {snapshot_file}")
     except (OSError, TypeError) as e:
         logger.error(f"Failed to save undo snapshot: {e}")

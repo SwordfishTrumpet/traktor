@@ -23,6 +23,7 @@ from .clients import (
     PlexClient,
     TraktAuth,
     TraktClient,
+    plex_account_fingerprint,
     read_first_episode,
 )
 from .config import get_plex_credentials, load_config
@@ -1472,7 +1473,9 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
         plex_server = PlexServer(plex_url, plex_token)
         logger.info("Connected to Plex server")
 
-        cache_manager = CacheManager(plex_server)
+        cache_manager = CacheManager(
+            plex_server, account_fingerprint=plex_account_fingerprint(plex_url, plex_token)
+        )
         cache_manager.load_cache(force_refresh=args.refresh_cache if args else False)
 
         plex = PlexClient(plex_server, cache_manager)

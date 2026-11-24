@@ -2,7 +2,7 @@
 
 import gzip
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -251,10 +251,11 @@ class TestTraktAuth:
 
     def test_save_tokens_logs_message(self, caplog, tmp_path, monkeypatch):
         """Test that save_tokens logs message for in-memory tokens."""
-        # Run from a temp dir so save_tokens writes a fake .env, not the real one
-        monkeypatch.chdir(tmp_path)
+        # Point the client at a fake .env: the token store is the file settings
+        # loaded, not the working directory (issue #103).
         fake_env = tmp_path / ".env"
         fake_env.write_text("TRAKT_ACCESS_TOKEN=old\nTRAKT_REFRESH_TOKEN=old\n")
+        monkeypatch.setattr(clients, "ENV_FILE", fake_env)
 
         auth = clients.TraktAuth()
         auth.access_token = "a" * 32  # current Trakt token length
@@ -275,10 +276,10 @@ class TestTraktAuth:
     def test_save_tokens_restricts_env_permissions(self, tmp_path, monkeypatch):
         """A wide-open .env is tightened to owner-only when tokens are saved
         (issue #12)."""
-        monkeypatch.chdir(tmp_path)
         fake_env = tmp_path / ".env"
         fake_env.write_text("TRAKT_ACCESS_TOKEN=old\nTRAKT_REFRESH_TOKEN=old\n")
         fake_env.chmod(0o644)
+        monkeypatch.setattr(clients, "ENV_FILE", fake_env)
 
         auth = clients.TraktAuth()
         auth.access_token = "a" * 32
@@ -1119,19 +1120,9 @@ class TestCacheManagerIncrementalUpdate:
 
     def test_incremental_update_adds_new_items(self, cache_manager, mock_plex_server, tmp_path):
         """Test that incremental update adds new items to cache."""
-        # Mock the cache meta file to have a recent timestamp
-        from datetime import datetime, timedelta
-
-        cache_manager.cache_meta_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(cache_manager.cache_meta_file, "w") as f:
-            json.dump(
-                {
-                    "version": clients.CACHE_VERSION,
-                    "created": (datetime.now() - timedelta(hours=1)).isoformat(),
-                    "last_update": (datetime.now() - timedelta(hours=1)).isoformat(),
-                },
-                f,
-            )
+        # The meta stamp must be timezone-aware, or a machine east of Greenwich reads it
+        # as hours in the future and finds nothing (issue #104).
+        self._write_recent_meta(cache_manager)
 
         # Run incremental update
         result = cache_manager._incremental_cache_update()
@@ -1173,16 +1164,22 @@ class TestCacheManagerIncrementalUpdate:
 
     @staticmethod
     def _write_recent_meta(cache_manager):
-        """Write a cache meta file with a 1-hour-old timestamp."""
-        from datetime import datetime, timedelta
+        """Write a cache meta file with a 1-hour-old timestamp.
 
+        The stamp is timezone-aware: a naive one is read as UTC by design, so on a machine
+        east of Greenwich a naive "now" looked hours into the future and the update found
+        nothing (issue #104).
+        """
+        from datetime import datetime, timedelta, timezone
+
+        one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         cache_manager.cache_meta_file.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_manager.cache_meta_file, "w") as f:
             json.dump(
                 {
                     "version": clients.CACHE_VERSION,
-                    "created": (datetime.now() - timedelta(hours=1)).isoformat(),
-                    "last_update": (datetime.now() - timedelta(hours=1)).isoformat(),
+                    "created": one_hour_ago,
+                    "last_update": one_hour_ago,
                 },
                 f,
             )
@@ -2081,9 +2078,9 @@ class TestShowCountersAndEpisodeSnapshots:
         return show
 
     def test_show_counters_normalizes_last_viewed(self):
-        """plexapi returns a naive datetime; the snapshot stores UTC ISO."""
+        """An aware datetime is stored as the same instant in UTC ISO (issue #104)."""
         counters = clients.PlexClient.show_counters(
-            self._show(1, 2, 3, datetime(2024, 6, 15, 12, 0, 0))
+            self._show(1, 2, 3, datetime(2024, 6, 15, 12, 0, 0, tzinfo=timezone.utc))
         )
 
         assert counters["viewedLeafCount"] == 2
@@ -2491,3 +2488,196 @@ class TestTokenFile:
             auth.save_tokens()
 
         assert env_file.read_text(encoding="utf-8") == before
+
+
+# ---------------------------------------------------------------------------
+# Issue #80: cached episode rows skipped the rating-key check #41 added
+# ---------------------------------------------------------------------------
+
+
+def _cache_with_episode_rows(rows):
+    """Build a cache holding one show's episode snapshot."""
+    server = MagicMock()
+    server.library.sections.return_value = []
+    cache = clients.CacheManager(server)
+    _empty_cache(cache)
+    cache.record_show_episodes(
+        700, {"viewedLeafCount": 1, "leafCount": 1, "lastViewedAt": None}, rows
+    )
+    return cache
+
+
+def test_cached_episode_row_with_a_url_rating_key_drops_the_snapshot():
+    """A doctored episode row cannot keep a URL where the rating key belongs."""
+    cache = _cache_with_episode_rows([[1, 1, "@127.0.0.1:9/steal", 1, None]])
+
+    assert cache._sanitize_cached_items() >= 1
+    assert cache.get_show_episodes(700) is None
+
+
+def test_clean_episode_snapshot_survives_sanitizing():
+    """The check drops nothing when every row is a plain rating key."""
+    rows = [[1, 1, 7001, 1, None], [1, 2, 7002, 0, None]]
+    cache = _cache_with_episode_rows(rows)
+
+    assert cache._sanitize_cached_items() == 0
+    assert cache.get_show_episodes(700)["episodes"] == rows
+
+
+def test_malformed_episode_snapshot_is_dropped():
+    """A snapshot with a wrong shape or a short row is dropped whole."""
+    server = MagicMock()
+    server.library.sections.return_value = []
+    cache = clients.CacheManager(server)
+    _empty_cache(cache)
+    cache.memory_cache["show_episodes"] = {
+        "700": {"episodes": "not a list"},
+        "701": {"episodes": [[1, 1, 7001, 1]]},
+    }
+
+    assert cache._sanitize_cached_items() == 2
+    assert cache.memory_cache["show_episodes"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Issue #92: personal list reads returned only the first page of ten
+# ---------------------------------------------------------------------------
+
+
+def _trakt_client_with_auth():
+    auth = MagicMock()
+    auth.get_headers.return_value = {"Authorization": "Bearer test-token"}
+    return clients.TraktClient(auth)
+
+
+def _serve_pages(client, pages):
+    """Make ``client`` answer an endpoint with ``pages`` and record the requests."""
+    calls = []
+
+    def fake_request(path, params=None, **kwargs):
+        page = (params or {}).get("page", 1)
+        calls.append(dict(params or {}))
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = pages[page - 1]
+        response.headers = {"X-Pagination-Page-Count": str(len(pages))}
+        return response
+
+    client._request = fake_request
+    return calls
+
+
+def _pages(item_factory, total_pages=2, per_page=10):
+    return [
+        [item_factory(page * per_page + index) for index in range(per_page)]
+        for page in range(total_pages)
+    ]
+
+
+def test_liked_lists_are_read_from_every_page():
+    client = _trakt_client_with_auth()
+    calls = _serve_pages(
+        client,
+        _pages(
+            lambda n: {
+                "list": {"name": f"List {n}", "user": {"username": "someone"}, "item_count": 1}
+            }
+        ),
+    )
+
+    assert len(client.get_liked_lists()) == 20
+    assert [call.get("page") for call in calls] == [1, 2]
+
+
+def test_collection_is_read_from_every_page():
+    client = _trakt_client_with_auth()
+    _serve_pages(
+        client,
+        _pages(lambda n: {"collected_at": "2026-01-01T00:00:00Z", "movie": {"title": f"M{n}"}}),
+    )
+
+    assert len(client.get_collection("movies")) == 20
+
+
+def test_watchlist_is_read_from_every_page():
+    client = _trakt_client_with_auth()
+    _serve_pages(
+        client,
+        _pages(
+            lambda n: {
+                "type": "movie",
+                "listed_at": "2026-01-01T00:00:00Z",
+                "movie": {"title": f"M{n}"},
+            }
+        ),
+    )
+
+    assert len(client.get_watchlist()) == 20
+
+
+def test_playback_progress_is_read_from_every_page():
+    client = _trakt_client_with_auth()
+    _serve_pages(
+        client,
+        _pages(
+            lambda n: {
+                "type": "movie",
+                "progress": 50,
+                "id": n,
+                "movie": {"title": f"M{n}", "ids": {"imdb": f"tt{n:07d}"}},
+            }
+        ),
+    )
+
+    assert len(client.get_playback_progress()) == 20
+
+
+# ---------------------------------------------------------------------------
+# Issue #102: the library cache was reused across Plex accounts
+# ---------------------------------------------------------------------------
+
+
+def test_a_cache_built_for_another_plex_account_is_not_reused(tmp_path, monkeypatch):
+    """The cached watched flags are per user, so a token switch rebuilds."""
+    monkeypatch.setattr(clients, "CACHE_DIR", tmp_path)
+    server = MagicMock()
+    server.library.sections.return_value = []
+    owner = clients.CacheManager(
+        server, account_fingerprint=clients.plex_account_fingerprint("http://plex", "owner-token")
+    )
+    _empty_cache(owner)
+    assert owner._save_cache() is True
+
+    other = clients.CacheManager(
+        server,
+        account_fingerprint=clients.plex_account_fingerprint("http://plex", "managed-user-token"),
+    )
+    assert other._is_cache_valid() is False
+
+    same = clients.CacheManager(
+        server,
+        account_fingerprint=clients.plex_account_fingerprint("http://plex", "owner-token"),
+    )
+    assert same._is_cache_valid() is True
+
+
+def test_a_cache_without_a_fingerprint_is_not_served_to_a_known_account(tmp_path, monkeypatch):
+    """A cache written before this change belongs to no account we can name."""
+    monkeypatch.setattr(clients, "CACHE_DIR", tmp_path)
+    server = MagicMock()
+    server.library.sections.return_value = []
+    legacy = clients.CacheManager(server)
+    _empty_cache(legacy)
+    assert legacy._save_cache() is True
+
+    known = clients.CacheManager(server, account_fingerprint="a1b2c3d4e5f60718")
+    assert known._is_cache_valid() is False
+
+
+def test_the_account_fingerprint_is_not_the_credential():
+    fingerprint = clients.plex_account_fingerprint("http://plex", "secret-token-value")
+
+    assert fingerprint is not None
+    assert len(fingerprint) == 16
+    assert "secret-token-value" not in fingerprint
+    assert clients.plex_account_fingerprint(None, "token") is None
