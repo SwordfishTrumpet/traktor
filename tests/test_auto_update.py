@@ -380,3 +380,27 @@ def test_manual_update_path_prints_the_same_instruction(capsys):
     out = capsys.readouterr().out
     assert release_wheel_url("9.9.9") in out
     assert "pip install -U traktor" not in out
+
+
+# ---------------------------------------------------------------------------
+# Issue #114: a wheel install reported its version as "unknown"
+# ---------------------------------------------------------------------------
+
+
+def test_a_wheel_install_reports_its_installed_version(tmp_path, monkeypatch):
+    import importlib.metadata as metadata
+
+    import traktor
+    from traktor import auto_update
+
+    monkeypatch.setattr(auto_update, "__file__", str(tmp_path / "traktor" / "auto_update.py"))
+
+    def no_installed_metadata(name):
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(metadata, "version", no_installed_metadata)
+
+    updater = AutoUpdater()
+
+    assert updater.current_version != "unknown"
+    assert updater.current_version == traktor.__version__

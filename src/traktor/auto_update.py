@@ -62,7 +62,29 @@ class AutoUpdater:
         self.release_info: dict[str, Any] = {}
 
     def _get_current_version(self) -> str:
-        """Get current version from pyproject.toml or package."""
+        """Return the installed version, or unknown when none is readable.
+
+        A wheel install ships no pyproject.toml beside the package, so reading
+        only that file reported unknown and every update check announced a
+        release the user already had (issue #114). Installed metadata is the
+        answer; the source tree pyproject is the last resort.
+        """
+        try:
+            from importlib.metadata import PackageNotFoundError
+            from importlib.metadata import version as package_version
+
+            try:
+                return package_version("traktor")
+            except PackageNotFoundError:
+                pass
+        except ImportError:
+            pass
+
+        from . import __version__ as package_dunder_version
+
+        if package_dunder_version and package_dunder_version != "unknown":
+            return package_dunder_version
+
         pyproject = Path(__file__).parent.parent.parent / "pyproject.toml"
         if pyproject.exists() and tomllib is not None:
             try:

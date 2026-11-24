@@ -81,3 +81,4 @@
 112	uv run pytest -q tests/test_config.py -k invalid_utf8	0	portability
 112	uv run pytest -q tests/test_cli.py -k non_utf8_config	0	portability
 113	uv run pytest -q tests/test_clients.py -k TestCacheContainerTypes	0	security
+114	uv run pytest -q tests/test_auto_update.py -k wheel_install_reports	0	correctness
