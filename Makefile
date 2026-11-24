@@ -27,6 +27,12 @@ dev:
 test:
 	uv run pytest
 
+# The inner-loop target: the same suite, stopping at the first failure, so a preflight
+# over a batch answers in one pass instead of after every file. The pipeline's
+# `gates.sh fast` looks for this name.
+test-fast:
+	uv run pytest -q -x
+
 # `make lint` is the check CI runs, so a green local gate predicts a green CI:
 # the CI job fails a formatting difference, and `make lint` used to run ruff
 # only, so a batch could pass every local check and land red on main (issue #71).
