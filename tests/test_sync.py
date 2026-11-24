@@ -2244,3 +2244,48 @@ class TestMissingReportTiming:
 
         assert self.reports, "the missing report was never written"
         assert any(item.get("title") == "Heat" for item in self.reports[-1])
+
+
+# ---------------------------------------------------------------------------
+# Issue #124: /status recorded only the exit code after a failed watch sync
+# ---------------------------------------------------------------------------
+
+
+def test_the_run_record_names_the_show_a_failed_watch_sync_lost(monkeypatch, tmp_path):
+    from traktor import run_status
+
+    progress_file = tmp_path / "sync_progress.json"
+    monkeypatch.setattr(sync, "SYNC_PROGRESS_FILE", progress_file)
+    monkeypatch.setattr(sync, "TRAKT_CLIENT_ID", "client-id")
+    monkeypatch.setattr(sync, "TRAKT_CLIENT_SECRET", "client-secret")
+    monkeypatch.setattr(sync, "LOG_FILE", tmp_path / "logs" / "traktor.log")
+    monkeypatch.setattr(
+        sync.integrity_checker, "run_all_checks", lambda: {"overall_healthy": True, "checks": {}}
+    )
+    monkeypatch.setattr(sync, "load_config", lambda: {})
+    monkeypatch.setattr(sync, "_print_summary", lambda *a, **k: None)
+    monkeypatch.setattr(sync, "_check_memory", lambda *a, **k: None)
+    monkeypatch.setattr(sync, "write_missing_report", lambda *a, **k: None)
+
+    class _Args:
+        sync_watched_only = True
+        list_source = "official"
+        interactive = False
+        undo = False
+        workers = 1
+
+    monkeypatch.setattr(sync, "_sync_lists", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("the real _sync_lists must run")
+    ))
+
+    # The real wrapper is what records the run, so drive it with a patched body.
+    def fake_body(args=None, resource_manager=None, failures=None):
+        failures.append("watch sync failed: could not read show Broken Show")
+        return 1
+
+    monkeypatch.setattr(sync, "_sync_lists", fake_body)
+
+    assert sync.sync_lists(_Args()) == 1
+    recorded = run_status.read_run_status(progress_file)
+    assert recorded["status"] == "failed"
+    assert "Broken Show" in recorded["error"]

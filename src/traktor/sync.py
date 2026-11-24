@@ -1354,8 +1354,13 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
     that is still going, which is how a twenty-day outage stayed invisible.
     """
     record_run_started(SYNC_PROGRESS_FILE)
+    # Why the run failed, so /status names the operation and the item
+    # instead of only the number the process exits with (issue #124).
+    failures: List[str] = []
     try:
-        exit_code = _sync_lists(args, resource_manager=resource_manager)
+        exit_code = _sync_lists(
+            args, resource_manager=resource_manager, failures=failures
+        )
     except SystemExit as exc:
         record_run_failed(SYNC_PROGRESS_FILE, f"run exited with code {exc.code}")
         raise
@@ -1368,12 +1373,23 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
     if exit_code == 0:
         record_run_succeeded(SYNC_PROGRESS_FILE)
     else:
-        record_run_failed(SYNC_PROGRESS_FILE, f"sync finished with exit code {exit_code}")
+        reason = "; ".join(failures) or f"sync finished with exit code {exit_code}"
+        record_run_failed(SYNC_PROGRESS_FILE, reason)
     return exit_code
 
 
-def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = None) -> int:
-    """Main sync function with parallel processing."""
+def _sync_lists(
+    args: Optional[Any] = None,
+    resource_manager: Optional[Any] = None,
+    failures: Optional[List[str]] = None,
+) -> int:
+    """Main sync function with parallel processing.
+    Args:
+        args: Parsed command line arguments
+        resource_manager: Optional ResourceManager for memory checks
+        failures: Optional list that receives one line per failed section,
+            so the caller can record why the run failed (issue #124)
+    """
     # Initialize resource manager if not provided but memory limits are configured
     if resource_manager is None and TRAKTOR_MAX_MEMORY_MB > 0:
         from .resource_manager import ResourceManager
@@ -1962,6 +1978,10 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
     if watch_sync_error:
         logger.error(f"Watch sync did not complete, so this run is a failure: {watch_sync_error}")
         print(f"Watch sync did not complete: {watch_sync_error}")
+        if failures is not None:
+            failures.append(
+                f"watch sync failed: {sanitize_terminal_text(str(watch_sync_error))}"
+            )
 
     # Calculate total elapsed time for the sync operation
     elapsed = time.time() - sync_start_time
@@ -1973,6 +1993,9 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
         elapsed,
         show_performance=args.performance_report if args else False,
     )
+
+    if stats["lists_failed"] > 0 and failures is not None:
+        failures.append(f"{stats['lists_failed']} list(s) failed")
 
     return 1 if (stats["lists_failed"] > 0 or watch_sync_error) else 0
 
