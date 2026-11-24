@@ -72,3 +72,4 @@
 96	uv run pytest -q tests/test_history_manager.py::TestUnkeyedRows	0	correctness
 105	uv run pytest -q tests/test_sync.py tests/test_official_lists.py -k fetch_keeps	0	correctness
 105	uv run pytest -q tests/test_official_lists.py -k failed_endpoint	0	correctness
+106	uv run pytest -q tests/test_clients.py -k watched_shows_are_read	0	correctness

@@ -1912,8 +1912,10 @@ class TraktClient:
         logger.info("Fetching watched shows from Trakt...")
 
         try:
-            response = self._request("sync/watched/shows")
-            data = response.json()
+            # Trakt answers this endpoint about ten shows per page, so a single
+            # request saw only the first page and every later page's shows were
+            # never synced (issue #106, the class of #92).
+            data = self._paginated_get("sync/watched/shows")
 
             # Count total episodes
             episode_count = 0

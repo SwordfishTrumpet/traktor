@@ -2916,3 +2916,24 @@ def test_playback_progress_reads_each_item_once():
 
     assert server.fetch_calls == 20
     assert sum(item.updates for item in server.items.values()) == 20
+
+
+# ---------------------------------------------------------------------------
+# Issue #106: watched shows came from the first page only
+# ---------------------------------------------------------------------------
+
+
+def test_watched_shows_are_read_from_every_page():
+    client = _trakt_client_with_auth()
+    calls = _serve_pages(
+        client,
+        _pages(
+            lambda n: {
+                "show": {"title": f"Show {n}", "ids": {"imdb": f"tt{n:07d}"}},
+                "seasons": [{"number": 1, "episodes": [{"number": 1}]}],
+            }
+        ),
+    )
+
+    assert len(client.get_watched_shows()) == 20
+    assert [call.get("page") for call in calls] == [1, 2]
