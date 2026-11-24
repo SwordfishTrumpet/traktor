@@ -3082,3 +3082,32 @@ def test_a_repeated_5xx_opens_the_trakt_circuit_breaker(monkeypatch):
             client._request("sync/lists")
 
     assert breaker.state == res.CircuitState.OPEN
+
+
+# ---------------------------------------------------------------------------
+# Issue #123: the Plex breaker was defined but never wrapped a Plex call
+# ---------------------------------------------------------------------------
+
+
+def test_plex_calls_are_counted_by_the_plex_circuit_breaker(monkeypatch):
+    import traktor.resilience as res
+
+    breaker = res.CircuitBreaker(
+        failure_threshold=3, success_threshold=2, cooldown_seconds=60.0, name="test-plex"
+    )
+    monkeypatch.setattr(clients, "plex_circuit_breaker", breaker)
+
+    server = MagicMock()
+    server.fetchItem.side_effect = ConnectionError("plex is down")
+    plex = clients.PlexClient(server, MagicMock())
+
+    for _ in range(3):
+        assert plex.mark_as_watched(42) is False
+
+    assert breaker.state == res.CircuitState.OPEN
+
+    # An open breaker fails fast instead of waiting on the dead server again.
+    server.fetchItem.side_effect = None
+    assert plex.mark_as_watched(43) is False
+    server.fetchItem.assert_called_with(42)
+    assert server.fetchItem.call_count == 3

@@ -18,7 +18,12 @@ from plexapi.exceptions import BadRequest, NotFound
 from .config import load_config, save_config
 from .log import get_correlation_id, logger
 from .performance import performance_monitor
-from .resilience import CircuitBreakerOpen, retry_with_backoff, trakt_circuit_breaker
+from .resilience import (
+    CircuitBreakerOpen,
+    plex_circuit_breaker,
+    retry_with_backoff,
+    trakt_circuit_breaker,
+)
 from .settings import (
     CACHE_DIR,
     CACHE_MAX_AGE_HOURS,
@@ -2419,6 +2424,21 @@ class PlexClient:
         performance_monitor.record_cache_miss()
         return None
 
+    def _via_breaker(self, operation, call):
+        """Run one Plex operation under the shared Plex circuit breaker (#123).
+
+        Nothing called the Plex breaker: it was defined, reported by
+        --circuit-status, and bypassed by every request, so it stayed green
+        through an outage while each call waited on the dead server. A
+        CircuitBreakerOpen propagates into the caller's existing failure
+        path, which is a fast failure instead of another wait.
+        """
+        try:
+            return plex_circuit_breaker.call(call)
+        except CircuitBreakerOpen:
+            logger.error(f"Plex circuit breaker is OPEN - not calling {operation}")
+            raise
+
     def _get_plex_item(self, rating_key):
         """Return the Plex item for a cached rating key, fetching it once per run.
 
@@ -2439,7 +2459,7 @@ class PlexClient:
         if rating_key_str in self.cache._plex_objects:
             return self.cache._plex_objects[rating_key_str]
         try:
-            item = self.server.fetchItem(safe_key)
+            item = self._via_breaker("fetchItem", lambda: self.server.fetchItem(safe_key))
         except Exception as e:
             logger.warning(
                 f"Cached ratingKey {safe_key} could not be fetched (stale cache entry?): {e}"
@@ -2524,7 +2544,12 @@ class PlexClient:
         turns a transient 5xx into a duplicate.
         """
         try:
-            return list(self.server.playlists(title=name, title__iexact=name))
+            return list(
+                self._via_breaker(
+                    "playlists",
+                    lambda: self.server.playlists(title=name, title__iexact=name),
+                )
+            )
         except NotFound:
             return []
 
@@ -2718,7 +2743,9 @@ class PlexClient:
             for playlist_name in blacklisted_lists:
                 if playlist_name in managed_playlists:
                     try:
-                        playlist = self.server.playlist(playlist_name)
+                        playlist = self._via_breaker(
+                            "playlist", lambda: self.server.playlist(playlist_name)
+                        )
                         if dry_run:
                             to_delete.append(playlist_name)
                             logger.info(f"[DRY RUN] Would delete blacklisted: {playlist_name}")
@@ -2734,7 +2761,7 @@ class PlexClient:
                         )
 
         try:
-            all_playlists = self.server.playlists()
+            all_playlists = self._via_breaker("playlists", self.server.playlists)
             logger.info(f"Found {len(all_playlists)} total playlists in Plex")
 
             for playlist in all_playlists:
@@ -2794,7 +2821,7 @@ class PlexClient:
         logger.info(f"Marking item as watched in Plex: {rating_key}")
 
         try:
-            item = self.server.fetchItem(rating_key)
+            item = self._via_breaker("fetchItem", lambda: self.server.fetchItem(rating_key))
 
             if hasattr(item, "markWatched"):
                 item.markWatched()
@@ -2826,7 +2853,7 @@ class PlexClient:
         logger.info(f"Marking item as unwatched in Plex: {rating_key}")
 
         try:
-            item = self.server.fetchItem(rating_key)
+            item = self._via_breaker("fetchItem", lambda: self.server.fetchItem(rating_key))
 
             if hasattr(item, "markUnwatched"):
                 item.markUnwatched()
@@ -2967,7 +2994,7 @@ class PlexClient:
         # Fallback to API call if not in cache (episodes, or cache miss)
         logger.debug(f"Cache miss for watched check: {rating_key}, falling back to API")
         try:
-            item = self.server.fetchItem(rating_key)
+            item = self._via_breaker("fetchItem", lambda: self.server.fetchItem(rating_key))
             is_watched = getattr(item, "isWatched", False)
             last_viewed = getattr(item, "lastViewedAt", None)
             return is_watched, last_viewed

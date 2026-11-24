@@ -91,3 +91,4 @@
 120	uv run pytest -q tests/test_clients.py -k authenticate_reports	0	compatibility
 121	uv run pytest -q tests/test_packaging.py -k creates_the_env	0	compatibility
 122	uv run pytest -q tests/test_clients.py -k opens_the_trakt_circuit_breaker	0	reliability
+123	uv run pytest -q tests/test_clients.py -k counted_by_the_plex_circuit_breaker	0	reliability
