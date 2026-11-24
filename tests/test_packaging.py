@@ -208,3 +208,57 @@ def test_security_policy_names_the_token_store_the_code_writes():
 
     assert "ENV_FILE" in settings
     assert "Trakt OAuth tokens are stored in the `.env` file" in policy
+
+
+# ---------------------------------------------------------------------------
+# Issue #87: every path DOCKER_MODE persists must be under a Compose mount
+# ---------------------------------------------------------------------------
+
+
+def _compose_mount_targets() -> list:
+    """Return the container paths docker-compose.yml mounts."""
+    import re
+
+    targets = []
+    for line in (ROOT / "docker-compose.yml").read_text(encoding="utf-8").splitlines():
+        match = re.match(r"\s*-\s*[^:\n]+:\s*(\S+)\s*$", line)
+        if match and match.group(1).startswith("/"):
+            targets.append(match.group(1))
+    return targets
+
+
+def test_compose_mounts_every_path_docker_mode_writes(monkeypatch):
+    """`docker compose run --rm` discarded the delta file, snapshots and backups (#87)."""
+    import importlib.util
+    from pathlib import Path as _Path
+
+    monkeypatch.setenv("DOCKER_MODE", "true")
+    spec = importlib.util.spec_from_file_location(
+        "packaging_probe_settings", ROOT / "src" / "traktor" / "settings.py"
+    )
+    settings = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(settings)
+
+    targets = _compose_mount_targets()
+
+    def covered(path):
+        text = str(path)
+        return any(text == t or text.startswith(t.rstrip("/") + "/") for t in targets)
+
+    # /data holds config, cache and logs; the delta file and the undo snapshots
+    # sit at the data root; snapshots default to the container home.
+    docker_paths = [
+        settings.CONFIG_FILE,
+        settings.CACHE_DIR,
+        settings.LOG_FILE,
+        settings.DATA_DIR / ".traktor_watch_sync.json",
+        settings.DATA_DIR / ".traktor",
+        _Path("/home/traktor/.traktor_backups"),
+    ]
+
+    uncovered = [str(path) for path in docker_paths if not covered(path)]
+    assert uncovered == []
+
+    # The mount for the container home must exist by name, or a backup written
+    # there still disappears with the container.
+    assert "/home/traktor/.traktor_backups" in targets
