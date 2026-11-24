@@ -304,3 +304,51 @@ def test_the_runbook_downloads_the_wheel_where_it_installs_it():
     assert downloads, "Case 2 has no download step"
     assert all("--dir" in line for line in downloads), downloads
     assert "dist/traktor-$VERSION-py3-none-any.whl" in case2 or "dist/" in case2
+
+
+# ---------------------------------------------------------------------------
+# Issue #119: setup.sh reported success when an install step failed
+# ---------------------------------------------------------------------------
+
+
+def _run_setup(tmp_path, path_prefix):
+    import shutil
+    import subprocess
+    import sys
+
+    root = pathlib.Path(__file__).parent.parent
+    script = tmp_path / "setup.sh"
+    shutil.copy(root / "setup.sh", script)
+    env = {"PATH": f"{path_prefix}:/usr/bin:/bin", "HOME": str(tmp_path / "home")}
+    (tmp_path / "home").mkdir(exist_ok=True)
+    return subprocess.run(
+        ["bash", str(script)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_setup_fails_when_dependency_sync_fails(tmp_path):
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "uv").write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+    (stub / "uv").chmod(0o755)
+
+    result = _run_setup(tmp_path, stub)
+
+    assert result.returncode != 0
+    assert "Setup complete" not in result.stdout
+
+
+def test_setup_fails_when_uv_cannot_be_installed(tmp_path):
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "curl").write_text("#!/bin/sh\nexit 6\n", encoding="utf-8")
+    (stub / "curl").chmod(0o755)
+
+    result = _run_setup(tmp_path, stub)
+
+    assert result.returncode != 0
+    assert "Setup complete" not in result.stdout
