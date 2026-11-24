@@ -45,6 +45,12 @@ def load_config():
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse config JSON: {e}", exc_info=True)
             return {}
+        except UnicodeDecodeError as e:
+            # A config saved by an editor in another encoding, or restored from a
+            # torn backup, is corrupt for this build, not fatal: every command
+            # used to abort at startup until the file was deleted (issue #112).
+            logger.error(f"Config file is not valid UTF-8, using defaults: {e}")
+            return {}
         except (PermissionError, FileNotFoundError, OSError) as e:
             logger.error(f"Failed to read config file: {e}", exc_info=True)
             return {}

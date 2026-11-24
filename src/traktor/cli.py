@@ -319,7 +319,13 @@ def _register_health_checks() -> None:
             # A config that is valid JSON but not an object is corrupt, and
             # load_config falls back to defaults for it (issue #47).
             return isinstance(config, dict)
-        except (json.JSONDecodeError, FileNotFoundError, PermissionError, OSError):
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            FileNotFoundError,
+            PermissionError,
+            OSError,
+        ):
             return False
 
     health_checker.register("cache", check_cache_exists)

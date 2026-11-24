@@ -631,3 +631,16 @@ def test_numeric_options_accept_valid_values(monkeypatch):
     assert args.workers == 2
     assert args.max_memory_mb == 1024
     assert args.cpu_throttle == 50.5
+
+
+def test_health_check_calls_a_non_utf8_config_unhealthy(tmp_path, monkeypatch):
+    import traktor.settings as settings
+
+    config_file = tmp_path / ".traktor_config.json"
+    config_file.write_bytes(b'{"managed_playlists": ["Caf\xe9"]}')
+    monkeypatch.setattr(settings, "CONFIG_FILE", config_file)
+
+    cli._register_health_checks()
+    results = cli.health_checker.check_all()
+
+    assert results["components"]["config"] != "healthy"

@@ -341,3 +341,18 @@ def test_failed_config_save_keeps_the_previous_file(tmp_path, monkeypatch):
 
     assert target.read_text(encoding="utf-8") == before
     assert "kept" in before
+
+
+# ---------------------------------------------------------------------------
+# Issue #112: a config that is not valid UTF-8 aborted every command
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_uses_defaults_for_invalid_utf8(tmp_path, monkeypatch):
+    from traktor import config as config_module
+
+    config_file = tmp_path / ".traktor_config.json"
+    config_file.write_bytes(b'{"managed_playlists": ["Caf\xe9"]}')
+    monkeypatch.setattr(config_module, "CONFIG_FILE", config_file)
+
+    assert config_module.load_config() == {}

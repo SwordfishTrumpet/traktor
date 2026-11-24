@@ -78,3 +78,5 @@
 109	uv run pytest -q tests/test_clients.py -k orphan_cleanup_keeps_a_config	0	data-integrity
 110	uv run pytest -q tests/test_sync.py -k collection_misses_reach_the_report	0	usability
 111	uv run pytest -q tests/test_cli.py -k numeric_options	0	correctness
+112	uv run pytest -q tests/test_config.py -k invalid_utf8	0	portability
+112	uv run pytest -q tests/test_cli.py -k non_utf8_config	0	portability
