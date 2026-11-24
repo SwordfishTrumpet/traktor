@@ -591,3 +591,43 @@ def test_version_flag_prints_the_package_version(capsys, monkeypatch):
 
     assert exit_info.value.code == 0
     assert __version__ in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Issue #111: numeric options accepted values that abort the run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--workers", "0"],
+        ["--workers", "-1"],
+        ["--max-memory-mb", "0"],
+        ["--max-memory-mb", "-5"],
+        ["--cpu-throttle", "nan"],
+        ["--cpu-throttle", "inf"],
+        ["--cpu-throttle", "0"],
+        ["--cpu-throttle", "101"],
+        ["--workers", "eight"],
+    ],
+)
+def test_numeric_options_refuse_out_of_range_values(monkeypatch, argv):
+    monkeypatch.setattr(sys, "argv", ["traktor", *argv])
+
+    with pytest.raises(SystemExit):
+        cli.parse_args()
+
+
+def test_numeric_options_accept_valid_values(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["traktor", "--workers", "2", "--max-memory-mb", "1024", "--cpu-throttle", "50.5"],
+    )
+
+    args = cli.parse_args()
+
+    assert args.workers == 2
+    assert args.max_memory_mb == 1024
+    assert args.cpu_throttle == 50.5
