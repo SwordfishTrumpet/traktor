@@ -1179,3 +1179,62 @@ class TestBackupRestoreIsBounded:
 
         assert manager.restore_backup(backup) is True
         assert cache_dir.joinpath("plex_library_cache.json.gz").exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #107: overlapping backup runs deleted each other's snapshots
+# ---------------------------------------------------------------------------
+
+
+class TestOverlappingBackups:
+    """A backup run must not see, or die on, a snapshot another run owns."""
+
+    @pytest.fixture
+    def backup_env(self, tmp_path, monkeypatch):
+        import traktor.resilience as res
+
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"key": "value"}')
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / "entry.json").write_text('{"cached": true}')
+        env_file = tmp_path / ".env"
+        env_file.write_text("TRAKT_CLIENT_ID=abc\nTRAKT_ACCESS_TOKEN=tok1234567890\n")
+
+        monkeypatch.setattr(res, "CONFIG_FILE", config_file)
+        monkeypatch.setattr(res, "ENV_FILE", env_file)
+        monkeypatch.setattr(res, "CACHE_DIR", cache_dir)
+
+        manager = res.BackupManager(backup_dir=tmp_path / "backups", max_backups=2, compress=True)
+        return manager, res
+
+    def test_a_snapshot_is_invisible_until_its_manifest_is_written(self, backup_env, monkeypatch):
+        manager, res = backup_env
+        visible_while_writing = []
+        real_write = res.write_json_atomic
+
+        def spy(path, data, **kwargs):
+            prefix = res.BACKUP_DIR_PREFIX
+            visible_while_writing.extend(
+                p.name for p in manager.backup_dir.iterdir() if p.name.startswith(prefix)
+            )
+            return real_write(path, data, **kwargs)
+
+        monkeypatch.setattr(res, "write_json_atomic", spy)
+        backup_path = manager.create_backup(reason="overlap")
+
+        assert visible_while_writing == []
+        assert backup_path.name.startswith(res.BACKUP_DIR_PREFIX)
+        assert (backup_path / "manifest.json").exists()
+
+    def test_cleanup_ignores_a_snapshot_another_run_removed(self, backup_env, monkeypatch):
+        manager, res = backup_env
+        for i in range(3):
+            manager.create_backup(reason=f"run-{i}")
+
+        def gone(path):
+            raise FileNotFoundError(str(path))
+
+        monkeypatch.setattr(res.shutil, "rmtree", gone)
+        manager._cleanup_old_backups()
+        assert len(manager.list_backups()) == 3

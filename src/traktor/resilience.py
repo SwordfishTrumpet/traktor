@@ -389,9 +389,20 @@ class BackupManager:
         Returns:
             Path to created backup
         """
-        backup_path = self._create_backup_dir(reason)
+        final_path = self._create_backup_dir(reason)
+        # Fill a hidden staging directory first, so another run's retention
+        # sweep cannot count, or delete, a snapshot whose manifest is not
+        # written yet. The directory is published under its real name when it
+        # is complete (issue #107).
+        working_path = final_path.with_name(f".{final_path.name}.partial")
+        try:
+            final_path.rename(working_path)
+        except OSError as e:
+            logger.debug(f"Could not stage backup in {working_path}: {e}")
+            working_path = final_path
+        backup_path = working_path
 
-        logger.info(f"Creating backup: {backup_path.name}")
+        logger.info(f"Creating backup: {final_path.name}")
 
         # Backup each item
         manifest: Dict[str, Any] = {
@@ -423,6 +434,16 @@ class BackupManager:
         if not write_json_atomic(manifest_path, manifest, mode=0o600):
             logger.error(f"Failed to write backup manifest: {manifest_path}")
             return backup_path
+
+        # Publish the finished snapshot under its retention-visible name. A
+        # snapshot only becomes visible once it can be restored (issue #107).
+        if working_path != final_path:
+            try:
+                working_path.rename(final_path)
+            except OSError as e:
+                logger.error(f"Could not publish backup {final_path.name}: {e}")
+                return working_path
+            backup_path = final_path
 
         # Cleanup old backups
         self._cleanup_old_backups()
@@ -763,15 +784,25 @@ class BackupManager:
         consider every directory under the backup location, so a folder the user
         kept there was deleted once the count passed the limit (issue #84).
         """
-        backups = sorted(
-            [d for d in self.backup_dir.iterdir() if _is_backup_dir(d)],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
+        # Two runs may sweep the same directory at once: a snapshot can vanish
+        # between the listing and the removal, and a sweep must not die on a
+        # path another run already removed (issue #107).
+        candidates: List[tuple] = []
+        for path in self.backup_dir.iterdir():
+            if not _is_backup_dir(path):
+                continue
+            try:
+                candidates.append((path.stat().st_mtime, path))
+            except OSError:
+                logger.debug(f"Backup vanished before cleanup: {path.name}")
+        candidates.sort(key=lambda entry: entry[0], reverse=True)
 
-        for old_backup in backups[self.max_backups :]:
+        for _, old_backup in candidates[self.max_backups :]:
             logger.info(f"Removing old backup: {old_backup.name}")
-            shutil.rmtree(old_backup)
+            try:
+                shutil.rmtree(old_backup)
+            except FileNotFoundError:
+                logger.debug(f"Backup already removed by another run: {old_backup.name}")
 
     def list_backups(self) -> List[Dict[str, Any]]:
         """List all available backups with metadata."""
