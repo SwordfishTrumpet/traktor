@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests as _requests
 import requests
 from plexapi.video import Show
 
@@ -3053,3 +3054,31 @@ def test_authenticate_reports_a_completed_token_save(monkeypatch):
     monkeypatch.setattr(clients.TraktAuth, "save_tokens", lambda self: True)
 
     assert auth.authenticate("a-code") is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #122: the Trakt breaker counted a returned 5xx as a success
+# ---------------------------------------------------------------------------
+
+
+def test_a_repeated_5xx_opens_the_trakt_circuit_breaker(monkeypatch):
+    import traktor.resilience as res
+
+    breaker = res.CircuitBreaker(
+        failure_threshold=2, success_threshold=2, cooldown_seconds=60.0, name="test-trakt"
+    )
+    monkeypatch.setattr(clients, "trakt_circuit_breaker", breaker)
+    monkeypatch.setattr(clients, "MAX_RETRIES", 1)
+
+    client = _trakt_client_with_auth()
+    client._rate_limiter.wait = lambda: None
+    response = MagicMock()
+    response.status_code = 503
+    response.headers = {}
+    monkeypatch.setattr(client._session, "get", lambda *args, **kwargs: response)
+
+    for _ in range(2):
+        with pytest.raises(_requests.exceptions.HTTPError):
+            client._request("sync/lists")
+
+    assert breaker.state == res.CircuitState.OPEN

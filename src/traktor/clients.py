@@ -1507,9 +1507,16 @@ class TraktClient:
         """Execute request with circuit breaker protection."""
 
         def make_request():
-            return self._request_with_retry(
+            response = self._request_with_retry(
                 method, url, headers=headers, params=params, json_data=json_data
             )
+            # A 5xx that survived the retries is a failure of the dependency.
+            # Returning it counted every outage request as a success, so the
+            # breaker never opened and each request paid the full retry
+            # schedule (issue #122).
+            if response.status_code >= 500:
+                response.raise_for_status()
+            return response
 
         try:
             return trakt_circuit_breaker.call(make_request)
