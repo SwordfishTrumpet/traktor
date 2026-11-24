@@ -2937,3 +2937,34 @@ def test_watched_shows_are_read_from_every_page():
 
     assert len(client.get_watched_shows()) == 20
     assert [call.get("page") for call in calls] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Issue #109: a finishing sync wrote its start-of-run config over a concurrent
+# credential save
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_cleanup_keeps_a_config_saved_during_the_run(tmp_path, monkeypatch):
+    config_file = tmp_path / ".traktor_config.json"
+    config_file.write_text('{"blacklisted_lists": []}', encoding="utf-8")
+    monkeypatch.setattr(clients, "CONFIG_FILE", config_file)
+
+    stale_snapshot = {"blacklisted_lists": [], "managed_playlists": []}
+
+    # Another session saves credentials while this run is working.
+    config_file.write_text(
+        '{"blacklisted_lists": [], "plex_url": "http://plex.example:32400", '
+        '"plex_token": "placeholder-value-for-the-test"}',
+        encoding="utf-8",
+    )
+
+    server = MagicMock()
+    server.playlists.return_value = []
+    plex = clients.PlexClient(server, MagicMock())
+
+    plex.cleanup_orphaned_playlists(["My Trakt List"], stale_snapshot)
+
+    saved = json.loads(config_file.read_text(encoding="utf-8"))
+    assert saved["plex_url"] == "http://plex.example:32400"
+    assert saved["managed_playlists"] == ["My Trakt List"]

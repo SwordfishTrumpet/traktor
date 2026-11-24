@@ -15,13 +15,14 @@ from urllib.parse import urlencode
 import requests
 from plexapi.exceptions import BadRequest, NotFound
 
-from .config import save_config
+from .config import load_config, save_config
 from .log import get_correlation_id, logger
 from .performance import performance_monitor
 from .resilience import CircuitBreakerOpen, retry_with_backoff, trakt_circuit_breaker
 from .settings import (
     CACHE_DIR,
     CACHE_MAX_AGE_HOURS,
+    CONFIG_FILE,
     CACHE_VERSION,
     ENV_FILE,
     TRAKT_ACCESS_TOKEN,
@@ -33,6 +34,7 @@ from .settings import (
 )
 from .utils import (
     DecompressionLimitError,
+    file_lock,
     normalize_tmdb_id,
     parse_timestamp,
     read_gzip_text,
@@ -2740,11 +2742,21 @@ class PlexClient:
             logger.error(f"Error during playlist cleanup: {e}", exc_info=True)
 
         if not dry_run:
-            config["managed_playlists"] = list(active_playlist_names)
-            logger.info(
-                f"About to save config with {len(config['managed_playlists'])} managed playlists"
-            )
-            save_config(config)
+            # The caller holds a snapshot taken when the run started, and a
+            # long run can finish after another session saved credentials. Write
+            # back only the key this method owns, re-read under the same lock
+            # the other writers use, so the concurrent save survives (#109).
+            with file_lock(CONFIG_FILE):
+                fresh = load_config()
+                if not isinstance(fresh, dict):
+                    fresh = {}
+                fresh["managed_playlists"] = list(active_playlist_names)
+                logger.info(
+                    f"About to save config with "
+                    f"{len(fresh['managed_playlists'])} managed playlists"
+                )
+                save_config(fresh)
+                config["managed_playlists"] = list(active_playlist_names)
 
         return to_delete if dry_run else deleted
 
