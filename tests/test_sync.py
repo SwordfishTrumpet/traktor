@@ -2199,3 +2199,48 @@ class TestOfficialPlaylistIsolation:
 
         assert sync.sync_lists(args) == 1
         assert attempted == ["Trending Movies", "Popular Movies"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #110: the missing report was written before collection and watchlist
+# ---------------------------------------------------------------------------
+
+
+class TestMissingReportTiming:
+    def _args(self, monkeypatch, argv):
+        import sys
+
+        from traktor import cli
+
+        monkeypatch.setattr(sys, "argv", ["traktor", *argv])
+        return cli.parse_args()
+
+    def _setup(self, monkeypatch, tmp_path):
+        env = TestSyncListsFeatureSections._setup(
+            TestSyncListsFeatureSections, monkeypatch, tmp_path
+        )
+        self.reports = []
+        monkeypatch.setattr(
+            sync,
+            "write_missing_report",
+            lambda items, **kwargs: self.reports.append(list(items)),
+        )
+        return env
+
+    def test_collection_misses_reach_the_report(self, monkeypatch, tmp_path):
+        env = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--sync-collection", "--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+        monkeypatch.setattr(sync, "_collect_plex_items", lambda items, *a, **k: [])
+
+        env["trakt_client"].get_collection.return_value = [
+            {"type": "movie", "movie": {"title": "Heat", "year": 1995, "ids": {"imdb": "tt0113277"}}}
+        ]
+        monkeypatch.setattr(sync, "TraktClient", lambda *a, **k: env["trakt_client"])
+
+        sync.sync_lists(args)
+
+        assert self.reports, "the missing report was never written"
+        assert any(item.get("title") == "Heat" for item in self.reports[-1])

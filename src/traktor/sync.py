@@ -1669,8 +1669,6 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
                 "Keeping the existing playlists."
             )
 
-    write_missing_report(missing_items, cache_manager=cache_manager)
-
     # Save undo snapshot before any destructive operations
     if args and (args.interactive or args.undo):
         playlist_snapshot = _save_playlist_snapshot(plex, config)
@@ -1948,6 +1946,12 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
                     stats["lists_failed"] += 1
 
         _check_memory(resource_manager)
+
+    # The report is written here, after every section that can add a missing
+    # item. It used to be written before the collection and watchlist syncs, so
+    # their misses never appeared and a run whose only misses came from them
+    # deleted the report (issue #110).
+    write_missing_report(missing_items, cache_manager=cache_manager)
 
     if watch_sync_error:
         logger.error(f"Watch sync did not complete, so this run is a failure: {watch_sync_error}")
