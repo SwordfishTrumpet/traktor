@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 from .log import logger
 from .settings import DATA_DIR, HISTORY_RETENTION_DAYS
-from .utils import file_lock, parse_timestamp, read_json_object, write_json_atomic
+from .utils import file_lock, parse_timestamp, try_read_json_object, write_json_atomic
 
 # Sync state file location
 WATCH_SYNC_FILE = DATA_DIR / ".traktor_watch_sync.json"
@@ -125,9 +125,21 @@ class WatchHistoryManager:
         logger.debug(f"Saved watch sync state to {self.sync_file}")
         return True
 
-    def _merge_with_disk(self) -> Dict[str, Any]:
-        """Return this run's state merged with what is on disk right now."""
-        on_disk = read_json_object(self.sync_file)
+    def _merge_with_disk(self) -> Optional[Dict[str, Any]]:
+        """Return this run's state merged with what is on disk right now.
+
+        Returns None when the file exists but cannot be read: replacing it with
+        this run's rows would permanently drop the rows another overlapping run
+        committed, which is the state loss issue #65 fixed for the readable
+        case (issue #128).
+        """
+        readable, on_disk = try_read_json_object(self.sync_file)
+        if not readable:
+            logger.error(
+                "Watch sync state exists but cannot be read, leaving it "
+                f"untouched: {self.sync_file}"
+            )
+            return None
         if self._replace_on_save or not self._mergeable(on_disk):
             # Nothing to merge with, the file is unreadable, or it belongs to
             # another Plex server: this run's state is the whole truth.

@@ -96,3 +96,4 @@
 125	uv run pytest -q tests/test_resilience.py -k "jitter or eight_concurrent_clients"	0	reliability
 126	uv run pytest -q tests/test_resilience.py::test_a_backup_that_cannot_be_completed_is_a_failure tests/test_cli.py::test_run_backup_reports_a_failed_snapshot	0	usability
 127	uv run pytest -q tests/test_history_manager.py -k "FailedWritesAreReported"	0	correctness
+128	uv run pytest -q tests/test_history_manager.py -k "UnreadableStateFile or try_read_json_object"	0	data-integrity
