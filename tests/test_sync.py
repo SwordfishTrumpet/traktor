@@ -1109,7 +1109,8 @@ class TestSyncListsOrchestration:
 
         assert "failed" in recorded
         assert "succeeded" not in recorded
-        assert "exit code 1" in recorded["failed"]
+        # The record names the cause, not just the exit code (issue #124).
+        assert "Broken Show" in recorded["failed"]
 
     def test_interactive_orphaned_cleanup_confirmed(self, monkeypatch, tmp_path):
         """Interactive mode previews orphaned cleanup and deletes on confirm."""
@@ -1672,9 +1673,7 @@ class TestSyncListsFeatureSections:
         assert stats["lists_failed"] == 1
         assert "Favorites" in updated
 
-    def test_failed_official_fetch_keeps_playlists_and_fails_the_run(
-        self, monkeypatch, tmp_path
-    ):
+    def test_failed_official_fetch_keeps_playlists_and_fails_the_run(self, monkeypatch, tmp_path):
         """A failed official fetch is not an empty official list (#105)."""
         env = self._setup(monkeypatch, tmp_path)
         args = self._args(monkeypatch, ["--list-source", "official"])
@@ -2162,9 +2161,7 @@ class TestOfficialPlaylistIsolation:
         monkeypatch.setattr(sys, "argv", ["traktor", *argv])
         return cli.parse_args()
 
-    def test_a_refused_official_playlist_does_not_abort_the_rest(
-        self, monkeypatch, tmp_path
-    ):
+    def test_a_refused_official_playlist_does_not_abort_the_rest(self, monkeypatch, tmp_path):
         from plexapi.exceptions import BadRequest
 
         from tests.test_sync import TestSyncListsFeatureSections
@@ -2231,18 +2228,34 @@ class TestMissingReportTiming:
         env = self._setup(monkeypatch, tmp_path)
         args = self._args(monkeypatch, ["--sync-collection", "--list-source", "official"])
 
-        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
         monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
-        monkeypatch.setattr(sync, "_collect_plex_items", lambda items, *a, **k: [])
 
+        def collect_nothing(items, plex, workers, list_name, stats, missing_items):
+            """Model what the real collector records: a miss reaches the tracker."""
+            missing_items.append(
+                {
+                    "title": "Heat",
+                    "year": 1995,
+                    "imdb_id": "tt0113277",
+                    "reason": "Movie not found in Plex library",
+                }
+            )
+            return []
+
+        monkeypatch.setattr(sync, "_collect_plex_items", collect_nothing)
         env["trakt_client"].get_collection.return_value = [
-            {"type": "movie", "movie": {"title": "Heat", "year": 1995, "ids": {"imdb": "tt0113277"}}}
+            {
+                "type": "movie",
+                "movie": {"title": "Heat", "year": 1995, "ids": {"imdb": "tt0113277"}},
+            }
         ]
         monkeypatch.setattr(sync, "TraktClient", lambda *a, **k: env["trakt_client"])
 
         sync.sync_lists(args)
 
         assert self.reports, "the missing report was never written"
+        # The report is written after the collection section, so its misses are
+        # in it (issue #110).
         assert any(item.get("title") == "Heat" for item in self.reports[-1])
 
 
@@ -2274,9 +2287,11 @@ def test_the_run_record_names_the_show_a_failed_watch_sync_lost(monkeypatch, tmp
         undo = False
         workers = 1
 
-    monkeypatch.setattr(sync, "_sync_lists", lambda *a, **k: (_ for _ in ()).throw(
-        AssertionError("the real _sync_lists must run")
-    ))
+    monkeypatch.setattr(
+        sync,
+        "_sync_lists",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("the real _sync_lists must run")),
+    )
 
     # The real wrapper is what records the run, so drive it with a patched body.
     def fake_body(args=None, resource_manager=None, failures=None):

@@ -6,11 +6,11 @@ from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-import requests as _requests
 import requests
+import requests as _requests
 from plexapi.video import Show
 
-from traktor import clients
+from traktor import clients, config
 
 
 class TestCacheManager:
@@ -2949,7 +2949,11 @@ def test_watched_shows_are_read_from_every_page():
 def test_orphan_cleanup_keeps_a_config_saved_during_the_run(tmp_path, monkeypatch):
     config_file = tmp_path / ".traktor_config.json"
     config_file.write_text('{"blacklisted_lists": []}', encoding="utf-8")
+    # load_config()/save_config() read the config module's path, while
+    # cleanup_orphaned_playlists takes its lock on the clients module's copy;
+    # both must point at the same temporary file.
     monkeypatch.setattr(clients, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(config, "CONFIG_FILE", config_file)
 
     stale_snapshot = {"blacklisted_lists": [], "managed_playlists": []}
 
@@ -2977,6 +2981,13 @@ def test_orphan_cleanup_keeps_a_config_saved_during_the_run(tmp_path, monkeypatc
 
 
 class TestCacheContainerTypes:
+    @pytest.fixture
+    def server(self):
+        """A Plex server that answers with no library sections."""
+        server = MagicMock()
+        server.library.sections.return_value = []
+        return server
+
     @pytest.mark.parametrize(
         "key, wrong_value",
         [
@@ -3075,6 +3086,7 @@ def test_a_repeated_5xx_opens_the_trakt_circuit_breaker(monkeypatch):
     response = MagicMock()
     response.status_code = 503
     response.headers = {}
+    response.raise_for_status.side_effect = _requests.exceptions.HTTPError("503 Server Error")
     monkeypatch.setattr(client._session, "get", lambda *args, **kwargs: response)
 
     for _ in range(2):

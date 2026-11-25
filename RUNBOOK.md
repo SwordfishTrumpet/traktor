@@ -234,7 +234,7 @@ gh run list --workflow Release --limit 5
 The code and the artifacts are fine; only the description is not.
 
 1. Edit the release body: `gh release edit "v$VERSION" --notes-file NOTES.md`.
-2. Check it: `gh release view "v$VERSION"` shows the new body.
+2. **Verify:** `gh release view "v$VERSION"` shows the new body.
 
 Nothing else changes: the tag, the artifacts and the source stay as they are.
 
@@ -248,8 +248,8 @@ the tag; if prompted, pass nothing - the tag stays).
 2. Re-run the workflow on the same tag from the Actions tab, or
    `gh workflow run release.yml --ref "v$VERSION"`. It rebuilds from the tagged tree and
    recreates the release.
-3. Verify in a scratch environment: create it, download the asset into `dist/`, install that
-   exact file, then check the version:
+3. **Verify:** in a scratch environment: create it, download the asset into `dist/`, install
+   that exact file, then check the version:
 
    ```bash
    python3 -m venv /tmp/venv
@@ -277,7 +277,7 @@ A defect shipped in the release. The download must stop presenting it as current
 3. Mark the old release: `gh release edit "v$VERSION" --notes-file NOTES.md` with a line at the
    top saying which version supersedes it. Keep the release visible - deleting it hides the
    fact that the version existed and leaves anyone holding it with no explanation.
-4. Verify: `gh release list` shows the new version as Latest, and the new notes name the
+4. **Verify:** `gh release list` shows the new version as Latest, and the new notes name the
    defect.
 
 In all three cases, record what happened in the next release's changelog entry, and check that

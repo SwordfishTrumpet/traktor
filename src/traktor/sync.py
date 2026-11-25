@@ -1358,9 +1358,7 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
     # instead of only the number the process exits with (issue #124).
     failures: List[str] = []
     try:
-        exit_code = _sync_lists(
-            args, resource_manager=resource_manager, failures=failures
-        )
+        exit_code = _sync_lists(args, resource_manager=resource_manager, failures=failures)
     except SystemExit as exc:
         record_run_failed(SYNC_PROGRESS_FILE, f"run exited with code {exc.code}")
         raise
@@ -1979,9 +1977,7 @@ def _sync_lists(
         logger.error(f"Watch sync did not complete, so this run is a failure: {watch_sync_error}")
         print(f"Watch sync did not complete: {watch_sync_error}")
         if failures is not None:
-            failures.append(
-                f"watch sync failed: {sanitize_terminal_text(str(watch_sync_error))}"
-            )
+            failures.append(f"watch sync failed: {sanitize_terminal_text(str(watch_sync_error))}")
 
     # Calculate total elapsed time for the sync operation
     elapsed = time.time() - sync_start_time

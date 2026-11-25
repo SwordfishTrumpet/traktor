@@ -1229,14 +1229,20 @@ class TestOverlappingBackups:
 
     def test_cleanup_ignores_a_snapshot_another_run_removed(self, backup_env, monkeypatch):
         manager, res = backup_env
+        # Create three snapshots before retention applies, so the sweep below
+        # really has something to remove.
+        manager.max_backups = 10
         for i in range(3):
             manager.create_backup(reason=f"run-{i}")
+        manager.max_backups = 2
 
         def gone(path):
             raise FileNotFoundError(str(path))
 
         monkeypatch.setattr(res.shutil, "rmtree", gone)
         manager._cleanup_old_backups()
+        # The sweep survived the race and removed nothing, because every
+        # snapshot was already gone when it tried.
         assert len(manager.list_backups()) == 3
 
 

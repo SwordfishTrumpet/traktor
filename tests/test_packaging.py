@@ -273,7 +273,11 @@ def test_the_compose_healthcheck_uses_the_check_that_can_fail():
 
     healthcheck = [line for line in text.splitlines() if "--health-check" in line]
     assert healthcheck, "the compose healthcheck does not run --health-check"
-    assert "--diagnose" not in text.split("healthcheck:")[1].split("networks:")[0]
+    # Check the command itself, not the surrounding comment: the comment
+    # explains the change and names the old command (issue #116).
+    commands = [line for line in text.splitlines() if "test:" in line or "CMD" in line]
+    assert commands, "the compose healthcheck has no command"
+    assert not any("--diagnose" in line for line in commands), commands
 
 
 def test_ci_runs_the_suite_the_way_the_readme_says():
@@ -314,9 +318,8 @@ def test_the_runbook_downloads_the_wheel_where_it_installs_it():
 def _run_setup(tmp_path, path_prefix):
     import shutil
     import subprocess
-    import sys
 
-    root = pathlib.Path(__file__).parent.parent
+    root = Path(__file__).resolve().parents[1]
     script = tmp_path / "setup.sh"
     shutil.copy(root / "setup.sh", script)
     env = {"PATH": f"{path_prefix}:/usr/bin:/bin", "HOME": str(tmp_path / "home")}

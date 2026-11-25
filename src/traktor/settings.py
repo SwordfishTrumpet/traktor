@@ -82,18 +82,10 @@ def _parse_positive_env(name, default, cast):
 
 
 # Circuit breaker tuning, documented in RUNBOOK.md under "Circuit breakers".
-TRAKTOR_TRAKT_FAILURE_THRESHOLD = _parse_positive_env(
-    "TRAKTOR_TRAKT_FAILURE_THRESHOLD", 5, int
-)
-TRAKTOR_TRAKT_COOLDOWN_SECONDS = _parse_positive_env(
-    "TRAKTOR_TRAKT_COOLDOWN_SECONDS", 60.0, float
-)
-TRAKTOR_PLEX_FAILURE_THRESHOLD = _parse_positive_env(
-    "TRAKTOR_PLEX_FAILURE_THRESHOLD", 3, int
-)
-TRAKTOR_PLEX_COOLDOWN_SECONDS = _parse_positive_env(
-    "TRAKTOR_PLEX_COOLDOWN_SECONDS", 30.0, float
-)
+TRAKTOR_TRAKT_FAILURE_THRESHOLD = _parse_positive_env("TRAKTOR_TRAKT_FAILURE_THRESHOLD", 5, int)
+TRAKTOR_TRAKT_COOLDOWN_SECONDS = _parse_positive_env("TRAKTOR_TRAKT_COOLDOWN_SECONDS", 60.0, float)
+TRAKTOR_PLEX_FAILURE_THRESHOLD = _parse_positive_env("TRAKTOR_PLEX_FAILURE_THRESHOLD", 3, int)
+TRAKTOR_PLEX_COOLDOWN_SECONDS = _parse_positive_env("TRAKTOR_PLEX_COOLDOWN_SECONDS", 30.0, float)
 
 # Active .env file location - the canonical Trakt token store since the .env
 # persistence change (legacy TOKEN_FILE below is no longer written by current
