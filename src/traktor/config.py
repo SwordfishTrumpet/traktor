@@ -8,6 +8,12 @@ from .log import logger
 from .settings import CONFIG_FILE
 from .utils import restrict_to_owner, write_json_atomic
 
+# Config keys this build interprets. ``managed_playlists`` names the Plex
+# playlists traktor owns and may delete, so a value of the wrong type is a
+# corrupt file rather than a preference (issue #129).
+CONFIG_LIST_OF_STRINGS_KEYS = ("managed_playlists", "blacklisted_lists")
+CONFIG_STRING_KEYS = ("plex_url", "plex_token")
+
 
 def _is_valid_plex_url(url):
     """Check if URL is a valid Plex server URL.
@@ -21,6 +27,42 @@ def _is_valid_plex_url(url):
     if not url:
         return False
     return url.startswith(("http://", "https://"))
+
+
+def _config_value_is_valid(key, value):
+    """Return True when ``value`` has the shape this key requires.
+
+    Only the keys this build interprets are checked; a config written by a
+    newer version keeps its unknown keys.
+
+    Args:
+        key: Config key
+        value: Value read from the file
+
+    Returns:
+        True when the value can be used as-is
+    """
+    if key in CONFIG_LIST_OF_STRINGS_KEYS:
+        return isinstance(value, list) and all(isinstance(entry, str) for entry in value)
+    if key in CONFIG_STRING_KEYS:
+        return isinstance(value, str)
+    return True
+
+
+def _config_is_valid(config):
+    """Return True when every known key holds the value type it needs.
+
+    The top-level shape was already checked (issue #47); nested containers were
+    not, and ``managed_playlists`` is a delete list: a mapping there made the
+    orphan cleanup delete Plex playlists named by its keys (issue #129).
+
+    Args:
+        config: Parsed configuration object
+
+    Returns:
+        True when the configuration is usable
+    """
+    return all(_config_value_is_valid(key, value) for key, value in config.items())
 
 
 def load_config():
@@ -37,6 +79,13 @@ def load_config():
                 logger.error(
                     f"Config file holds a JSON {type(config).__name__}, expected an object; "
                     f"using defaults"
+                )
+                return {}
+            if not _config_is_valid(config):
+                logger.error(
+                    "Config file has a value of the wrong type (managed_playlists and "
+                    "blacklisted_lists must be lists of strings, plex_url and plex_token "
+                    "strings); using defaults"
                 )
                 return {}
             logger.info("Configuration loaded successfully")

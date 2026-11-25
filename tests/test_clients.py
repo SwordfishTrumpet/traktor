@@ -3123,3 +3123,40 @@ def test_plex_calls_are_counted_by_the_plex_circuit_breaker(monkeypatch):
     assert plex.mark_as_watched(43) is False
     server.fetchItem.assert_called_with(42)
     assert server.fetchItem.call_count == 3
+
+
+class TestOrphanCleanupRefusesAWrongContainer:
+    """A mapping in managed_playlists must not name playlists to delete (#129)."""
+
+    @pytest.fixture
+    def plex_client(self):
+        server = MagicMock()
+        cache = MagicMock()
+        cache.memory_cache = {}
+        return clients.PlexClient(server, cache)
+
+    def test_mapping_in_the_managed_slot_deletes_nothing(self, plex_client):
+        playlist = MagicMock()
+        playlist.title = "Victim Playlist"
+        plex_client.server.playlists.return_value = [playlist]
+        config = {"managed_playlists": {"Victim Playlist": {"unexpected": True}}}
+
+        deleted = plex_client.cleanup_orphaned_playlists([], config)
+
+        assert deleted == []
+        playlist.delete.assert_not_called()
+        plex_client.server.playlists.assert_not_called()
+
+    def test_mapping_in_the_blacklist_slot_deletes_nothing(self, plex_client):
+        playlist = MagicMock()
+        playlist.title = "Victim Playlist"
+        plex_client.server.playlists.return_value = [playlist]
+        config = {
+            "managed_playlists": ["Victim Playlist"],
+            "blacklisted_lists": {"Victim Playlist": True},
+        }
+
+        deleted = plex_client.cleanup_orphaned_playlists(["Victim Playlist"], config)
+
+        assert deleted == []
+        playlist.delete.assert_not_called()

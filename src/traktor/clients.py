@@ -2738,11 +2738,20 @@ class PlexClient:
         config: Dict[str, Any],
         dry_run: bool = False,
     ) -> List[str]:
-        deleted = []
-        to_delete = []
+        deleted: List[str] = []
+        to_delete: List[str] = []
 
         managed_playlists = config.get("managed_playlists", [])
         blacklisted_lists = config.get("blacklisted_lists", [])
+        if not isinstance(managed_playlists, list) or not isinstance(blacklisted_lists, list):
+            # A corrupt or hand-edited config can put a mapping here, whose keys
+            # would be read as managed playlist titles and deleted from Plex
+            # (issue #129). Nothing is deleted until the config is sane.
+            logger.error(
+                "Config managed_playlists/blacklisted_lists is not a list; "
+                "skipping playlist cleanup"
+            )
+            return deleted
         if blacklisted_lists:
             logger.info(f"Also removing {len(blacklisted_lists)} blacklisted playlist(s)")
             for playlist_name in blacklisted_lists:
