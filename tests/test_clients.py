@@ -3160,3 +3160,53 @@ class TestOrphanCleanupRefusesAWrongContainer:
 
         assert deleted == []
         playlist.delete.assert_not_called()
+
+
+class TestTraktRetryJitter:
+    """Trakt retries carry jitter so parallel workers stop retrying together (#125)."""
+
+    @pytest.fixture
+    def trakt_client(self, monkeypatch):
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_ID", "test-client-id")
+        monkeypatch.setattr(clients, "TRAKT_API_URL", "https://api.trakt.tv")
+        auth = MagicMock()
+        auth.get_headers.return_value = {"Authorization": "Bearer test-token"}
+        return clients.TraktClient(auth)
+
+    def test_a_server_error_retry_waits_a_jittered_delay(self, trakt_client, monkeypatch):
+        waits = []
+        monkeypatch.setattr(clients.time, "sleep", waits.append)
+        monkeypatch.setattr(clients, "add_jitter", lambda delay: 0.42)
+        monkeypatch.setattr(trakt_client._rate_limiter, "wait", lambda: None)
+
+        response_500 = MagicMock()
+        response_500.status_code = 500
+        response_200 = MagicMock()
+        response_200.status_code = 200
+
+        with patch.object(trakt_client._session, "get", side_effect=[response_500, response_200]):
+            response = trakt_client._request_with_retry(
+                "GET", "https://api.trakt.tv/test", headers={}
+            )
+
+        assert response.status_code == 200
+        assert waits == [0.42]
+
+    def test_a_rate_limit_keeps_the_header_as_a_lower_bound(self, trakt_client, monkeypatch):
+        waits = []
+        monkeypatch.setattr(clients.time, "sleep", waits.append)
+        monkeypatch.setattr(trakt_client._rate_limiter, "wait", lambda: None)
+        # Jitter only adds, so the delay handed to sleep is never below the
+        # delay add_jitter was given.
+        monkeypatch.setattr(clients, "add_jitter", lambda delay: delay + 0.25)
+
+        response_429 = MagicMock()
+        response_429.status_code = 429
+        response_429.headers = {"Retry-After": "12"}
+        response_200 = MagicMock()
+        response_200.status_code = 200
+
+        with patch.object(trakt_client._session, "get", side_effect=[response_429, response_200]):
+            trakt_client._request_with_retry("GET", "https://api.trakt.tv/test", headers={})
+
+        assert waits == [12.25]
