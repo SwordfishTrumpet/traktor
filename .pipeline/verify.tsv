@@ -99,3 +99,4 @@
 128	uv run pytest -q tests/test_history_manager.py -k "UnreadableStateFile or try_read_json_object"	0	data-integrity
 129	uv run pytest -q tests/test_config.py tests/test_clients.py -k "managed_list or non_string_entry or valid_config_is_returned or OrphanCleanupRefusesAWrongContainer"	0	security
 130	uv run pytest -q tests/test_official_lists.py -k PeriodSpellingIsCanonical	0	correctness
+131	uv run pytest -q tests/test_official_lists.py tests/test_log.py -k "CacheFreshnessIsAbsolute or JSONTimestampIsAnInstant"	0	correctness

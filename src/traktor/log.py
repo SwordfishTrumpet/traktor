@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import uuid
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 
 from .settings import DOCKER_MODE, LOG_FILE
@@ -52,7 +53,10 @@ class JSONFormatter(logging.Formatter):
 
     def format(self, record):
         log_data = {
-            "timestamp": self.formatTime(record),
+            # An absolute, zone-qualified instant. formatTime() rendered a naive
+            # local string, so the hour a DST change repeats produced identical
+            # timestamps for two different events (issue #131).
+            "timestamp": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
             "level": record.levelname,
             "logger": record.name,
             "message": record.getMessage(),

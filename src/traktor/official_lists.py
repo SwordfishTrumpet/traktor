@@ -5,7 +5,7 @@ caching, and deduplicating items from Trakt's official algorithmic lists.
 """
 
 import json
-from datetime import datetime, timedelta
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -119,9 +119,11 @@ class OfficialListsService:
         try:
             # Get TTL for this endpoint type
             ttl_hours = self.client.get_cache_ttl(endpoint_name)
-            cache_mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
-
-            if datetime.now() - cache_mtime > timedelta(hours=ttl_hours):
+            # Compare instants rather than wall-clock readings: a naive local
+            # subtraction is an hour off across a DST change, which made a stale
+            # cache look fresh (issue #131).
+            age_seconds = time.time() - cache_file.stat().st_mtime
+            if age_seconds > ttl_hours * 3600:
                 logger.debug(f"Cache expired for {endpoint_name} (TTL: {ttl_hours}h)")
                 return False
 

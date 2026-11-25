@@ -817,3 +817,37 @@ class TestPeriodSpellingIsCanonical:
         cache_file = service._get_cache_file("movies.played", canonical)
         assert cache_file.exists()
         assert "monthly item" in cache_file.read_text(encoding="utf-8")
+
+
+class TestCacheFreshnessIsAbsolute:
+    """Cache age is measured between instants, not between wall clocks (#131)."""
+
+    @pytest.fixture
+    def service(self, tmp_path):
+        with patch("traktor.trakt_official.TRAKT_CLIENT_ID", "test_client_id"):
+            return OfficialListsService(cache_dir=tmp_path)
+
+    def test_an_elapsed_4500s_over_a_3600s_ttl_is_expired(self, service, monkeypatch):
+        import os
+        from types import SimpleNamespace
+
+        from traktor import official_lists
+
+        items = [
+            {
+                "type": "movie",
+                "movie": {"title": "Movie 1", "year": 2024, "ids": {"imdb": "tt1111111"}},
+                "score": 10,
+            }
+        ]
+        service._save_cache("movies.trending", items)
+        cache_file = service._get_cache_file("movies.trending")
+        # 2024-11-03 05:30 UTC, which is 01:30 EDT.
+        before_fallback = 1730611800
+        os.utime(cache_file, (before_fallback, before_fallback))
+
+        # 06:45 UTC is 01:45 EST: 4500 seconds later, past the 1-hour TTL, even
+        # though the naive local subtraction counts only 15 minutes.
+        monkeypatch.setattr(official_lists, "time", SimpleNamespace(time=lambda: 1730616300))
+
+        assert service._is_cache_valid("movies.trending") is False
