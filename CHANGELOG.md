@@ -6,6 +6,86 @@ The format is based on Keep a Changelog and this project currently uses a simple
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-25
+
+Everything below is a fix, a hardening step or a documentation correction; there is no new
+user-facing feature and no configuration has to change. Two behaviour changes are called out in
+"Changed".
+
+### Changed
+
+- **A backup is reported as created only when it can be restored (issue #126)**
+  - `traktor --backup` exits 1 and says the snapshot failed when its manifest cannot be written,
+    and the incomplete directory is removed. The pre-sync backup path treats it the same way
+- **The config file must hold the value types traktor reads (issue #129)**
+  - `managed_playlists` and `blacklisted_lists` must be lists of strings, `plex_url` and
+    `plex_token` strings. A file that violates this is treated as corrupt and defaults are used,
+    instead of a mapping in `managed_playlists` making cleanup delete Plex playlists named by its
+    keys
+- Retries now carry jitter (issue #125): the eight workers and overlapping cron runs no longer
+  retry a recovering Trakt or Plex dependency in one synchronized wave. `max_delay` still caps the
+  deterministic backoff
+- A watch-state write that failed is reported as a failure (issue #127): a removal, restore or
+  timestamp advance no longer claims success when the file did not change
+- A watch-state file that cannot be read is left untouched (issue #128), instead of being replaced
+  with this run's rows and dropping another run's
+- Log timestamps are aware UTC instants and official-list cache age is measured in absolute time
+  (issue #131), so a daylight-saving change no longer repeats a timestamp or hides a stale cache
+
+### Security
+
+- **The Trakt login requires the state it issued on every callback (issue #10)**
+  - A pasted callback URL whose state is blank, missing or foreign is refused; `auth-helper.py`
+    now uses the same login path instead of exchanging any pasted code
+  - README and `.env.example` record what the out-of-band redirect URI cannot check, and name the
+    loopback redirect URI that can. Changing that default is still an open decision on issue #10
+- **Every GitHub action is pinned to a commit hash, and the actionlint artifact is
+  checksum-verified (issue #18)**: a fetched installer script no longer runs in CI, and the uv
+  version the workflows install is fixed
+- The Plex credential is written owner-only (issue #12); a restore refuses any item outside the
+  paths traktor backs up (issue #11); a destructive step with no terminal fails closed (issue #14)
+- A config file that is not valid UTF-8 is treated as corrupt instead of crashing every command
+  (issue #112); the library-cache structure check requires the right container per key (issue #113);
+  a doctored cache cannot reach an unchecked rating key (issue #41, #80)
+
+### Fixed
+
+- **List sync keeps a playlist it could not fetch (issue #105)**: a failed Trakt fetch no longer
+  makes the playlist look removed, no orphan cleanup runs while the live set is unknown, and the
+  run is recorded as failed. One refused official playlist no longer aborts the rest (issue #108)
+- **Watched shows are read from every page of Trakt's answer (issue #106)** and every page of the
+  liked-list, collection, watchlist and playback-progress reads too (issues #46, #92)
+- The missing-items report is written after the collection and watchlist sections (issue #110), so
+  their misses appear in `missing.txt`
+- An official-list period is normalized once (issue #130), so `Monthly` no longer caches weekly
+  data under the monthly file
+- A finishing sync writes back only the playlist list (issue #109), so a credential saved by
+  another run survives; two backup runs no longer delete each other's snapshots (issue #107)
+- The Trakt circuit breaker counts a 5xx that survived the retries (issue #122) and the Plex
+  breaker wraps Plex calls (issue #123); both read the tuning variables RUNBOOK.md documents
+  (issue #115)
+- The container healthcheck runs `--health-check`, which can report a bad config (issue #116)
+- `/status` records why a watch sync failed, including the show, not only an exit code (issue #124)
+- Watch sync: a failed show read fails the run instead of looking unwatched (issue #22); episode
+  snapshots make a delta pull cheap (issue #21) and a show with nothing to transfer is never read
+  (issue #39); removals carry a version so an overlapping run cannot resurrect them (issues #95,
+  #96); history state is pruned on every run (issues #68, #69)
+- Overlapping runs of the shared state files are merged under a lock (issues #64, #65, #67), and a
+  foreign directory beside the backups survives retention (issues #84, #89, #98)
+- `--workers 0` and other impossible numeric values are refused at startup (issue #111); a wheel
+  install reports its real version (issue #114); the runbook's rollback downloads the wheel where
+  it installs it (issue #118)
+- `setup.sh` exits non-zero when uv or the dependency sync fails (issue #119) and creates the
+  `.env` it tells the user to edit (issue #121); `auth-helper.py` no longer claims a refused token
+  save (issue #120); CI runs the suite with warnings as errors (issue #117)
+- `--diagnose` resolves saved Plex credentials without prompting (issue #62); the container setup
+  scripts create every directory compose mounts (issue #87); composed health endpoints register
+  their checks in one place (issue #61); the official-list cache is keyed by period (issue #66)
+- Memory figures share one platform-aware converter (issue #63); the cache belongs to one Plex
+  account (issue #102); the token store is the `.env` the loader opened (issue #103)
+- Backup retention uses the documented settings (issues #84, #89, #98); gzip reads are bounded
+  (issue #81); official playlists are keyed by title across periods (issue #82)
+
 ## [1.1.1] - 2026-11-20
 
 ### Added

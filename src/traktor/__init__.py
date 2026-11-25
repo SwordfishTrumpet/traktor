@@ -1,6 +1,6 @@
 """Traktor - Sync Trakt liked lists to Plex playlists."""
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 from .cli import main
 
