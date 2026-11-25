@@ -5,33 +5,14 @@ import sys
 sys.path.insert(0, "src")
 
 from traktor.clients import TraktAuth
+from traktor.sync import authenticate_trakt
 
 auth = TraktAuth()
 
-print("\nTrakt Authentication")
-print("===================")
-print("\n1. Visit this URL in your browser:")
-print(f"   {auth.get_auth_url()}")
-print("\n2. Log in to Trakt and authorize the application")
-print("3. Copy the authorization code from the page")
-print()
-
-auth_code = input("Authorization code: ").strip()
-
-if not auth_code:
-    print("Error: No code entered")
-    sys.exit(1)
-
-try:
-    # authenticate() reports whether the tokens reached the .env store as well
-    # as being accepted by Trakt. Telling the user they were saved when the
-    # write was refused lost the credential with the process (issue #120).
-    if not auth.authenticate(auth_code):
-        print("\nAuthenticated with Trakt, but the tokens were not saved.")
-        print("Create a .env file (cp .env.example .env) and run this again.")
-        sys.exit(1)
-    print("\nSuccessfully authenticated with Trakt!")
-    print("Tokens saved. You can now run traktor with watch sync.")
-except Exception as e:
-    print(f"\nError: {e}")
+# One login path only. This helper used to print an authorization URL and then
+# call TraktAuth.authenticate() directly, which took no state: a code from
+# anyone's login was exchangeable here even though the main flow refuses it
+# (issue #10). authenticate_trakt() issues the state, refuses a callback that
+# does not carry it, and reports a refused token save (issue #120).
+if not authenticate_trakt(auth, force=True):
     sys.exit(1)

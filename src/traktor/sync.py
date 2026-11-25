@@ -1064,17 +1064,42 @@ def _extract_auth_state(value: str) -> Optional[str]:
         value: Raw pasted text
 
     Returns:
-        The state string, or None when the input carries no state parameter
-        (the out-of-band flow shows only the authorization code).
+        The state string, an empty string when the parameter is there but blank,
+        or None when the input carries no state parameter at all. The blank case
+        is reported rather than dropped, because ``parse_qs`` discarding it made
+        a callback with ``state=`` look like a bare authorization code (#10).
     """
     v = value.strip()
     if "state=" not in v:
         return None
     query = v.split("?", 1)[1] if "?" in v else v
-    states = parse_qs(query).get("state")
+    states = parse_qs(query, keep_blank_values=True).get("state")
     if states:
         return states[0]
     return None
+
+
+def _pasted_input_is_acceptable(value: str, expected_state: Optional[str]) -> bool:
+    """Return True when a pasted line may be exchanged for tokens (issue #10).
+
+    Pasting a bare authorization code is the documented path for a headless box,
+    where the browser shows only the code. A pasted callback URL must carry the
+    state this login issued: a URL with someone else's state, with the state
+    blanked, or with the parameter removed is refused instead of being treated
+    as "no state" and exchanged.
+
+    Args:
+        value: Raw pasted text
+        expected_state: The state this login issued, or None when none was issued
+
+    Returns:
+        True when the input may be used
+    """
+    if expected_state is None:
+        return True
+    if "code=" not in value:
+        return True
+    return _extract_auth_state(value) == expected_state
 
 
 def _collect_auth_code(auth_url: str, expected_state: Optional[str]) -> Optional[str]:
@@ -1192,12 +1217,7 @@ def _collect_auth_code(auth_url: str, expected_state: Optional[str]) -> Optional
         if ready:
             line = sys.stdin.readline()
             if line:
-                pasted_state = _extract_auth_state(line)
-                if (
-                    pasted_state is not None
-                    and expected_state is not None
-                    and pasted_state != expected_state
-                ):
+                if not _pasted_input_is_acceptable(line, expected_state):
                     logger.error("Refused pasted callback: state does not match this login")
                     print(
                         "   That callback does not belong to this login "

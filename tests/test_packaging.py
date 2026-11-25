@@ -388,3 +388,58 @@ def test_setup_does_not_overwrite_an_existing_env(tmp_path):
 
     assert _run_setup(tmp_path, stub).returncode == 0
     assert "mine" in (tmp_path / ".env").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Issue #18: the build pipeline ran a downloaded installer and unpinned tools
+# ---------------------------------------------------------------------------
+
+
+def _workflow_files():
+    return sorted((ROOT / ".github" / "workflows").glob("*.yml"))
+
+
+def test_every_action_is_pinned_to_a_commit():
+    """A moving tag runs whatever upstream publishes next, with our token (#18)."""
+    import re
+
+    references = []
+    for workflow in _workflow_files():
+        for line in workflow.read_text(encoding="utf-8").splitlines():
+            match = re.match(r"\s*(?:-\s*)?uses:\s*(\S+)", line)
+            if match:
+                references.append((workflow.name, match.group(1), line))
+
+    assert references, "no action references found"
+    for name, reference, line in references:
+        assert re.search(r"@[0-9a-f]{40}$", reference), f"{name}: not pinned: {reference}"
+        assert "#" in line, f"{name}: pinned without a version comment: {line.strip()}"
+
+
+def test_the_actionlint_install_verifies_a_pinned_artifact():
+    """The installer script was fetched and executed on every run (#18)."""
+    import re
+
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    step = ci.split("Install actionlint", 1)[1].split("- name:", 1)[0]
+
+    assert "<(curl" not in step, "the installer is still executed from the network"
+    assert "| bash" not in step and "|bash" not in step
+    assert re.search(r"sha256sum -c -", step), "the artifact is not checksum verified"
+    assert re.search(r"version=\d+\.\d+\.\d+", step), "the artifact version is not pinned"
+
+
+def test_ci_pins_the_tool_versions_it_installs():
+    """`version: latest` installs whatever is newest at run time (#18)."""
+    for workflow in _workflow_files():
+        text = workflow.read_text(encoding="utf-8")
+        assert 'version: "latest"' not in text, workflow.name
+        assert "version: latest" not in text, workflow.name
+
+
+def test_codeql_can_be_dispatched_by_hand():
+    """A silently disabled schedule needs a manual run to tell (#40)."""
+    codeql = (ROOT / ".github" / "workflows" / "codeql.yml").read_text(encoding="utf-8")
+
+    trigger_block = codeql.split("jobs:", 1)[0]
+    assert "workflow_dispatch:" in trigger_block
