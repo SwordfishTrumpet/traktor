@@ -155,6 +155,10 @@ uv sync
 cp .env.example .env  # then edit .env with your credentials
 ```
 
+`./setup.sh` does the last two steps for you: it syncs the dependencies and copies
+`.env.example` to `.env` (owner-only, and never over an existing `.env`), and it stops
+with a non-zero exit if either step fails.
+
 `uv sync` installs the runtime and the development tools in one step, because they live in the project's dependency groups.
 
 That is the supported install: traktor is not published to a package index. A tagged release is a GitHub Release whose assets are the wheel and sdist that workflow built, so `uv pip install "https://github.com/SwordfishTrumpet/traktor/releases/latest/download/traktor-<version>-py3-none-any.whl"` also works when you want a specific release rather than a checkout.
@@ -553,7 +557,7 @@ Three things are worth watching:
 | "incomplete Plex credentials" | Only one of `PLEX_URL` and `PLEX_TOKEN` is set | Set both, or neither to be prompted |
 | A film shows as watched in the wrong place | The other side has a newer timestamp | `--watch-conflict=plex` or `trakt`, or fix the timestamp at the source |
 | Nothing happens on the first list run | No official lists enabled, or none configured | Check `TRAKTOR_OFFICIAL_LISTS_ENABLED` and `--official-endpoints` |
-| Circuit breaker reports OPEN | Trakt or Plex is failing repeatedly | Wait the cooldown (60s Trakt, 30s Plex) or check `--circuit-status` |
+| Circuit breaker reports OPEN | Trakt or Plex is failing repeatedly | Wait the cooldown (60s Trakt, 30s Plex unless `TRAKTOR_TRAKT_COOLDOWN_SECONDS` or `TRAKTOR_PLEX_COOLDOWN_SECONDS` say otherwise) or check `--circuit-status` |
 | Playlists exist but other users cannot see them | Playlist was created with a managed-user token | Re-run with the server owner's token |
 | A restore refuses to run | The backup manifest names a path this build did not write | Restore the backup by hand from the paths it lists |
 | Every run warns about memory | The threshold is below your steady state | Raise `TRAKTOR_MAX_MEMORY_MB`, or ignore it: nothing is capped |
@@ -583,7 +587,7 @@ uv run mypy src/
 uv run black src/ tests/
 ```
 
-`make test`, `make lint` and `make format` wrap the same commands. `make lint` is the check CI runs: formatting (`black --check`, also available alone as `make format-check`) and the linter (`ruff`), so a green local run predicts a green CI job. The Python floor is 3.10.
+`make test` runs the suite with warnings as errors, the same command CI runs; `make lint` and `make format` wrap the checks above. `make lint` is the check CI runs: formatting (`black --check`, also available alone as `make format-check`) and the linter (`ruff`), so a green local run predicts a green CI job. The Python floor is 3.10.
 
 ## 31. Repository layout
 

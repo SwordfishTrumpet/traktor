@@ -51,7 +51,9 @@ services:
     
     # Health check
     healthcheck:
-      test: ["CMD", "uv", "run", "traktor", "--diagnose"]
+      # The container is unhealthy when its config cannot be read, which is
+      # what --health-check answers and --diagnose did not (issue #116).
+      test: ["CMD", "uv", "run", "traktor", "--health-check"]
       interval: 1m
       timeout: 30s
       retries: 3

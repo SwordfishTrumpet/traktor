@@ -356,3 +356,31 @@ class TestSetupLoggingStructured:
         data = json.loads(result)
         assert data["correlation_id"] == "auto-cid"
         set_correlation_id(None)
+
+
+class TestJSONTimestampIsAnInstant:
+    """Two instants in a repeated DST hour must not serialize alike (issue #131)."""
+
+    @staticmethod
+    def _timestamp_for(created):
+        formatter = JSONFormatter()
+        record = logging.LogRecord(
+            name="traktor",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=1,
+            msg="Test message",
+            args=(),
+            exc_info=None,
+        )
+        record.created = created
+        return json.loads(formatter.format(record))["timestamp"]
+
+    def test_an_absolute_utc_timestamp_is_emitted(self):
+        # 2024-11-03 05:30 UTC is 01:30 EDT; 06:30 UTC is the second 01:30, EST.
+        before_fallback = self._timestamp_for(1730611800)
+        after_fallback = self._timestamp_for(1730615400)
+
+        assert before_fallback == "2024-11-03T05:30:00+00:00"
+        assert after_fallback == "2024-11-03T06:30:00+00:00"
+        assert before_fallback != after_fallback

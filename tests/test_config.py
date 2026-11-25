@@ -341,3 +341,57 @@ def test_failed_config_save_keeps_the_previous_file(tmp_path, monkeypatch):
 
     assert target.read_text(encoding="utf-8") == before
     assert "kept" in before
+
+
+# ---------------------------------------------------------------------------
+# Issue #112: a config that is not valid UTF-8 aborted every command
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_uses_defaults_for_invalid_utf8(tmp_path, monkeypatch):
+    from traktor import config as config_module
+
+    config_file = tmp_path / ".traktor_config.json"
+    config_file.write_bytes(b'{"managed_playlists": ["Caf\xe9"]}')
+    monkeypatch.setattr(config_module, "CONFIG_FILE", config_file)
+
+    assert config_module.load_config() == {}
+
+
+def test_a_mapping_where_the_managed_list_belongs_is_corrupt(tmp_path, monkeypatch):
+    """managed_playlists names playlists to delete, so a mapping is corrupt (#129)."""
+    config_file = tmp_path / ".traktor_config.json"
+    config_file.write_text(
+        json.dumps({"managed_playlists": {"Victim Playlist": {"unexpected": True}}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_FILE", config_file)
+
+    assert config.load_config() == {}
+
+
+def test_a_non_string_entry_in_a_list_key_is_corrupt(tmp_path, monkeypatch):
+    """A list of the wrong element type would reach Plex as a playlist title (#129)."""
+    config_file = tmp_path / ".traktor_config.json"
+    config_file.write_text(
+        json.dumps({"blacklisted_lists": [{"name": "Victim Playlist"}]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config, "CONFIG_FILE", config_file)
+
+    assert config.load_config() == {}
+
+
+def test_a_valid_config_is_returned_unchanged(tmp_path, monkeypatch):
+    """The schema must not reject the shape this build writes."""
+    config_file = tmp_path / ".traktor_config.json"
+    saved = {
+        "managed_playlists": ["Trakt Official - Movies"],
+        "blacklisted_lists": [],
+        "plex_url": "http://plex.local:32400",
+        "plex_token": "token",
+    }
+    config_file.write_text(json.dumps(saved), encoding="utf-8")
+    monkeypatch.setattr(config, "CONFIG_FILE", config_file)
+
+    assert config.load_config() == saved

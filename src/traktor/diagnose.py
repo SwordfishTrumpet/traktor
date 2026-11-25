@@ -7,6 +7,7 @@ Provides comprehensive system checks for:
 - Common issues and suggestions
 """
 
+import json
 import os
 import platform
 import sys
@@ -25,6 +26,20 @@ from .settings import (
     TRAKT_CLIENT_ID,
     TRAKT_CLIENT_SECRET,
 )
+
+
+def _config_file_is_readable() -> bool:
+    """Return True when the config file parses as a JSON object.
+
+    diagnose used to treat an existing file as a passing check, so a
+    corrupt config was reported healthy (issue #116).
+    """
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            return isinstance(json.load(f), dict)
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+        logger.debug(f"Config file is not readable JSON: {e}")
+        return False
 
 
 @dataclass
@@ -227,20 +242,34 @@ class DiagnoseCommand:
         # Check config file
         config = load_config()
         if CONFIG_FILE.exists():
-            self._add_result(
-                "Config File",
-                "pass",
-                f"Config file exists ({CONFIG_FILE})",
-            )
-
-            # Check for managed playlists
-            managed = config.get("managed_playlists", [])
-            if managed:
+            # Existing is not the same as readable: the file is parsed here
+            # so a corrupt config fails this check instead of passing it,
+            # which is what the shipped container healthcheck reported
+            # (issue #116).
+            if not _config_file_is_readable():
                 self._add_result(
-                    "Managed Playlists",
-                    "pass",
-                    f"{len(managed)} playlist(s) being tracked",
+                    "Config File",
+                    "fail",
+                    f"Config file is not readable JSON ({CONFIG_FILE})",
+                    suggestions=[
+                        "Fix the JSON, or delete the file to fall back to defaults",
+                    ],
                 )
+            else:
+                self._add_result(
+                    "Config File",
+                    "pass",
+                    f"Config file exists and parses ({CONFIG_FILE})",
+                )
+
+                # Check for managed playlists
+                managed = config.get("managed_playlists", [])
+                if managed:
+                    self._add_result(
+                        "Managed Playlists",
+                        "pass",
+                        f"{len(managed)} playlist(s) being tracked",
+                    )
         else:
             self._add_result(
                 "Config File",

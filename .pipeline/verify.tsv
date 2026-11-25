@@ -70,3 +70,33 @@
 94	uv run pytest -q tests/test_clients.py::test_playback_progress_reads_each_item_once	0	performance
 95	uv run pytest -q tests/test_history_manager.py::TestOverlappingRemovals	0	data-integrity
 96	uv run pytest -q tests/test_history_manager.py::TestUnkeyedRows	0	correctness
+105	uv run pytest -q tests/test_sync.py tests/test_official_lists.py -k fetch_keeps	0	correctness
+105	uv run pytest -q tests/test_official_lists.py -k failed_endpoint	0	correctness
+106	uv run pytest -q tests/test_clients.py -k watched_shows_are_read	0	correctness
+107	uv run pytest -q tests/test_resilience.py -k TestOverlappingBackups	0	operations
+108	uv run pytest -q tests/test_sync.py -k refused_official_playlist	0	correctness
+109	uv run pytest -q tests/test_clients.py -k orphan_cleanup_keeps_a_config	0	data-integrity
+110	uv run pytest -q tests/test_sync.py -k collection_misses_reach_the_report	0	usability
+111	uv run pytest -q tests/test_cli.py -k numeric_options	0	correctness
+112	uv run pytest -q tests/test_config.py -k invalid_utf8	0	portability
+112	uv run pytest -q tests/test_cli.py -k non_utf8_config	0	portability
+113	uv run pytest -q tests/test_clients.py -k TestCacheContainerTypes	0	security
+114	uv run pytest -q tests/test_auto_update.py -k wheel_install_reports	0	correctness
+115	uv run pytest -q tests/test_resilience.py -k documented_variables	0	deployment
+116	uv run pytest -q tests/test_diagnose.py -k config_check	0	observability
+116	uv run pytest -q tests/test_packaging.py -k healthcheck	0	observability
+117	uv run pytest -q tests/test_packaging.py -k readme_says	0	build
+118	uv run pytest -q tests/test_packaging.py -k downloads_the_wheel	0	build
+119	uv run pytest -q tests/test_packaging.py -k setup_fails	0	deployment
+120	uv run pytest -q tests/test_clients.py -k authenticate_reports	0	compatibility
+121	uv run pytest -q tests/test_packaging.py -k creates_the_env	0	compatibility
+122	uv run pytest -q tests/test_clients.py -k opens_the_trakt_circuit_breaker	0	reliability
+123	uv run pytest -q tests/test_clients.py -k counted_by_the_plex_circuit_breaker	0	reliability
+124	uv run pytest -q tests/test_sync.py -k names_the_show_a_failed_watch_sync	0	observability
+125	uv run pytest -q tests/test_resilience.py -k "jitter or eight_concurrent_clients"	0	reliability
+126	uv run pytest -q tests/test_resilience.py::test_a_backup_that_cannot_be_completed_is_a_failure tests/test_cli.py::test_run_backup_reports_a_failed_snapshot	0	usability
+127	uv run pytest -q tests/test_history_manager.py -k "FailedWritesAreReported"	0	correctness
+128	uv run pytest -q tests/test_history_manager.py -k "UnreadableStateFile or try_read_json_object"	0	data-integrity
+129	uv run pytest -q tests/test_config.py tests/test_clients.py -k "managed_list or non_string_entry or valid_config_is_returned or OrphanCleanupRefusesAWrongContainer"	0	security
+130	uv run pytest -q tests/test_official_lists.py -k PeriodSpellingIsCanonical	0	correctness
+131	uv run pytest -q tests/test_official_lists.py tests/test_log.py -k "CacheFreshnessIsAbsolute or JSONTimestampIsAnInstant"	0	correctness

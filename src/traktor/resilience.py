@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import json
 import os
+import random
 import shutil
 import threading
 import time
@@ -17,7 +18,17 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .log import logger
-from .settings import CACHE_DIR, CONFIG_FILE, ENV_FILE, TRAKTOR_BACKUP_DIR, TRAKTOR_MAX_BACKUPS
+from .settings import (
+    CACHE_DIR,
+    CONFIG_FILE,
+    ENV_FILE,
+    TRAKTOR_BACKUP_DIR,
+    TRAKTOR_MAX_BACKUPS,
+    TRAKTOR_PLEX_COOLDOWN_SECONDS,
+    TRAKTOR_PLEX_FAILURE_THRESHOLD,
+    TRAKTOR_TRAKT_COOLDOWN_SECONDS,
+    TRAKTOR_TRAKT_FAILURE_THRESHOLD,
+)
 from .utils import (
     DecompressionLimitError,
     file_lock,
@@ -375,7 +386,7 @@ class BackupManager:
             ("cache", CACHE_DIR),
         ]
 
-    def create_backup(self, reason: str = "manual") -> Path:
+    def create_backup(self, reason: str = "manual") -> Optional[Path]:
         """Create a backup of all traktor state.
 
         The directory is created exclusively (``exist_ok=False``) and its name
@@ -387,11 +398,24 @@ class BackupManager:
             reason: Reason for backup (manual, scheduled, pre_sync, etc.)
 
         Returns:
-            Path to created backup
+            Path to the created backup, or None when it could not be completed.
+            A snapshot without a manifest cannot be restored, so it is removed
+            rather than reported as a usable backup (issue #126).
         """
-        backup_path = self._create_backup_dir(reason)
+        final_path = self._create_backup_dir(reason)
+        # Fill a hidden staging directory first, so another run's retention
+        # sweep cannot count, or delete, a snapshot whose manifest is not
+        # written yet. The directory is published under its real name when it
+        # is complete (issue #107).
+        working_path = final_path.with_name(f".{final_path.name}.partial")
+        try:
+            final_path.rename(working_path)
+        except OSError as e:
+            logger.debug(f"Could not stage backup in {working_path}: {e}")
+            working_path = final_path
+        backup_path = working_path
 
-        logger.info(f"Creating backup: {backup_path.name}")
+        logger.info(f"Creating backup: {final_path.name}")
 
         # Backup each item
         manifest: Dict[str, Any] = {
@@ -422,7 +446,22 @@ class BackupManager:
         manifest_path = backup_path / "manifest.json"
         if not write_json_atomic(manifest_path, manifest, mode=0o600):
             logger.error(f"Failed to write backup manifest: {manifest_path}")
-            return backup_path
+            # An incompletely written snapshot cannot be restored, so it must
+            # not survive as something a retention sweep counts or an operator
+            # restores (issue #126).
+            shutil.rmtree(backup_path, ignore_errors=True)
+            return None
+
+        # Publish the finished snapshot under its retention-visible name. A
+        # snapshot only becomes visible once it can be restored (issue #107).
+        if working_path != final_path:
+            try:
+                working_path.rename(final_path)
+            except OSError as e:
+                logger.error(f"Could not publish backup {final_path.name}: {e}")
+                shutil.rmtree(working_path, ignore_errors=True)
+                return None
+            backup_path = final_path
 
         # Cleanup old backups
         self._cleanup_old_backups()
@@ -763,15 +802,25 @@ class BackupManager:
         consider every directory under the backup location, so a folder the user
         kept there was deleted once the count passed the limit (issue #84).
         """
-        backups = sorted(
-            [d for d in self.backup_dir.iterdir() if _is_backup_dir(d)],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
+        # Two runs may sweep the same directory at once: a snapshot can vanish
+        # between the listing and the removal, and a sweep must not die on a
+        # path another run already removed (issue #107).
+        candidates: List[tuple] = []
+        for path in self.backup_dir.iterdir():
+            if not _is_backup_dir(path):
+                continue
+            try:
+                candidates.append((path.stat().st_mtime, path))
+            except OSError:
+                logger.debug(f"Backup vanished before cleanup: {path.name}")
+        candidates.sort(key=lambda entry: entry[0], reverse=True)
 
-        for old_backup in backups[self.max_backups :]:
+        for _, old_backup in candidates[self.max_backups :]:
             logger.info(f"Removing old backup: {old_backup.name}")
-            shutil.rmtree(old_backup)
+            try:
+                shutil.rmtree(old_backup)
+            except FileNotFoundError:
+                logger.debug(f"Backup already removed by another run: {old_backup.name}")
 
     def list_backups(self) -> List[Dict[str, Any]]:
         """List all available backups with metadata."""
@@ -962,6 +1011,31 @@ class IntegrityChecker:
             return True
 
 
+# At most this share of a computed retry delay is added back at random, so
+# clients that fail together do not retry together (issue #125).
+RETRY_JITTER_FRACTION = 0.5
+
+
+def add_jitter(delay: float) -> float:
+    """Return ``delay`` plus a random share of it, never less than ``delay``.
+
+    Parallel workers retry a shared dependency on the same schedule, so they
+    come back in one synchronized wave and hit the dependency exactly as it
+    recovers. Adding a random share - rather than subtracting - keeps a
+    server-supplied ``Retry-After`` a lower bound while still spreading the
+    clients apart (issue #125).
+
+    Args:
+        delay: Deterministic delay in seconds
+
+    Returns:
+        A delay between ``delay`` and ``delay * (1 + RETRY_JITTER_FRACTION)``
+    """
+    if delay <= 0:
+        return 0.0
+    return delay + random.uniform(0.0, delay * RETRY_JITTER_FRACTION)
+
+
 def retry_with_backoff(
     max_retries: int = 3,
     base_delay: float = 1.0,
@@ -1017,7 +1091,7 @@ def retry_with_backoff(
                     if not should_retry or attempt >= max_retries:
                         raise
 
-                    delay = min(base_delay * (2**attempt), max_delay)
+                    delay = add_jitter(min(base_delay * (2**attempt), max_delay))
                     logger.warning(
                         f"[{name}] Attempt {attempt + 1}/{max_retries + 1} failed: {e}. "
                         f"Retrying in {delay:.1f}s..."
@@ -1104,13 +1178,21 @@ class SyncProgress:
         }
 
 
-# Global instances for mission-critical components
+# Global instances for mission-critical components. The thresholds and
+# cooldowns are read from the variables RUNBOOK.md documents, so an operator
+# can make a failing dependency fail fast (issue #115).
 trakt_circuit_breaker = CircuitBreaker(
-    failure_threshold=5, success_threshold=2, cooldown_seconds=60.0, name="trakt_api"
+    failure_threshold=TRAKTOR_TRAKT_FAILURE_THRESHOLD,
+    success_threshold=2,
+    cooldown_seconds=TRAKTOR_TRAKT_COOLDOWN_SECONDS,
+    name="trakt_api",
 )
 
 plex_circuit_breaker = CircuitBreaker(
-    failure_threshold=3, success_threshold=2, cooldown_seconds=30.0, name="plex_api"
+    failure_threshold=TRAKTOR_PLEX_FAILURE_THRESHOLD,
+    success_threshold=2,
+    cooldown_seconds=TRAKTOR_PLEX_COOLDOWN_SECONDS,
+    name="plex_api",
 )
 
 health_checker = HealthCheck()

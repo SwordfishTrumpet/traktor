@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -25,6 +26,32 @@ from .resilience import (
 from .resource_manager import ResourceManager
 from .settings import HEALTH_SERVER_PORT, MAX_WORKERS, ensure_dirs
 from .sync import sync_lists
+
+
+def _positive_int(value):
+    """Parse a whole number that has to be one or more (issue #111).
+
+    ``--workers 0`` used to reach ThreadPoolExecutor and abort the run after
+    authentication and the cache work; a negative value did the same.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected a whole number, got {value!r}")
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {number}")
+    return number
+
+
+def _cpu_percent(value):
+    """Parse a CPU percentage in (0, 100]. ``nan`` and ``inf`` are refused."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}")
+    if not math.isfinite(number) or not 0 < number <= 100:
+        raise argparse.ArgumentTypeError(f"must be above 0 and at most 100, got {value}")
+    return number
 
 
 def parse_args():
@@ -55,9 +82,9 @@ def parse_args():
     parser.add_argument(
         "--workers",
         "-w",
-        type=int,
+        type=_positive_int,
         default=MAX_WORKERS,
-        help=f"Number of parallel workers (default: {MAX_WORKERS})",
+        help=f"Number of parallel workers, 1 or more (default: {MAX_WORKERS})",
     )
 
     # Watch sync arguments
@@ -249,18 +276,18 @@ def parse_args():
     )
     parser.add_argument(
         "--max-memory-mb",
-        type=int,
+        type=_positive_int,
         default=None,
         help=(
-            "Log a warning once memory use passes this many MB (default: 512); "
-            "this is a threshold, not a hard limit"
+            "Log a warning once memory use passes this many MB, 1 or more "
+            "(default: 512); this is a threshold, not a hard limit"
         ),
     )
     parser.add_argument(
         "--cpu-throttle",
-        type=float,
+        type=_cpu_percent,
         default=None,
-        help="Target CPU usage percentage (0-100) for throttling",
+        help="Target CPU usage percentage, above 0 and up to 100, for throttling",
     )
 
     return parser.parse_args()
@@ -292,7 +319,13 @@ def _register_health_checks() -> None:
             # A config that is valid JSON but not an object is corrupt, and
             # load_config falls back to defaults for it (issue #47).
             return isinstance(config, dict)
-        except (json.JSONDecodeError, FileNotFoundError, PermissionError, OSError):
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            FileNotFoundError,
+            PermissionError,
+            OSError,
+        ):
             return False
 
     health_checker.register("cache", check_cache_exists)
@@ -327,6 +360,12 @@ def _run_backup(args):
     """Create a backup."""
     print("Creating backup...")
     backup_path = backup_manager.create_backup(reason="manual")
+    if backup_path is None:
+        # A snapshot that could not be completed cannot be restored, so saying
+        # it was created would send the operator into a recovery with nothing
+        # to recover from (issue #126).
+        print("❌ Backup failed: the snapshot could not be completed")
+        return 1
     print(f"✅ Backup created: {backup_path}")
     return 0
 

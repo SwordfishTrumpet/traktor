@@ -669,3 +669,102 @@ class TestUnkeyedRows:
             "episode",
             "movie",
         ]
+
+
+# ---------------------------------------------------------------------------
+# Issue #127: a failed write is reported, not reported as success
+# ---------------------------------------------------------------------------
+
+
+class TestFailedWritesAreReported:
+    """A mutator must not claim a change the file does not hold (issue #127)."""
+
+    def test_save_state_reports_success(self, mock_history_manager):
+        assert mock_history_manager.save_state() is True
+
+    def test_remove_reports_a_failed_write(self, mock_history_manager, monkeypatch):
+        mock_history_manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt1", plex_rating_key=1
+        )
+        assert mock_history_manager.save_state() is True
+        monkeypatch.setattr(history_manager, "write_json_atomic", lambda *a, **k: False)
+
+        assert mock_history_manager.remove_synced_item(plex_rating_key=1) is False
+
+    def test_timestamp_does_not_advance_after_a_failed_write(
+        self, mock_history_manager, monkeypatch
+    ):
+        monkeypatch.setattr(history_manager, "write_json_atomic", lambda *a, **k: False)
+
+        assert mock_history_manager.update_last_sync_timestamp() is False
+        assert mock_history_manager.get_last_sync_timestamp() is None
+
+    def test_restore_reports_a_failed_write(self, mock_history_manager, tmp_path, monkeypatch):
+        mock_history_manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt2", plex_rating_key=2
+        )
+        assert mock_history_manager.save_state() is True
+        backup = mock_history_manager.backup_state(tmp_path / "state.json.backup")
+        assert backup is not None
+        assert mock_history_manager.clear_all() is True
+
+        monkeypatch.setattr(history_manager, "write_json_atomic", lambda *a, **k: False)
+
+        assert mock_history_manager.restore_from_backup(backup) is False
+
+    def test_clear_reports_a_failed_write(self, mock_history_manager, monkeypatch):
+        monkeypatch.setattr(history_manager, "write_json_atomic", lambda *a, **k: False)
+
+        assert mock_history_manager.clear_all() is False
+
+
+# ---------------------------------------------------------------------------
+# Issue #128: an unreadable state file is not replaced
+# ---------------------------------------------------------------------------
+
+
+class TestUnreadableStateFile:
+    """Only a missing file may be replaced with this run's rows (issue #128)."""
+
+    def test_an_unreadable_file_keeps_the_other_runs_rows(
+        self, temp_state_file, mock_history_manager, monkeypatch
+    ):
+        mock_history_manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="ttA", plex_rating_key=1
+        )
+        assert mock_history_manager.save_state() is True
+        before = temp_state_file.read_text(encoding="utf-8")
+
+        mock_history_manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="ttA2", plex_rating_key=2
+        )
+        monkeypatch.setattr(history_manager, "try_read_json_object", lambda path: (False, {}))
+
+        assert mock_history_manager.save_state() is False
+        assert temp_state_file.read_text(encoding="utf-8") == before
+        assert "ttA2" not in before
+
+    def test_a_missing_file_is_written(self, temp_state_file, mock_history_manager):
+        assert not temp_state_file.exists()
+        mock_history_manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="ttB", plex_rating_key=3
+        )
+
+        assert mock_history_manager.save_state() is True
+        assert "ttB" in temp_state_file.read_text(encoding="utf-8")
+
+
+def test_try_read_json_object_separates_unreadable_from_missing(tmp_path):
+    """The shared reader reports a file it could not parse (issue #128)."""
+    from traktor.utils import try_read_json_object
+
+    missing = tmp_path / "missing.json"
+    assert try_read_json_object(missing) == (True, {})
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    assert try_read_json_object(broken) == (False, {})
+
+    good = tmp_path / "good.json"
+    good.write_text('{"a": 1}', encoding="utf-8")
+    assert try_read_json_object(good) == (True, {"a": 1})

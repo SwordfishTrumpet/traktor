@@ -5,9 +5,9 @@ caching, and deduplicating items from Trakt's official algorithmic lists.
 """
 
 import json
-from datetime import datetime, timedelta
+import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 
@@ -42,6 +42,11 @@ class OfficialListsService:
         self.client = TraktOfficialClient(client_id)
         self.cache_dir = cache_dir or CACHE_DIR / "official_lists"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Endpoints whose fetch failed and had no cached answer to fall back on.
+        # The caller must not treat such an endpoint as "this list is gone": the
+        # empty result it returned is a failure, and acting on it deleted the
+        # playlist the endpoint owns (issue #105).
+        self.failed_endpoints: Set[str] = set()
         logger.debug("OfficialListsService initialized")
 
     def _get_cache_file(self, endpoint_name: str, period: str = "weekly") -> Path:
@@ -114,9 +119,11 @@ class OfficialListsService:
         try:
             # Get TTL for this endpoint type
             ttl_hours = self.client.get_cache_ttl(endpoint_name)
-            cache_mtime = datetime.fromtimestamp(cache_file.stat().st_mtime)
-
-            if datetime.now() - cache_mtime > timedelta(hours=ttl_hours):
+            # Compare instants rather than wall-clock readings: a naive local
+            # subtraction is an hour off across a DST change, which made a stale
+            # cache look fresh (issue #131).
+            age_seconds = time.time() - cache_file.stat().st_mtime
+            if age_seconds > ttl_hours * 3600:
                 logger.debug(f"Cache expired for {endpoint_name} (TTL: {ttl_hours}h)")
                 return False
 
@@ -281,6 +288,12 @@ class OfficialListsService:
         Returns:
             List of items from the endpoint
         """
+        # One canonical spelling for the cache key and the request. Forwarding
+        # the raw value let "Monthly" pass the cache key (which lowercases) while
+        # the API client rejected it and fetched weekly data, which was then
+        # served as the monthly list (issue #130).
+        period = self._valid_period(period)
+
         # Try cache first
         if use_cache:
             cached = self._load_cache(endpoint_name, period)
@@ -303,6 +316,7 @@ class OfficialListsService:
                 stale = self._load_stale_cache(endpoint_name, period)
                 if stale is not None:
                     return stale
+            self.failed_endpoints.add(endpoint_name)
             return []
         except (KeyError, ValueError, TypeError) as e:
             logger.error(f"Data error fetching {endpoint_name}: {e}")
@@ -310,6 +324,7 @@ class OfficialListsService:
                 stale = self._load_stale_cache(endpoint_name, period)
                 if stale is not None:
                     return stale
+            self.failed_endpoints.add(endpoint_name)
             return []
         except Exception as e:
             logger.error(f"Unexpected error fetching {endpoint_name}: {e}")
@@ -317,6 +332,7 @@ class OfficialListsService:
                 stale = self._load_stale_cache(endpoint_name, period)
                 if stale is not None:
                     return stale
+            self.failed_endpoints.add(endpoint_name)
             return []
 
     def fetch_multiple_endpoints(
@@ -358,6 +374,10 @@ class OfficialListsService:
                     logger.debug(f"Fetched {len(items)} items from {endpoint_name}")
                 except (requests.exceptions.RequestException, ValueError, KeyError, TypeError) as e:
                     logger.error(f"Failed to fetch {endpoint_name}: {e}")
+                    # An endpoint that raised here is as unavailable as one
+                    # whose own handler gave up, so its existing playlist must
+                    # not be treated as removed (issue #105).
+                    self.failed_endpoints.add(endpoint_name)
                     results[endpoint_name] = []
 
         return results

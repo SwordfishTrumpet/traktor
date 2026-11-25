@@ -1109,7 +1109,8 @@ class TestSyncListsOrchestration:
 
         assert "failed" in recorded
         assert "succeeded" not in recorded
-        assert "exit code 1" in recorded["failed"]
+        # The record names the cause, not just the exit code (issue #124).
+        assert "Broken Show" in recorded["failed"]
 
     def test_interactive_orphaned_cleanup_confirmed(self, monkeypatch, tmp_path):
         """Interactive mode previews orphaned cleanup and deletes on confirm."""
@@ -1641,6 +1642,127 @@ class TestSyncListsFeatureSections:
         assert result == 0
         official_service.get_playlists_from_endpoints.assert_called_once()
 
+    def test_failed_list_fetch_keeps_its_playlist_active(self):
+        """A list whose items cannot be fetched still exists (#105).
+
+        Orphan cleanup deletes every managed playlist that is not in the active
+        set, so the name must be active before the fetch, not after it.
+        """
+        stats = {"items_total": 0, "items_not_found": 0, "lists_failed": 0}
+        updated: set = set()
+        trakt = MagicMock()
+        trakt.get_list_items.side_effect = _requests.exceptions.ConnectionError("503")
+
+        result = sync.process_list_parallel(
+            {
+                "list": {
+                    "name": "Favorites",
+                    "user": {"username": "me"},
+                    "ids": {"trakt": 7},
+                }
+            },
+            MagicMock(),
+            trakt,
+            2,
+            stats,
+            updated,
+            [],
+        )
+
+        assert result["success"] is False
+        assert stats["lists_failed"] == 1
+        assert "Favorites" in updated
+
+    def test_failed_official_fetch_keeps_playlists_and_fails_the_run(self, monkeypatch, tmp_path):
+        """A failed official fetch is not an empty official list (#105)."""
+        env = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.trending"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        official_service = MagicMock()
+        official_service.get_playlists_from_endpoints.return_value = []
+        official_service.failed_endpoints = {"movies.trending"}
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+
+        assert sync.sync_lists(args) == 1
+        env["plex_client"].cleanup_orphaned_playlists.assert_not_called()
+
+    def test_a_failed_endpoint_leaves_the_merged_playlist_untouched(self, monkeypatch, tmp_path):
+        """Merged mode must not write partial content over a live playlist (#105)."""
+        env = self._setup(monkeypatch, tmp_path)
+        args = self._args(
+            monkeypatch,
+            ["--list-source", "official", "--official-playlist-mode", "merged"],
+        )
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.played"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        official_service = MagicMock()
+        # The aggregation still returns the playlists built from the endpoints
+        # that answered; writing them would drop the failed endpoint's items.
+        official_service.get_playlists_from_endpoints.return_value = [
+            {"name": "Trakt Official - Movies", "items": [{"title": "Heat"}]}
+        ]
+        official_service.failed_endpoints = {"movies.played"}
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+
+        processed = []
+        monkeypatch.setattr(
+            sync, "process_official_list_parallel", lambda *a, **k: processed.append(a[0])
+        )
+
+        assert sync.sync_lists(args) == 1
+        assert processed == []
+        env["plex_client"].create_or_update_playlist.assert_not_called()
+        env["plex_client"].cleanup_orphaned_playlists.assert_not_called()
+
+    def test_an_official_section_failure_still_keeps_the_playlists(self, monkeypatch, tmp_path):
+        """A section that raises cannot tell which playlists are live (#105)."""
+        env = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.played"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        official_service = MagicMock()
+        official_service.get_playlists_from_endpoints.side_effect = ValueError("bad payload")
+        official_service.failed_endpoints = set()
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+
+        assert sync.sync_lists(args) == 1
+        env["plex_client"].cleanup_orphaned_playlists.assert_not_called()
+
+    def test_a_collection_failure_keeps_the_official_playlist_active(self, monkeypatch):
+        """The name is active before items are collected, like the personal path (#105)."""
+        updated: set = set()
+        stats = {"items_total": 0, "items_not_found": 0, "lists_failed": 0}
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("the collector died")
+
+        monkeypatch.setattr(sync, "_collect_plex_items", explode)
+
+        result = sync.process_official_list_parallel(
+            {"name": "Trakt Official - Movies", "items": [{"title": "Heat"}]},
+            MagicMock(),
+            2,
+            stats,
+            updated,
+            [],
+        )
+
+        assert result["success"] is False
+        assert "Trakt Official - Movies" in updated
+
     def test_merged_official_mode_asks_for_every_period_at_once(self, monkeypatch, tmp_path):
         """Merged mode must aggregate the periods, not write one playlist each (#82)."""
         self._setup(monkeypatch, tmp_path)
@@ -2094,3 +2216,161 @@ class TestNonInteractivePrompts:
             sync.sync_lists(args)
 
         assert exc_info.value.code == 1
+
+
+# ---------------------------------------------------------------------------
+# Issue #108: one refused official playlist aborted the rest and the run was
+# recorded as a success
+# ---------------------------------------------------------------------------
+
+
+class TestOfficialPlaylistIsolation:
+    def _args(self, monkeypatch, argv):
+        import sys
+
+        from traktor import cli
+
+        monkeypatch.setattr(sys, "argv", ["traktor", *argv])
+        return cli.parse_args()
+
+    def test_a_refused_official_playlist_does_not_abort_the_rest(self, monkeypatch, tmp_path):
+        from plexapi.exceptions import BadRequest
+
+        env = TestSyncListsFeatureSections._setup(
+            TestSyncListsFeatureSections, monkeypatch, tmp_path
+        )
+        args = self._args(monkeypatch, ["--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.trending"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        official_service = MagicMock()
+        official_service.get_playlists_from_endpoints.return_value = [
+            {"name": "Trending Movies", "items": [], "description": ""},
+            {"name": "Popular Movies", "items": [], "description": ""},
+        ]
+        official_service.failed_endpoints = set()
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+
+        attempted = []
+
+        def create(name, items, description=None, **kwargs):
+            attempted.append(name)
+            if name == "Trending Movies":
+                raise BadRequest("no items to add")
+            return MagicMock()
+
+        env["plex_client"].create_or_update_playlist.side_effect = create
+
+        assert sync.sync_lists(args) == 1
+        assert attempted == ["Trending Movies", "Popular Movies"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #110: the missing report was written before collection and watchlist
+# ---------------------------------------------------------------------------
+
+
+class TestMissingReportTiming:
+    def _args(self, monkeypatch, argv):
+        import sys
+
+        from traktor import cli
+
+        monkeypatch.setattr(sys, "argv", ["traktor", *argv])
+        return cli.parse_args()
+
+    def _setup(self, monkeypatch, tmp_path):
+        env = TestSyncListsFeatureSections._setup(
+            TestSyncListsFeatureSections, monkeypatch, tmp_path
+        )
+        self.reports = []
+        monkeypatch.setattr(
+            sync,
+            "write_missing_report",
+            lambda items, **kwargs: self.reports.append(list(items)),
+        )
+        return env
+
+    def test_collection_misses_reach_the_report(self, monkeypatch, tmp_path):
+        env = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--sync-collection", "--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: False)
+
+        def collect_nothing(items, plex, workers, list_name, stats, missing_items):
+            """Model what the real collector records: a miss reaches the tracker."""
+            missing_items.append(
+                {
+                    "title": "Heat",
+                    "year": 1995,
+                    "imdb_id": "tt0113277",
+                    "reason": "Movie not found in Plex library",
+                }
+            )
+            return []
+
+        monkeypatch.setattr(sync, "_collect_plex_items", collect_nothing)
+        env["trakt_client"].get_collection.return_value = [
+            {
+                "type": "movie",
+                "movie": {"title": "Heat", "year": 1995, "ids": {"imdb": "tt0113277"}},
+            }
+        ]
+        monkeypatch.setattr(sync, "TraktClient", lambda *a, **k: env["trakt_client"])
+
+        sync.sync_lists(args)
+
+        assert self.reports, "the missing report was never written"
+        # The report is written after the collection section, so its misses are
+        # in it (issue #110).
+        assert any(item.get("title") == "Heat" for item in self.reports[-1])
+
+
+# ---------------------------------------------------------------------------
+# Issue #124: /status recorded only the exit code after a failed watch sync
+# ---------------------------------------------------------------------------
+
+
+def test_the_run_record_names_the_show_a_failed_watch_sync_lost(monkeypatch, tmp_path):
+    from traktor import run_status
+
+    progress_file = tmp_path / "sync_progress.json"
+    monkeypatch.setattr(sync, "SYNC_PROGRESS_FILE", progress_file)
+    monkeypatch.setattr(sync, "TRAKT_CLIENT_ID", "client-id")
+    monkeypatch.setattr(sync, "TRAKT_CLIENT_SECRET", "client-secret")
+    monkeypatch.setattr(sync, "LOG_FILE", tmp_path / "logs" / "traktor.log")
+    monkeypatch.setattr(
+        sync.integrity_checker, "run_all_checks", lambda: {"overall_healthy": True, "checks": {}}
+    )
+    monkeypatch.setattr(sync, "load_config", lambda: {})
+    monkeypatch.setattr(sync, "_print_summary", lambda *a, **k: None)
+    monkeypatch.setattr(sync, "_check_memory", lambda *a, **k: None)
+    monkeypatch.setattr(sync, "write_missing_report", lambda *a, **k: None)
+
+    class _Args:
+        sync_watched_only = True
+        list_source = "official"
+        interactive = False
+        undo = False
+        workers = 1
+
+    monkeypatch.setattr(
+        sync,
+        "_sync_lists",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("the real _sync_lists must run")),
+    )
+
+    # The real wrapper is what records the run, so drive it with a patched body.
+    def fake_body(args=None, resource_manager=None, failures=None):
+        failures.append("watch sync failed: could not read show Broken Show")
+        return 1
+
+    monkeypatch.setattr(sync, "_sync_lists", fake_body)
+
+    assert sync.sync_lists(_Args()) == 1
+    recorded = run_status.read_run_status(progress_file)
+    assert recorded["status"] == "failed"
+    assert "Broken Show" in recorded["error"]

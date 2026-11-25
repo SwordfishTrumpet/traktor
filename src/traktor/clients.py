@@ -15,14 +15,21 @@ from urllib.parse import urlencode
 import requests
 from plexapi.exceptions import BadRequest, NotFound
 
-from .config import save_config
+from .config import load_config, save_config
 from .log import get_correlation_id, logger
 from .performance import performance_monitor
-from .resilience import CircuitBreakerOpen, retry_with_backoff, trakt_circuit_breaker
+from .resilience import (
+    CircuitBreakerOpen,
+    add_jitter,
+    plex_circuit_breaker,
+    retry_with_backoff,
+    trakt_circuit_breaker,
+)
 from .settings import (
     CACHE_DIR,
     CACHE_MAX_AGE_HOURS,
     CACHE_VERSION,
+    CONFIG_FILE,
     ENV_FILE,
     TRAKT_ACCESS_TOKEN,
     TRAKT_API_URL,
@@ -33,6 +40,7 @@ from .settings import (
 )
 from .utils import (
     DecompressionLimitError,
+    file_lock,
     normalize_tmdb_id,
     parse_timestamp,
     read_gzip_text,
@@ -574,22 +582,34 @@ class CacheManager:
             logger.warning("Cache is not a dict, rebuilding...")
             return False
 
-        required_keys = [
+        # Each key has exactly one shape: the five indexes are mappings and the
+        # two snapshot lists are lists. Accepting either container let a cache
+        # with a list in an index slot pass the check and then raise
+        # AttributeError in the first lookup, which stopped every run until the
+        # cache was deleted (issue #113).
+        required_mappings = [
             "movies_by_imdb",
             "movies_by_tmdb",
             "shows_by_imdb",
             "shows_by_tmdb",
-            "movies_list",
-            "shows_list",
             "by_rating_key",
         ]
+        required_lists = ["movies_list", "shows_list"]
 
-        for key in required_keys:
+        for key in required_mappings:
             if key not in self.memory_cache:
                 logger.warning(f"Cache missing required key '{key}', rebuilding...")
                 return False
-            if not isinstance(self.memory_cache[key], (dict, list)):
-                logger.warning(f"Cache key '{key}' has wrong type, rebuilding...")
+            if not isinstance(self.memory_cache[key], dict):
+                logger.warning(f"Cache key '{key}' must be a mapping, rebuilding...")
+                return False
+
+        for key in required_lists:
+            if key not in self.memory_cache:
+                logger.warning(f"Cache missing required key '{key}', rebuilding...")
+                return False
+            if not isinstance(self.memory_cache[key], list):
+                logger.warning(f"Cache key '{key}' must be a list, rebuilding...")
                 return False
 
         self._sanitize_cached_items()
@@ -1301,8 +1321,11 @@ class TraktAuth:
             logger.debug(f"Expires in: {data.get('expires_in', 'unknown')} seconds")
             logger.debug(f"Created at: {data.get('created_at', 'unknown')}")
 
-            self.save_tokens()
-            return True
+            # The save can refuse (no .env, unreadable .env) and the tokens
+            # then live only in this process. The caller must know, or it
+            # tells the user the credential is stored when it is not
+            # (issue #120).
+            return self.save_tokens()
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Authentication request failed: {e}", exc_info=True)
@@ -1444,6 +1467,10 @@ class TraktClient:
                     retry_after = parse_retry_after(
                         response.headers.get("Retry-After"), RETRY_BACKOFF_BASE**attempt
                     )
+                    # Jitter only adds, so the server's Retry-After stays a
+                    # lower bound while eight workers stop sharing one
+                    # schedule (issue #125).
+                    retry_after = add_jitter(retry_after)
                     logger.warning(
                         f"Rate limited (429). Retry after {retry_after}s. Attempt {attempt + 1}/{MAX_RETRIES}"
                     )
@@ -1453,7 +1480,7 @@ class TraktClient:
 
                 # Handle server errors (5xx) with exponential backoff
                 if 500 <= response.status_code < 600:
-                    wait_time = RETRY_BACKOFF_BASE**attempt
+                    wait_time = add_jitter(RETRY_BACKOFF_BASE**attempt)
                     logger.warning(
                         f"Server error ({response.status_code}). Retrying in {wait_time}s. Attempt {attempt + 1}/{MAX_RETRIES}"
                     )
@@ -1464,7 +1491,7 @@ class TraktClient:
                 return response
 
             except requests.exceptions.Timeout:
-                wait_time = RETRY_BACKOFF_BASE**attempt
+                wait_time = add_jitter(RETRY_BACKOFF_BASE**attempt)
                 logger.warning(
                     f"Request timeout. Retrying in {wait_time}s. Attempt {attempt + 1}/{MAX_RETRIES}"
                 )
@@ -1474,7 +1501,7 @@ class TraktClient:
                     raise
 
             except requests.exceptions.ConnectionError:
-                wait_time = RETRY_BACKOFF_BASE**attempt
+                wait_time = add_jitter(RETRY_BACKOFF_BASE**attempt)
                 logger.warning(
                     f"Connection error. Retrying in {wait_time}s. Attempt {attempt + 1}/{MAX_RETRIES}"
                 )
@@ -1490,9 +1517,16 @@ class TraktClient:
         """Execute request with circuit breaker protection."""
 
         def make_request():
-            return self._request_with_retry(
+            response = self._request_with_retry(
                 method, url, headers=headers, params=params, json_data=json_data
             )
+            # A 5xx that survived the retries is a failure of the dependency.
+            # Returning it counted every outage request as a success, so the
+            # breaker never opened and each request paid the full retry
+            # schedule (issue #122).
+            if response.status_code >= 500:
+                response.raise_for_status()
+            return response
 
         try:
             return trakt_circuit_breaker.call(make_request)
@@ -1912,8 +1946,10 @@ class TraktClient:
         logger.info("Fetching watched shows from Trakt...")
 
         try:
-            response = self._request("sync/watched/shows")
-            data = response.json()
+            # Trakt answers this endpoint about ten shows per page, so a single
+            # request saw only the first page and every later page's shows were
+            # never synced (issue #106, the class of #92).
+            data = self._paginated_get("sync/watched/shows")
 
             # Count total episodes
             episode_count = 0
@@ -2393,6 +2429,21 @@ class PlexClient:
         performance_monitor.record_cache_miss()
         return None
 
+    def _via_breaker(self, operation, call):
+        """Run one Plex operation under the shared Plex circuit breaker (#123).
+
+        Nothing called the Plex breaker: it was defined, reported by
+        --circuit-status, and bypassed by every request, so it stayed green
+        through an outage while each call waited on the dead server. A
+        CircuitBreakerOpen propagates into the caller's existing failure
+        path, which is a fast failure instead of another wait.
+        """
+        try:
+            return plex_circuit_breaker.call(call)
+        except CircuitBreakerOpen:
+            logger.error(f"Plex circuit breaker is OPEN - not calling {operation}")
+            raise
+
     def _get_plex_item(self, rating_key):
         """Return the Plex item for a cached rating key, fetching it once per run.
 
@@ -2413,7 +2464,7 @@ class PlexClient:
         if rating_key_str in self.cache._plex_objects:
             return self.cache._plex_objects[rating_key_str]
         try:
-            item = self.server.fetchItem(safe_key)
+            item = self._via_breaker("fetchItem", lambda: self.server.fetchItem(safe_key))
         except Exception as e:
             logger.warning(
                 f"Cached ratingKey {safe_key} could not be fetched (stale cache entry?): {e}"
@@ -2498,7 +2549,12 @@ class PlexClient:
         turns a transient 5xx into a duplicate.
         """
         try:
-            return list(self.server.playlists(title=name, title__iexact=name))
+            return list(
+                self._via_breaker(
+                    "playlists",
+                    lambda: self.server.playlists(title=name, title__iexact=name),
+                )
+            )
         except NotFound:
             return []
 
@@ -2682,17 +2738,28 @@ class PlexClient:
         config: Dict[str, Any],
         dry_run: bool = False,
     ) -> List[str]:
-        deleted = []
-        to_delete = []
+        deleted: List[str] = []
+        to_delete: List[str] = []
 
         managed_playlists = config.get("managed_playlists", [])
         blacklisted_lists = config.get("blacklisted_lists", [])
+        if not isinstance(managed_playlists, list) or not isinstance(blacklisted_lists, list):
+            # A corrupt or hand-edited config can put a mapping here, whose keys
+            # would be read as managed playlist titles and deleted from Plex
+            # (issue #129). Nothing is deleted until the config is sane.
+            logger.error(
+                "Config managed_playlists/blacklisted_lists is not a list; "
+                "skipping playlist cleanup"
+            )
+            return deleted
         if blacklisted_lists:
             logger.info(f"Also removing {len(blacklisted_lists)} blacklisted playlist(s)")
             for playlist_name in blacklisted_lists:
                 if playlist_name in managed_playlists:
                     try:
-                        playlist = self.server.playlist(playlist_name)
+                        playlist = self._via_breaker(
+                            "playlist", lambda: self.server.playlist(playlist_name)
+                        )
                         if dry_run:
                             to_delete.append(playlist_name)
                             logger.info(f"[DRY RUN] Would delete blacklisted: {playlist_name}")
@@ -2708,7 +2775,7 @@ class PlexClient:
                         )
 
         try:
-            all_playlists = self.server.playlists()
+            all_playlists = self._via_breaker("playlists", self.server.playlists)
             logger.info(f"Found {len(all_playlists)} total playlists in Plex")
 
             for playlist in all_playlists:
@@ -2738,11 +2805,21 @@ class PlexClient:
             logger.error(f"Error during playlist cleanup: {e}", exc_info=True)
 
         if not dry_run:
-            config["managed_playlists"] = list(active_playlist_names)
-            logger.info(
-                f"About to save config with {len(config['managed_playlists'])} managed playlists"
-            )
-            save_config(config)
+            # The caller holds a snapshot taken when the run started, and a
+            # long run can finish after another session saved credentials. Write
+            # back only the key this method owns, re-read under the same lock
+            # the other writers use, so the concurrent save survives (#109).
+            with file_lock(CONFIG_FILE):
+                fresh = load_config()
+                if not isinstance(fresh, dict):
+                    fresh = {}
+                fresh["managed_playlists"] = list(active_playlist_names)
+                logger.info(
+                    f"About to save config with "
+                    f"{len(fresh['managed_playlists'])} managed playlists"
+                )
+                save_config(fresh)
+                config["managed_playlists"] = list(active_playlist_names)
 
         return to_delete if dry_run else deleted
 
@@ -2758,7 +2835,7 @@ class PlexClient:
         logger.info(f"Marking item as watched in Plex: {rating_key}")
 
         try:
-            item = self.server.fetchItem(rating_key)
+            item = self._via_breaker("fetchItem", lambda: self.server.fetchItem(rating_key))
 
             if hasattr(item, "markWatched"):
                 item.markWatched()
@@ -2790,7 +2867,7 @@ class PlexClient:
         logger.info(f"Marking item as unwatched in Plex: {rating_key}")
 
         try:
-            item = self.server.fetchItem(rating_key)
+            item = self._via_breaker("fetchItem", lambda: self.server.fetchItem(rating_key))
 
             if hasattr(item, "markUnwatched"):
                 item.markUnwatched()
@@ -2931,7 +3008,7 @@ class PlexClient:
         # Fallback to API call if not in cache (episodes, or cache miss)
         logger.debug(f"Cache miss for watched check: {rating_key}, falling back to API")
         try:
-            item = self.server.fetchItem(rating_key)
+            item = self._via_breaker("fetchItem", lambda: self.server.fetchItem(rating_key))
             is_watched = getattr(item, "isWatched", False)
             last_viewed = getattr(item, "lastViewedAt", None)
             return is_watched, last_viewed

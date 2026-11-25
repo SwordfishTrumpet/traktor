@@ -7,9 +7,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
+import requests as _requests
 from plexapi.video import Show
 
-from traktor import clients
+from traktor import clients, config
 
 
 class TestCacheManager:
@@ -2916,3 +2917,296 @@ def test_playback_progress_reads_each_item_once():
 
     assert server.fetch_calls == 20
     assert sum(item.updates for item in server.items.values()) == 20
+
+
+# ---------------------------------------------------------------------------
+# Issue #106: watched shows came from the first page only
+# ---------------------------------------------------------------------------
+
+
+def test_watched_shows_are_read_from_every_page():
+    client = _trakt_client_with_auth()
+    calls = _serve_pages(
+        client,
+        _pages(
+            lambda n: {
+                "show": {"title": f"Show {n}", "ids": {"imdb": f"tt{n:07d}"}},
+                "seasons": [{"number": 1, "episodes": [{"number": 1}]}],
+            }
+        ),
+    )
+
+    assert len(client.get_watched_shows()) == 20
+    assert [call.get("page") for call in calls] == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Issue #109: a finishing sync wrote its start-of-run config over a concurrent
+# credential save
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_cleanup_keeps_a_config_saved_during_the_run(tmp_path, monkeypatch):
+    config_file = tmp_path / ".traktor_config.json"
+    config_file.write_text('{"blacklisted_lists": []}', encoding="utf-8")
+    # load_config()/save_config() read the config module's path, while
+    # cleanup_orphaned_playlists takes its lock on the clients module's copy;
+    # both must point at the same temporary file.
+    monkeypatch.setattr(clients, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(config, "CONFIG_FILE", config_file)
+
+    stale_snapshot = {"blacklisted_lists": [], "managed_playlists": []}
+
+    # Another session saves credentials while this run is working.
+    config_file.write_text(
+        '{"blacklisted_lists": [], "plex_url": "http://plex.example:32400", '
+        '"plex_token": "placeholder-value-for-the-test"}',
+        encoding="utf-8",
+    )
+
+    server = MagicMock()
+    server.playlists.return_value = []
+    plex = clients.PlexClient(server, MagicMock())
+
+    plex.cleanup_orphaned_playlists(["My Trakt List"], stale_snapshot)
+
+    saved = json.loads(config_file.read_text(encoding="utf-8"))
+    assert saved["plex_url"] == "http://plex.example:32400"
+    assert saved["managed_playlists"] == ["My Trakt List"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #113: the structure check accepted either container for every key
+# ---------------------------------------------------------------------------
+
+
+class TestCacheContainerTypes:
+    @pytest.fixture
+    def server(self):
+        """A Plex server that answers with no library sections."""
+        server = MagicMock()
+        server.library.sections.return_value = []
+        return server
+
+    @pytest.mark.parametrize(
+        "key, wrong_value",
+        [
+            ("movies_by_imdb", []),
+            ("movies_by_tmdb", []),
+            ("shows_by_imdb", []),
+            ("shows_by_tmdb", []),
+            ("by_rating_key", []),
+            ("movies_list", {}),
+            ("shows_list", {}),
+        ],
+    )
+    def test_a_wrong_container_type_is_not_a_valid_cache(self, server, key, wrong_value):
+        cache = clients.CacheManager(server)
+        _empty_cache(cache)
+        cache.memory_cache[key] = wrong_value
+
+        assert cache._validate_cache_structure() is False
+
+    def test_load_cache_rebuilds_instead_of_loading_a_wrong_container(
+        self, server, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(clients, "CACHE_DIR", tmp_path)
+        wrong = {
+            "movies_by_imdb": [],
+            "movies_by_tmdb": {},
+            "shows_by_imdb": {},
+            "shows_by_tmdb": {},
+            "movies_list": [],
+            "shows_list": [],
+            "by_rating_key": {},
+        }
+        (tmp_path / "plex_library_cache.json").write_text(json.dumps(wrong), encoding="utf-8")
+
+        cache = clients.CacheManager(server)
+
+        assert cache.load_cache() is False
+        assert isinstance(cache.memory_cache.get("movies_by_imdb", {}), dict)
+
+
+# ---------------------------------------------------------------------------
+# Issue #120: authenticate() claimed success when the tokens were not saved
+# ---------------------------------------------------------------------------
+
+
+def test_authenticate_reports_a_refused_token_save(monkeypatch):
+    auth = clients.TraktAuth()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "access_token": "access-token-value-1234",
+        "refresh_token": "refresh-token-value-1234",
+    }
+
+    session = MagicMock()
+    session.post.return_value = response
+    monkeypatch.setattr(clients.requests, "Session", lambda: session)
+    monkeypatch.setattr(clients.TraktAuth, "save_tokens", lambda self: False)
+
+    assert auth.authenticate("a-code") is False
+
+
+def test_authenticate_reports_a_completed_token_save(monkeypatch):
+    auth = clients.TraktAuth()
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {
+        "access_token": "access-token-value-1234",
+        "refresh_token": "refresh-token-value-1234",
+    }
+
+    session = MagicMock()
+    session.post.return_value = response
+    monkeypatch.setattr(clients.requests, "Session", lambda: session)
+    monkeypatch.setattr(clients.TraktAuth, "save_tokens", lambda self: True)
+
+    assert auth.authenticate("a-code") is True
+
+
+# ---------------------------------------------------------------------------
+# Issue #122: the Trakt breaker counted a returned 5xx as a success
+# ---------------------------------------------------------------------------
+
+
+def test_a_repeated_5xx_opens_the_trakt_circuit_breaker(monkeypatch):
+    import traktor.resilience as res
+
+    breaker = res.CircuitBreaker(
+        failure_threshold=2, success_threshold=2, cooldown_seconds=60.0, name="test-trakt"
+    )
+    monkeypatch.setattr(clients, "trakt_circuit_breaker", breaker)
+    monkeypatch.setattr(clients, "MAX_RETRIES", 1)
+
+    client = _trakt_client_with_auth()
+    client._rate_limiter.wait = lambda: None
+    response = MagicMock()
+    response.status_code = 503
+    response.headers = {}
+    response.raise_for_status.side_effect = _requests.exceptions.HTTPError("503 Server Error")
+    monkeypatch.setattr(client._session, "get", lambda *args, **kwargs: response)
+
+    for _ in range(2):
+        with pytest.raises(_requests.exceptions.HTTPError):
+            client._request("sync/lists")
+
+    assert breaker.state == res.CircuitState.OPEN
+
+
+# ---------------------------------------------------------------------------
+# Issue #123: the Plex breaker was defined but never wrapped a Plex call
+# ---------------------------------------------------------------------------
+
+
+def test_plex_calls_are_counted_by_the_plex_circuit_breaker(monkeypatch):
+    import traktor.resilience as res
+
+    breaker = res.CircuitBreaker(
+        failure_threshold=3, success_threshold=2, cooldown_seconds=60.0, name="test-plex"
+    )
+    monkeypatch.setattr(clients, "plex_circuit_breaker", breaker)
+
+    server = MagicMock()
+    server.fetchItem.side_effect = ConnectionError("plex is down")
+    plex = clients.PlexClient(server, MagicMock())
+
+    for _ in range(3):
+        assert plex.mark_as_watched(42) is False
+
+    assert breaker.state == res.CircuitState.OPEN
+
+    # An open breaker fails fast instead of waiting on the dead server again.
+    server.fetchItem.side_effect = None
+    assert plex.mark_as_watched(43) is False
+    server.fetchItem.assert_called_with(42)
+    assert server.fetchItem.call_count == 3
+
+
+class TestOrphanCleanupRefusesAWrongContainer:
+    """A mapping in managed_playlists must not name playlists to delete (#129)."""
+
+    @pytest.fixture
+    def plex_client(self):
+        server = MagicMock()
+        cache = MagicMock()
+        cache.memory_cache = {}
+        return clients.PlexClient(server, cache)
+
+    def test_mapping_in_the_managed_slot_deletes_nothing(self, plex_client):
+        playlist = MagicMock()
+        playlist.title = "Victim Playlist"
+        plex_client.server.playlists.return_value = [playlist]
+        config = {"managed_playlists": {"Victim Playlist": {"unexpected": True}}}
+
+        deleted = plex_client.cleanup_orphaned_playlists([], config)
+
+        assert deleted == []
+        playlist.delete.assert_not_called()
+        plex_client.server.playlists.assert_not_called()
+
+    def test_mapping_in_the_blacklist_slot_deletes_nothing(self, plex_client):
+        playlist = MagicMock()
+        playlist.title = "Victim Playlist"
+        plex_client.server.playlists.return_value = [playlist]
+        config = {
+            "managed_playlists": ["Victim Playlist"],
+            "blacklisted_lists": {"Victim Playlist": True},
+        }
+
+        deleted = plex_client.cleanup_orphaned_playlists(["Victim Playlist"], config)
+
+        assert deleted == []
+        playlist.delete.assert_not_called()
+
+
+class TestTraktRetryJitter:
+    """Trakt retries carry jitter so parallel workers stop retrying together (#125)."""
+
+    @pytest.fixture
+    def trakt_client(self, monkeypatch):
+        monkeypatch.setattr(clients, "TRAKT_CLIENT_ID", "test-client-id")
+        monkeypatch.setattr(clients, "TRAKT_API_URL", "https://api.trakt.tv")
+        auth = MagicMock()
+        auth.get_headers.return_value = {"Authorization": "Bearer test-token"}
+        return clients.TraktClient(auth)
+
+    def test_a_server_error_retry_waits_a_jittered_delay(self, trakt_client, monkeypatch):
+        waits = []
+        monkeypatch.setattr(clients.time, "sleep", waits.append)
+        monkeypatch.setattr(clients, "add_jitter", lambda delay: 0.42)
+        monkeypatch.setattr(trakt_client._rate_limiter, "wait", lambda: None)
+
+        response_500 = MagicMock()
+        response_500.status_code = 500
+        response_200 = MagicMock()
+        response_200.status_code = 200
+
+        with patch.object(trakt_client._session, "get", side_effect=[response_500, response_200]):
+            response = trakt_client._request_with_retry(
+                "GET", "https://api.trakt.tv/test", headers={}
+            )
+
+        assert response.status_code == 200
+        assert waits == [0.42]
+
+    def test_a_rate_limit_keeps_the_header_as_a_lower_bound(self, trakt_client, monkeypatch):
+        waits = []
+        monkeypatch.setattr(clients.time, "sleep", waits.append)
+        monkeypatch.setattr(trakt_client._rate_limiter, "wait", lambda: None)
+        # Jitter only adds, so the delay handed to sleep is never below the
+        # delay add_jitter was given.
+        monkeypatch.setattr(clients, "add_jitter", lambda delay: delay + 0.25)
+
+        response_429 = MagicMock()
+        response_429.status_code = 429
+        response_429.headers = {"Retry-After": "12"}
+        response_200 = MagicMock()
+        response_200.status_code = 200
+
+        with patch.object(trakt_client._session, "get", side_effect=[response_429, response_200]):
+            trakt_client._request_with_retry("GET", "https://api.trakt.tv/test", headers={})
+
+        assert waits == [12.25]

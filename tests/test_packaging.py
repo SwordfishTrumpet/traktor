@@ -262,3 +262,129 @@ def test_compose_mounts_every_path_docker_mode_writes(monkeypatch):
     # The mount for the container home must exist by name, or a backup written
     # there still disappears with the container.
     assert "/home/traktor/.traktor_backups" in targets
+
+
+def test_the_compose_healthcheck_uses_the_check_that_can_fail():
+    """A healthcheck that cannot report a bad config is not a healthcheck (#116)."""
+    import pathlib
+
+    compose = pathlib.Path(__file__).parent.parent / "docker-compose.yml"
+    text = compose.read_text(encoding="utf-8")
+
+    healthcheck = [line for line in text.splitlines() if "--health-check" in line]
+    assert healthcheck, "the compose healthcheck does not run --health-check"
+    # Check the command itself, not the surrounding comment: the comment
+    # explains the change and names the old command (issue #116).
+    commands = [line for line in text.splitlines() if "test:" in line or "CMD" in line]
+    assert commands, "the compose healthcheck has no command"
+    assert not any("--diagnose" in line for line in commands), commands
+
+
+def test_ci_runs_the_suite_the_way_the_readme_says():
+    """README promises warnings-as-errors in CI; the step has to carry it (#117)."""
+    import pathlib
+
+    root = pathlib.Path(__file__).parent.parent
+    ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    pytest_steps = [line for line in ci.splitlines() if "pytest" in line and "run:" in line]
+
+    assert pytest_steps, "ci.yml has no pytest step"
+    assert all("-W error" in line for line in pytest_steps), pytest_steps
+
+    makefile = (root / "Makefile").read_text(encoding="utf-8")
+    test_target = makefile.split("test:", 1)[1].split("\n\n", 1)[0]
+    assert "-W error" in test_target, test_target
+
+
+def test_the_runbook_downloads_the_wheel_where_it_installs_it():
+    """gh release download needs --dir, or the install path is empty (#118)."""
+    import pathlib
+
+    root = pathlib.Path(__file__).parent.parent
+    runbook = (root / "RUNBOOK.md").read_text(encoding="utf-8")
+    case2 = runbook.split("### Case 2", 1)[1].split("### Case 3", 1)[0]
+
+    downloads = [line for line in case2.splitlines() if "gh release download" in line]
+    assert downloads, "Case 2 has no download step"
+    assert all("--dir" in line for line in downloads), downloads
+    assert "dist/traktor-$VERSION-py3-none-any.whl" in case2 or "dist/" in case2
+
+
+# ---------------------------------------------------------------------------
+# Issue #119: setup.sh reported success when an install step failed
+# ---------------------------------------------------------------------------
+
+
+def _run_setup(tmp_path, path_prefix):
+    import shutil
+    import subprocess
+
+    root = Path(__file__).resolve().parents[1]
+    script = tmp_path / "setup.sh"
+    shutil.copy(root / "setup.sh", script)
+    env = {"PATH": f"{path_prefix}:/usr/bin:/bin", "HOME": str(tmp_path / "home")}
+    (tmp_path / "home").mkdir(exist_ok=True)
+    return subprocess.run(
+        ["bash", str(script)],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_setup_fails_when_dependency_sync_fails(tmp_path):
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "uv").write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+    (stub / "uv").chmod(0o755)
+
+    result = _run_setup(tmp_path, stub)
+
+    assert result.returncode != 0
+    assert "Setup complete" not in result.stdout
+
+
+def test_setup_fails_when_uv_cannot_be_installed(tmp_path):
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "curl").write_text("#!/bin/sh\nexit 6\n", encoding="utf-8")
+    (stub / "curl").chmod(0o755)
+
+    result = _run_setup(tmp_path, stub)
+
+    assert result.returncode != 0
+    assert "Setup complete" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Issue #121: setup.sh told the user to edit a .env it never created
+# ---------------------------------------------------------------------------
+
+
+def test_setup_creates_the_env_it_tells_the_user_to_edit(tmp_path):
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "uv").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (stub / "uv").chmod(0o755)
+    (tmp_path / ".env.example").write_text("PLEX_URL=\\nPLEX_TOKEN=\\n", encoding="utf-8")
+
+    result = _run_setup(tmp_path, stub)
+
+    assert result.returncode == 0, result.stderr
+    created = tmp_path / ".env"
+    assert created.exists()
+    assert created.read_text(encoding="utf-8") == "PLEX_URL=\\nPLEX_TOKEN=\\n"
+    assert created.stat().st_mode & 0o777 == 0o600
+
+
+def test_setup_does_not_overwrite_an_existing_env(tmp_path):
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    (stub / "uv").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (stub / "uv").chmod(0o755)
+    (tmp_path / ".env.example").write_text("PLEX_URL=\\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("PLEX_URL=http://mine:32400\\n", encoding="utf-8")
+
+    assert _run_setup(tmp_path, stub).returncode == 0
+    assert "mine" in (tmp_path / ".env").read_text(encoding="utf-8")

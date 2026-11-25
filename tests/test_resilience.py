@@ -12,6 +12,7 @@ from traktor.resilience import (
     CircuitBreakerOpen,
     HealthCheck,
     SyncProgress,
+    add_jitter,
     retry_with_backoff,
 )
 
@@ -159,7 +160,7 @@ class TestRetryWithBackoff:
         assert call_count == 2
 
     def test_exponential_backoff_delay(self, tmp_path):
-        """Delay should increase exponentially."""
+        """The deterministic backoff grows exponentially; jitter only adds (issue #125)."""
         delays = []
 
         @retry_with_backoff(
@@ -176,14 +177,14 @@ class TestRetryWithBackoff:
             with pytest.raises(RuntimeError):
                 always_fail()
 
-        # Delays should be: 0.1, 0.2, 0.4 (exponential)
+        # Nominal delays are 0.1, 0.2, 0.4 (exponential); each carries up to 50%
+        # of extra jitter so concurrent clients separate.
         assert len(delays) == 3
-        assert delays[0] == 0.1
-        assert delays[1] == 0.2
-        assert delays[2] == 0.4
+        for index, nominal in enumerate((0.1, 0.2, 0.4)):
+            assert nominal <= delays[index] <= nominal * 1.5
 
     def test_max_delay_cap(self, tmp_path):
-        """Delay should not exceed max_delay."""
+        """The backoff stops growing at max_delay; jitter adds at most half of it."""
         delays = []
 
         @retry_with_backoff(
@@ -201,7 +202,7 @@ class TestRetryWithBackoff:
                 always_fail()
 
         # All delays should be capped at 2.0
-        assert all(d <= 2.0 for d in delays)
+        assert all(d <= 2.0 * 1.5 for d in delays)
 
 
 class TestSyncProgress:
@@ -1179,3 +1180,222 @@ class TestBackupRestoreIsBounded:
 
         assert manager.restore_backup(backup) is True
         assert cache_dir.joinpath("plex_library_cache.json.gz").exists()
+
+
+# ---------------------------------------------------------------------------
+# Issue #107: overlapping backup runs deleted each other's snapshots
+# ---------------------------------------------------------------------------
+
+
+class TestOverlappingBackups:
+    """A backup run must not see, or die on, a snapshot another run owns."""
+
+    @pytest.fixture
+    def backup_env(self, tmp_path, monkeypatch):
+        import traktor.resilience as res
+
+        config_file = tmp_path / "config.json"
+        config_file.write_text('{"key": "value"}')
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+        (cache_dir / "entry.json").write_text('{"cached": true}')
+        env_file = tmp_path / ".env"
+        env_file.write_text("TRAKT_CLIENT_ID=abc\nTRAKT_ACCESS_TOKEN=tok1234567890\n")
+
+        monkeypatch.setattr(res, "CONFIG_FILE", config_file)
+        monkeypatch.setattr(res, "ENV_FILE", env_file)
+        monkeypatch.setattr(res, "CACHE_DIR", cache_dir)
+
+        manager = res.BackupManager(backup_dir=tmp_path / "backups", max_backups=2, compress=True)
+        return manager, res
+
+    def test_a_snapshot_is_invisible_until_its_manifest_is_written(self, backup_env, monkeypatch):
+        manager, res = backup_env
+        visible_while_writing = []
+        real_write = res.write_json_atomic
+
+        def spy(path, data, **kwargs):
+            prefix = res.BACKUP_DIR_PREFIX
+            visible_while_writing.extend(
+                p.name for p in manager.backup_dir.iterdir() if p.name.startswith(prefix)
+            )
+            return real_write(path, data, **kwargs)
+
+        monkeypatch.setattr(res, "write_json_atomic", spy)
+        backup_path = manager.create_backup(reason="overlap")
+
+        assert visible_while_writing == []
+        assert backup_path.name.startswith(res.BACKUP_DIR_PREFIX)
+        assert (backup_path / "manifest.json").exists()
+
+    def test_cleanup_ignores_a_snapshot_another_run_removed(self, backup_env, monkeypatch):
+        manager, res = backup_env
+        # Create three snapshots before retention applies, so the sweep below
+        # really has something to remove.
+        manager.max_backups = 10
+        for i in range(3):
+            manager.create_backup(reason=f"run-{i}")
+        manager.max_backups = 2
+
+        def gone(path):
+            raise FileNotFoundError(str(path))
+
+        monkeypatch.setattr(res.shutil, "rmtree", gone)
+        manager._cleanup_old_backups()
+        # The sweep survived the race and removed nothing, because every
+        # snapshot was already gone when it tried.
+        assert len(manager.list_backups()) == 3
+
+
+# ---------------------------------------------------------------------------
+# Issue #115: the runbook's circuit breaker variables were never read
+# ---------------------------------------------------------------------------
+
+
+def test_breaker_tuning_comes_from_the_documented_variables(monkeypatch):
+    import importlib
+
+    import traktor.resilience as resilience
+    import traktor.settings as settings
+
+    monkeypatch.setenv("TRAKTOR_TRAKT_FAILURE_THRESHOLD", "3")
+    monkeypatch.setenv("TRAKTOR_TRAKT_COOLDOWN_SECONDS", "120")
+    monkeypatch.setenv("TRAKTOR_PLEX_FAILURE_THRESHOLD", "5")
+    monkeypatch.setenv("TRAKTOR_PLEX_COOLDOWN_SECONDS", "60")
+    try:
+        importlib.reload(settings)
+        importlib.reload(resilience)
+
+        assert resilience.trakt_circuit_breaker.failure_threshold == 3
+        assert resilience.trakt_circuit_breaker.cooldown_seconds == 120.0
+        assert resilience.plex_circuit_breaker.failure_threshold == 5
+        assert resilience.plex_circuit_breaker.cooldown_seconds == 60.0
+    finally:
+        for name in (
+            "TRAKTOR_TRAKT_FAILURE_THRESHOLD",
+            "TRAKTOR_TRAKT_COOLDOWN_SECONDS",
+            "TRAKTOR_PLEX_FAILURE_THRESHOLD",
+            "TRAKTOR_PLEX_COOLDOWN_SECONDS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+        importlib.reload(settings)
+        importlib.reload(resilience)
+
+
+def test_an_unreadable_breaker_variable_keeps_the_default(monkeypatch):
+    import importlib
+
+    import traktor.resilience as resilience
+    import traktor.settings as settings
+
+    monkeypatch.setenv("TRAKTOR_TRAKT_FAILURE_THRESHOLD", "not-a-number")
+    try:
+        importlib.reload(settings)
+        importlib.reload(resilience)
+
+        assert resilience.trakt_circuit_breaker.failure_threshold == 5
+    finally:
+        monkeypatch.delenv("TRAKTOR_TRAKT_FAILURE_THRESHOLD", raising=False)
+        importlib.reload(settings)
+        importlib.reload(resilience)
+
+
+class TestRetryJitter:
+    """Concurrent clients must not retry a shared dependency in lockstep (issue #125)."""
+
+    def test_a_jittered_delay_never_waits_less_than_the_delay(self):
+        """Jitter only adds, so a server's Retry-After stays a lower bound."""
+        import traktor.resilience as resilience
+
+        for delay in (0.5, 4.0, 30.0):
+            for _ in range(50):
+                jittered = add_jitter(delay)
+                assert delay <= jittered <= delay * (1 + resilience.RETRY_JITTER_FRACTION)
+        assert add_jitter(0) == 0.0
+
+    def test_eight_concurrent_clients_get_eight_schedules(self, monkeypatch):
+        """Eight workers failing together must not retry as one wave."""
+        import itertools
+        import threading
+
+        import traktor.resilience as resilience
+
+        offsets = itertools.count()
+        monkeypatch.setattr(
+            resilience.random, "uniform", lambda low, high: (next(offsets) + 1) / 1000.0
+        )
+        schedules = {}
+        lock = threading.Lock()
+
+        def record_sleep(seconds):
+            with lock:
+                schedules.setdefault(threading.current_thread().name, []).append(round(seconds, 6))
+
+        monkeypatch.setattr(resilience.time, "sleep", record_sleep)
+
+        @retry_with_backoff(
+            max_retries=2,
+            base_delay=0.05,
+            max_delay=1.0,
+            retryable_exceptions=(TimeoutError,),
+            name="shared_dependency",
+        )
+        def dependency():
+            raise TimeoutError("shared dependency down")
+
+        barrier = threading.Barrier(8)
+        unexpected = []
+
+        def worker():
+            barrier.wait()
+            try:
+                dependency()
+            except TimeoutError:
+                return
+            unexpected.append(threading.current_thread().name)
+
+        threads = [threading.Thread(target=worker, name=f"client-{i}") for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert unexpected == []
+        assert len(schedules) == 8
+        assert len({tuple(delays) for delays in schedules.values()}) == 8
+
+
+def test_a_backup_that_cannot_be_completed_is_a_failure(tmp_path, monkeypatch):
+    """A snapshot without a manifest cannot be restored, so it is not a backup (#126)."""
+    import traktor.resilience as res
+
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"key": "value"}', encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text("TRAKT_CLIENT_ID=abc\n", encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / "entry.json").write_text('{"cached": true}', encoding="utf-8")
+
+    monkeypatch.setattr(res, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(res, "ENV_FILE", env_file)
+    monkeypatch.setattr(res, "CACHE_DIR", cache_dir)
+
+    backup_dir = tmp_path / "backups"
+    manager = res.BackupManager(backup_dir=backup_dir, compress=True)
+    real_write = res.write_json_atomic
+
+    def refuse_the_manifest(path, data, *args, **kwargs):
+        if str(path).endswith("manifest.json"):
+            return False
+        return real_write(path, data, *args, **kwargs)
+
+    with patch.object(res, "write_json_atomic", refuse_the_manifest):
+        assert manager.create_backup(reason="manual") is None
+
+    assert list(backup_dir.iterdir()) == []
+    assert manager.list_backups() == []
+
+    restored = manager.create_backup(reason="manual")
+    assert restored is not None
+    assert (restored / "manifest.json").exists()

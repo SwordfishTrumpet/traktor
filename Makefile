@@ -25,7 +25,10 @@ dev:
 	uv sync --group dev
 
 test:
-	uv run pytest
+	uv run pytest -W error
+
+# `make test` is the suite CI runs, and CI runs it with warnings as errors,
+# so the local gate fails a warning too (issues #71, #117).
 
 # The inner-loop target: the same suite, stopping at the first failure, so a preflight
 # over a batch answers in one pass instead of after every file. The pipeline's

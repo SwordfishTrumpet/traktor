@@ -691,6 +691,11 @@ def process_list_parallel(
         return {"list_name": list_name, "success": False, "error": "missing_info"}
 
     list_start_time = time.time()
+    # Active before the fetch: a list whose item read fails is still a list that
+    # exists on Trakt, and orphan cleanup deletes every managed playlist that is
+    # not active. Marking it after the fetch made one 5xx delete the user's
+    # playlist (issue #105).
+    updated_playlists.add(list_name)
     try:
         items = trakt.get_list_items(username, list_id)
         stats["items_total"] += len(items)
@@ -766,13 +771,17 @@ def process_official_list_parallel(
 
     logger.info(f"Processing official list: '{list_name}' ({len(items)} items)")
 
+    # The title is active from the start, like the personal-list path: a
+    # failure while collecting items must not make the existing playlist look
+    # orphaned, because cleanup would delete it (issue #105).
+    updated_playlists.add(list_name)
+
     # Build description with "Updated at" timestamp like liked lists
     filtered_description = _build_playlist_description(description)
 
     list_start_time = time.time()
     try:
         if not items:
-            updated_playlists.add(list_name)
             plex.create_or_update_playlist(list_name, [], description=filtered_description)
             return {"list_name": list_name, "success": True, "matched": 0, "not_found": 0}
 
@@ -781,7 +790,6 @@ def process_official_list_parallel(
         items_not_found_before = stats.get("items_not_found", 0)
         plex_items = _collect_plex_items(items, plex, workers, list_name, stats, missing_items)
 
-        updated_playlists.add(list_name)
         plex.create_or_update_playlist(list_name, plex_items, description=filtered_description)
 
         # Calculate items not found for this list
@@ -803,6 +811,22 @@ def process_official_list_parallel(
             "not_found": items_not_found,
             "warning": "no_matches",
         }
+    except requests.exceptions.RequestException as e:
+        # One refused playlist must not abandon the rest, and it must reach the
+        # exit code: the outer handler used to log and carry on, so the run
+        # reported success while the remaining playlists were never touched
+        # (issue #108).
+        logger.error(f"API request failed for official list '{list_name}': {e}")
+        stats["lists_failed"] += 1
+        return {"list_name": list_name, "success": False, "error": f"API error: {e}"}
+    except (ValueError, KeyError, TypeError) as e:
+        logger.error(f"Data processing failed for official list '{list_name}': {e}")
+        stats["lists_failed"] += 1
+        return {"list_name": list_name, "success": False, "error": f"Data error: {e}"}
+    except Exception as e:
+        logger.error(f"Unexpected failure for official list '{list_name}': {e}", exc_info=True)
+        stats["lists_failed"] += 1
+        return {"list_name": list_name, "success": False, "error": str(e)}
     finally:
         list_elapsed = time.time() - list_start_time
         performance_monitor.record_api_call(f"official_list:{list_name}", list_elapsed)
@@ -1239,7 +1263,13 @@ def authenticate_trakt(auth, force=False):
     logger.debug(f"Received auth code (length: {len(auth_code)})")
 
     try:
-        auth.authenticate(auth_code)
+        if not auth.authenticate(auth_code):
+            # The exchange worked but the tokens were not written, so the
+            # next run has to authenticate again (issue #120).
+            logger.error("Trakt authentication succeeded but the tokens were not saved")
+            print("Authenticated with Trakt, but the tokens could not be saved.")
+            print("Set TRAKT_ACCESS_TOKEN and TRAKT_REFRESH_TOKEN in .env and retry.")
+            return False
         logger.info("Trakt authentication successful")
         print("Successfully authenticated with Trakt!")
         return True
@@ -1327,8 +1357,11 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
     that is still going, which is how a twenty-day outage stayed invisible.
     """
     record_run_started(SYNC_PROGRESS_FILE)
+    # Why the run failed, so /status names the operation and the item
+    # instead of only the number the process exits with (issue #124).
+    failures: List[str] = []
     try:
-        exit_code = _sync_lists(args, resource_manager=resource_manager)
+        exit_code = _sync_lists(args, resource_manager=resource_manager, failures=failures)
     except SystemExit as exc:
         record_run_failed(SYNC_PROGRESS_FILE, f"run exited with code {exc.code}")
         raise
@@ -1341,12 +1374,23 @@ def sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = Non
     if exit_code == 0:
         record_run_succeeded(SYNC_PROGRESS_FILE)
     else:
-        record_run_failed(SYNC_PROGRESS_FILE, f"sync finished with exit code {exit_code}")
+        reason = "; ".join(failures) or f"sync finished with exit code {exit_code}"
+        record_run_failed(SYNC_PROGRESS_FILE, reason)
     return exit_code
 
 
-def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = None) -> int:
-    """Main sync function with parallel processing."""
+def _sync_lists(
+    args: Optional[Any] = None,
+    resource_manager: Optional[Any] = None,
+    failures: Optional[List[str]] = None,
+) -> int:
+    """Main sync function with parallel processing.
+    Args:
+        args: Parsed command line arguments
+        resource_manager: Optional ResourceManager for memory checks
+        failures: Optional list that receives one line per failed section,
+            so the caller can record why the run failed (issue #124)
+    """
     # Initialize resource manager if not provided but memory limits are configured
     if resource_manager is None and TRAKTOR_MAX_MEMORY_MB > 0:
         from .resource_manager import ResourceManager
@@ -1379,6 +1423,10 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
         try:
             logger.info("Creating pre-sync backup...")
             backup_path = backup_manager.create_backup(reason="pre_sync")
+            if backup_path is None:
+                # An unusable snapshot is a failed backup, not a created one
+                # (issue #126).
+                raise RuntimeError("the snapshot could not be completed")
             logger.info(f"Pre-sync backup created: {backup_path}")
         except Exception as e:
             logger.error(f"Pre-sync backup failed: {e}")
@@ -1553,6 +1601,11 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
         _check_memory(resource_manager)
 
     # Official lists sync (always enabled by default - no auth required)
+    official_service: Optional[Any] = None
+    # A failed official fetch is not an empty official list: the endpoint's
+    # playlist still exists, so nothing may be pruned on this run, and the run
+    # is a failure (issues #105, #108).
+    official_fetch_failed = False
     if args and _should_sync_official_lists(args):
         print("\n" + "=" * 60)
         print("Official Lists Sync")
@@ -1592,6 +1645,25 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
 
             if all_official_playlists:
                 stats["official_playlists_found"] = len(all_official_playlists)
+
+            # Check the fetch before writing anything: in merged mode the
+            # aggregation still produced playlists from the endpoints that
+            # answered, and updating them would drop the failed endpoint's
+            # items from the real playlist (issue #105).
+            failed = sorted(official_service.failed_endpoints)
+            if failed:
+                official_fetch_failed = True
+                stats["lists_failed"] += len(failed)
+                logger.error(
+                    "Official list fetch failed for %s; keeping the existing playlists "
+                    "and recording this run as failed",
+                    ", ".join(failed),
+                )
+                print(
+                    f"\nOfficial list fetch failed for: {', '.join(failed)}. "
+                    "Keeping the existing playlists."
+                )
+            elif all_official_playlists:
                 print(f"\nProcessing {len(all_official_playlists)} official playlist(s)...")
                 for playlist in all_official_playlists:
                     playlist_name = playlist.get("name", "Unknown")
@@ -1619,12 +1691,16 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
                 print("   No official playlists to process")
 
         except Exception as e:
+            # A failure in this section means the official playlists were not
+            # updated, so the run failed even though it carries on to the rest
+            # of the sync (issue #108). It also means this run cannot tell which
+            # official playlists are live, so cleanup must not prune any (#105).
+            official_fetch_failed = True
             logger.error(f"Official lists sync failed: {e}", exc_info=True)
             print(f"\nOfficial lists sync failed: {e}")
+            stats["lists_failed"] += 1
 
-    _check_memory(resource_manager)
-
-    write_missing_report(missing_items, cache_manager=cache_manager)
+        _check_memory(resource_manager)
 
     # Save undo snapshot before any destructive operations
     if args and (args.interactive or args.undo):
@@ -1636,6 +1712,12 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
     # Skip orphaned playlist cleanup when in watch-only mode (no playlists created)
     if args and args.sync_watched_only:
         logger.info("Skipping orphaned playlist cleanup (--sync-watched-only mode)")
+    elif official_fetch_failed:
+        logger.warning(
+            "Skipping orphaned playlist cleanup: an official list fetch failed, so this "
+            "run does not know the full set of live playlists"
+        )
+        print("   Skipped orphaned playlist cleanup (an official list fetch failed)")
     else:
         print("\nChecking for orphaned playlists...")
 
@@ -1898,9 +1980,17 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
 
         _check_memory(resource_manager)
 
+    # The report is written here, after every section that can add a missing
+    # item. It used to be written before the collection and watchlist syncs, so
+    # their misses never appeared and a run whose only misses came from them
+    # deleted the report (issue #110).
+    write_missing_report(missing_items, cache_manager=cache_manager)
+
     if watch_sync_error:
         logger.error(f"Watch sync did not complete, so this run is a failure: {watch_sync_error}")
         print(f"Watch sync did not complete: {watch_sync_error}")
+        if failures is not None:
+            failures.append(f"watch sync failed: {sanitize_terminal_text(str(watch_sync_error))}")
 
     # Calculate total elapsed time for the sync operation
     elapsed = time.time() - sync_start_time
@@ -1912,6 +2002,9 @@ def _sync_lists(args: Optional[Any] = None, resource_manager: Optional[Any] = No
         elapsed,
         show_performance=args.performance_report if args else False,
     )
+
+    if stats["lists_failed"] > 0 and failures is not None:
+        failures.append(f"{stats['lists_failed']} list(s) failed")
 
     return 1 if (stats["lists_failed"] > 0 or watch_sync_error) else 0
 

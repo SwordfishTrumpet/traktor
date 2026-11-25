@@ -591,3 +591,68 @@ def test_version_flag_prints_the_package_version(capsys, monkeypatch):
 
     assert exit_info.value.code == 0
     assert __version__ in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Issue #111: numeric options accepted values that abort the run
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--workers", "0"],
+        ["--workers", "-1"],
+        ["--max-memory-mb", "0"],
+        ["--max-memory-mb", "-5"],
+        ["--cpu-throttle", "nan"],
+        ["--cpu-throttle", "inf"],
+        ["--cpu-throttle", "0"],
+        ["--cpu-throttle", "101"],
+        ["--workers", "eight"],
+    ],
+)
+def test_numeric_options_refuse_out_of_range_values(monkeypatch, argv):
+    monkeypatch.setattr(sys, "argv", ["traktor", *argv])
+
+    with pytest.raises(SystemExit):
+        cli.parse_args()
+
+
+def test_numeric_options_accept_valid_values(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["traktor", "--workers", "2", "--max-memory-mb", "1024", "--cpu-throttle", "50.5"],
+    )
+
+    args = cli.parse_args()
+
+    assert args.workers == 2
+    assert args.max_memory_mb == 1024
+    assert args.cpu_throttle == 50.5
+
+
+def test_health_check_calls_a_non_utf8_config_unhealthy(tmp_path, monkeypatch):
+    import traktor.settings as settings
+
+    config_file = tmp_path / ".traktor_config.json"
+    config_file.write_bytes(b'{"managed_playlists": ["Caf\xe9"]}')
+    monkeypatch.setattr(settings, "CONFIG_FILE", config_file)
+
+    cli._register_health_checks()
+    results = cli.health_checker.check_all()
+
+    assert results["components"]["config"] != "healthy"
+
+
+def test_run_backup_reports_a_failed_snapshot(monkeypatch, capsys):
+    """A backup that cannot be restored is reported as a failure (issue #126)."""
+    monkeypatch.setattr(cli.backup_manager, "create_backup", lambda reason="manual": None)
+
+    exit_code = cli._run_backup(_make_args(monkeypatch))
+
+    printed = capsys.readouterr().out
+    assert exit_code == 1
+    assert "Backup failed" in printed
+    assert "Backup created" not in printed

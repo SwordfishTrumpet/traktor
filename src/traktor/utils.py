@@ -12,7 +12,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 from .log import logger
 
@@ -153,6 +153,32 @@ def write_json_atomic(
     return write_text_atomic(path, json.dumps(data, indent=indent), mode=mode)
 
 
+def try_read_json_object(path) -> Tuple[bool, Dict[str, Any]]:
+    """Read a JSON object from ``path``, reporting whether it could be read.
+
+    :func:`read_json_object` deliberately treats a missing, unreadable and
+    malformed file alike, because a caller that only merges its own keys in does
+    not care. A read-modify-write that must not replace a file it could not read
+    does care (issue #128).
+
+    Args:
+        path: File to read
+
+    Returns:
+        ``(True, object)`` when the file was read - a missing file reads as an
+        empty object - and ``(False, {})`` when the file is there but could not
+        be read or parsed.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return True, {}
+    except (PermissionError, json.JSONDecodeError, OSError):
+        return False, {}
+    return True, data if isinstance(data, dict) else {}
+
+
 def read_json_object(path) -> Dict[str, Any]:
     """Read a JSON object from ``path``, returning an empty dict when unusable.
 
@@ -166,12 +192,8 @@ def read_json_object(path) -> Dict[str, Any]:
     Returns:
         The parsed object, or an empty dict
     """
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except (FileNotFoundError, PermissionError, json.JSONDecodeError, OSError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    _, data = try_read_json_object(path)
+    return data
 
 
 @contextmanager
