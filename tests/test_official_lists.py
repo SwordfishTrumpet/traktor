@@ -789,3 +789,31 @@ class TestFailedEndpointTracking:
 
         assert service.fetch_endpoint("movies.trending", "weekly") == [{"type": "movie"}]
         assert service.failed_endpoints == set()
+
+
+class TestPeriodSpellingIsCanonical:
+    """The cache key and the API request must agree on the period (issue #130)."""
+
+    @pytest.fixture
+    def service(self, tmp_path):
+        with patch("traktor.trakt_official.TRAKT_CLIENT_ID", "test_client_id"):
+            return OfficialListsService(cache_dir=tmp_path)
+
+    @pytest.mark.parametrize(
+        "requested, canonical", [("Monthly", "monthly"), (" monthly ", "monthly")]
+    )
+    @patch("traktor.official_lists.TraktOfficialClient.get_endpoint")
+    def test_a_case_variant_period_is_requested_and_cached_alike(
+        self, mock_get_endpoint, requested, canonical, service
+    ):
+        mock_get_endpoint.return_value = [
+            {"type": "movie", "movie": {"title": "monthly item", "ids": {"imdb": "tt1"}}}
+        ]
+
+        service.fetch_endpoint("movies.played", requested, use_cache=True)
+
+        mock_get_endpoint.assert_called_once()
+        assert mock_get_endpoint.call_args.kwargs["period"] == canonical
+        cache_file = service._get_cache_file("movies.played", canonical)
+        assert cache_file.exists()
+        assert "monthly item" in cache_file.read_text(encoding="utf-8")

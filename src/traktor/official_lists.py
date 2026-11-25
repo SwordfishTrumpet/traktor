@@ -286,6 +286,12 @@ class OfficialListsService:
         Returns:
             List of items from the endpoint
         """
+        # One canonical spelling for the cache key and the request. Forwarding
+        # the raw value let "Monthly" pass the cache key (which lowercases) while
+        # the API client rejected it and fetched weekly data, which was then
+        # served as the monthly list (issue #130).
+        period = self._valid_period(period)
+
         # Try cache first
         if use_cache:
             cached = self._load_cache(endpoint_name, period)
