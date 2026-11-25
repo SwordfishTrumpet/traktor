@@ -20,20 +20,20 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
         with:
-          version: "latest"
+          version: "0.11.6"
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Cache uv dependencies
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6
         with:
           path: ~/.cache/uv
           key: uv-${{ runner.os }}-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml', 'uv.lock') }}
@@ -57,7 +57,7 @@ jobs:
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.12'
-        uses: codecov/codecov-action@v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5  # v7
         with:
           files: ./coverage.xml
           fail_ci_if_error: false
@@ -70,7 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Install Bandit
         run: pip install bandit==1.9.4
@@ -79,7 +79,7 @@ jobs:
         run: bandit -r src/ -f json -o bandit-report.json -ll -ii
 
       - name: Upload security report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         if: always()
         with:
           name: bandit-security-report
@@ -92,10 +92,10 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request' || github.event_name == 'push'
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6
 
       - name: Export locked dependencies
         # --no-emit-project: pip-audit installs with hash checking enabled and
@@ -112,11 +112,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
-      - name: Install actionlint (pinned)
+      - name: Install actionlint (pinned, checksum verified)
+        # The installer script used to be fetched and executed on every run, so
+        # a change upstream ran here with this repository's token. The release
+        # artifact is downloaded and its published SHA-256 checked before it is
+        # unpacked and executed (issue #18).
         run: |
-          bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.9/scripts/download-actionlint.bash)
+          version=1.7.9
+          archive="actionlint_${version}_linux_amd64.tar.gz"
+          curl -sSfLo "$archive" \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/${archive}"
+          echo "233b280d05e100837f4af1433c7b40a5dcb306e3aa68fb4f17f8a7f45a7df7b4  ${archive}" | sha256sum -c -
+          tar -xzf "$archive" actionlint
 
       - name: Run actionlint
         run: ./actionlint -color
