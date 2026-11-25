@@ -8,6 +8,7 @@ import gzip
 import hashlib
 import json
 import os
+import random
 import shutil
 import threading
 import time
@@ -1003,6 +1004,31 @@ class IntegrityChecker:
             return True
 
 
+# At most this share of a computed retry delay is added back at random, so
+# clients that fail together do not retry together (issue #125).
+RETRY_JITTER_FRACTION = 0.5
+
+
+def add_jitter(delay: float) -> float:
+    """Return ``delay`` plus a random share of it, never less than ``delay``.
+
+    Parallel workers retry a shared dependency on the same schedule, so they
+    come back in one synchronized wave and hit the dependency exactly as it
+    recovers. Adding a random share - rather than subtracting - keeps a
+    server-supplied ``Retry-After`` a lower bound while still spreading the
+    clients apart (issue #125).
+
+    Args:
+        delay: Deterministic delay in seconds
+
+    Returns:
+        A delay between ``delay`` and ``delay * (1 + RETRY_JITTER_FRACTION)``
+    """
+    if delay <= 0:
+        return 0.0
+    return delay + random.uniform(0.0, delay * RETRY_JITTER_FRACTION)
+
+
 def retry_with_backoff(
     max_retries: int = 3,
     base_delay: float = 1.0,
@@ -1058,7 +1084,7 @@ def retry_with_backoff(
                     if not should_retry or attempt >= max_retries:
                         raise
 
-                    delay = min(base_delay * (2**attempt), max_delay)
+                    delay = add_jitter(min(base_delay * (2**attempt), max_delay))
                     logger.warning(
                         f"[{name}] Attempt {attempt + 1}/{max_retries + 1} failed: {e}. "
                         f"Retrying in {delay:.1f}s..."

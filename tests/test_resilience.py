@@ -12,6 +12,7 @@ from traktor.resilience import (
     CircuitBreakerOpen,
     HealthCheck,
     SyncProgress,
+    add_jitter,
     retry_with_backoff,
 )
 
@@ -159,7 +160,7 @@ class TestRetryWithBackoff:
         assert call_count == 2
 
     def test_exponential_backoff_delay(self, tmp_path):
-        """Delay should increase exponentially."""
+        """The deterministic backoff grows exponentially; jitter only adds (issue #125)."""
         delays = []
 
         @retry_with_backoff(
@@ -176,14 +177,14 @@ class TestRetryWithBackoff:
             with pytest.raises(RuntimeError):
                 always_fail()
 
-        # Delays should be: 0.1, 0.2, 0.4 (exponential)
+        # Nominal delays are 0.1, 0.2, 0.4 (exponential); each carries up to 50%
+        # of extra jitter so concurrent clients separate.
         assert len(delays) == 3
-        assert delays[0] == 0.1
-        assert delays[1] == 0.2
-        assert delays[2] == 0.4
+        for index, nominal in enumerate((0.1, 0.2, 0.4)):
+            assert nominal <= delays[index] <= nominal * 1.5
 
     def test_max_delay_cap(self, tmp_path):
-        """Delay should not exceed max_delay."""
+        """The backoff stops growing at max_delay; jitter adds at most half of it."""
         delays = []
 
         @retry_with_backoff(
@@ -201,7 +202,7 @@ class TestRetryWithBackoff:
                 always_fail()
 
         # All delays should be capped at 2.0
-        assert all(d <= 2.0 for d in delays)
+        assert all(d <= 2.0 * 1.5 for d in delays)
 
 
 class TestSyncProgress:
@@ -1297,3 +1298,69 @@ def test_an_unreadable_breaker_variable_keeps_the_default(monkeypatch):
         monkeypatch.delenv("TRAKTOR_TRAKT_FAILURE_THRESHOLD", raising=False)
         importlib.reload(settings)
         importlib.reload(resilience)
+
+
+class TestRetryJitter:
+    """Concurrent clients must not retry a shared dependency in lockstep (issue #125)."""
+
+    def test_a_jittered_delay_never_waits_less_than_the_delay(self):
+        """Jitter only adds, so a server's Retry-After stays a lower bound."""
+        import traktor.resilience as resilience
+
+        for delay in (0.5, 4.0, 30.0):
+            for _ in range(50):
+                jittered = add_jitter(delay)
+                assert delay <= jittered <= delay * (1 + resilience.RETRY_JITTER_FRACTION)
+        assert add_jitter(0) == 0.0
+
+    def test_eight_concurrent_clients_get_eight_schedules(self, monkeypatch):
+        """Eight workers failing together must not retry as one wave."""
+        import itertools
+        import threading
+
+        import traktor.resilience as resilience
+
+        offsets = itertools.count()
+        monkeypatch.setattr(
+            resilience.random, "uniform", lambda low, high: (next(offsets) + 1) / 1000.0
+        )
+        schedules = {}
+        lock = threading.Lock()
+
+        def record_sleep(seconds):
+            with lock:
+                schedules.setdefault(threading.current_thread().name, []).append(round(seconds, 6))
+
+        monkeypatch.setattr(resilience.time, "sleep", record_sleep)
+
+        @retry_with_backoff(
+            max_retries=2,
+            base_delay=0.05,
+            max_delay=1.0,
+            retryable_exceptions=(TimeoutError,),
+            name="shared_dependency",
+        )
+        def dependency():
+            raise TimeoutError("shared dependency down")
+
+        barrier = threading.Barrier(8)
+        unexpected = []
+
+        def worker():
+            barrier.wait()
+            try:
+                dependency()
+            except TimeoutError:
+                return
+            unexpected.append(threading.current_thread().name)
+
+        threads = [threading.Thread(target=worker, name=f"client-{i}") for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert unexpected == []
+        assert len(schedules) == 8
+        assert len({tuple(delays) for delays in schedules.values()}) == 8
+

@@ -93,3 +93,4 @@
 122	uv run pytest -q tests/test_clients.py -k opens_the_trakt_circuit_breaker	0	reliability
 123	uv run pytest -q tests/test_clients.py -k counted_by_the_plex_circuit_breaker	0	reliability
 124	uv run pytest -q tests/test_sync.py -k names_the_show_a_failed_watch_sync	0	observability
+125	uv run pytest -q tests/test_resilience.py -k "jitter or eight_concurrent_clients"	0	reliability

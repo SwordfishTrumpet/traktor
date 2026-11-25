@@ -20,6 +20,7 @@ from .log import get_correlation_id, logger
 from .performance import performance_monitor
 from .resilience import (
     CircuitBreakerOpen,
+    add_jitter,
     plex_circuit_breaker,
     retry_with_backoff,
     trakt_circuit_breaker,
@@ -27,8 +28,8 @@ from .resilience import (
 from .settings import (
     CACHE_DIR,
     CACHE_MAX_AGE_HOURS,
-    CONFIG_FILE,
     CACHE_VERSION,
+    CONFIG_FILE,
     ENV_FILE,
     TRAKT_ACCESS_TOKEN,
     TRAKT_API_URL,
@@ -1466,6 +1467,10 @@ class TraktClient:
                     retry_after = parse_retry_after(
                         response.headers.get("Retry-After"), RETRY_BACKOFF_BASE**attempt
                     )
+                    # Jitter only adds, so the server's Retry-After stays a
+                    # lower bound while eight workers stop sharing one
+                    # schedule (issue #125).
+                    retry_after = add_jitter(retry_after)
                     logger.warning(
                         f"Rate limited (429). Retry after {retry_after}s. Attempt {attempt + 1}/{MAX_RETRIES}"
                     )
@@ -1475,7 +1480,7 @@ class TraktClient:
 
                 # Handle server errors (5xx) with exponential backoff
                 if 500 <= response.status_code < 600:
-                    wait_time = RETRY_BACKOFF_BASE**attempt
+                    wait_time = add_jitter(RETRY_BACKOFF_BASE**attempt)
                     logger.warning(
                         f"Server error ({response.status_code}). Retrying in {wait_time}s. Attempt {attempt + 1}/{MAX_RETRIES}"
                     )
@@ -1486,7 +1491,7 @@ class TraktClient:
                 return response
 
             except requests.exceptions.Timeout:
-                wait_time = RETRY_BACKOFF_BASE**attempt
+                wait_time = add_jitter(RETRY_BACKOFF_BASE**attempt)
                 logger.warning(
                     f"Request timeout. Retrying in {wait_time}s. Attempt {attempt + 1}/{MAX_RETRIES}"
                 )
@@ -1496,7 +1501,7 @@ class TraktClient:
                     raise
 
             except requests.exceptions.ConnectionError:
-                wait_time = RETRY_BACKOFF_BASE**attempt
+                wait_time = add_jitter(RETRY_BACKOFF_BASE**attempt)
                 logger.warning(
                     f"Connection error. Retrying in {wait_time}s. Attempt {attempt + 1}/{MAX_RETRIES}"
                 )
