@@ -2236,8 +2236,6 @@ class TestOfficialPlaylistIsolation:
     def test_a_refused_official_playlist_does_not_abort_the_rest(self, monkeypatch, tmp_path):
         from plexapi.exceptions import BadRequest
 
-        from tests.test_sync import TestSyncListsFeatureSections
-
         env = TestSyncListsFeatureSections._setup(
             TestSyncListsFeatureSections, monkeypatch, tmp_path
         )
