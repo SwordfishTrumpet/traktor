@@ -1420,6 +1420,10 @@ def _sync_lists(
         try:
             logger.info("Creating pre-sync backup...")
             backup_path = backup_manager.create_backup(reason="pre_sync")
+            if backup_path is None:
+                # An unusable snapshot is a failed backup, not a created one
+                # (issue #126).
+                raise RuntimeError("the snapshot could not be completed")
             logger.info(f"Pre-sync backup created: {backup_path}")
         except Exception as e:
             logger.error(f"Pre-sync backup failed: {e}")

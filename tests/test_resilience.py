@@ -1364,3 +1364,38 @@ class TestRetryJitter:
         assert len(schedules) == 8
         assert len({tuple(delays) for delays in schedules.values()}) == 8
 
+
+def test_a_backup_that_cannot_be_completed_is_a_failure(tmp_path, monkeypatch):
+    """A snapshot without a manifest cannot be restored, so it is not a backup (#126)."""
+    import traktor.resilience as res
+
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"key": "value"}', encoding="utf-8")
+    env_file = tmp_path / ".env"
+    env_file.write_text("TRAKT_CLIENT_ID=abc\n", encoding="utf-8")
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    (cache_dir / "entry.json").write_text('{"cached": true}', encoding="utf-8")
+
+    monkeypatch.setattr(res, "CONFIG_FILE", config_file)
+    monkeypatch.setattr(res, "ENV_FILE", env_file)
+    monkeypatch.setattr(res, "CACHE_DIR", cache_dir)
+
+    backup_dir = tmp_path / "backups"
+    manager = res.BackupManager(backup_dir=backup_dir, compress=True)
+    real_write = res.write_json_atomic
+
+    def refuse_the_manifest(path, data, *args, **kwargs):
+        if str(path).endswith("manifest.json"):
+            return False
+        return real_write(path, data, *args, **kwargs)
+
+    with patch.object(res, "write_json_atomic", refuse_the_manifest):
+        assert manager.create_backup(reason="manual") is None
+
+    assert list(backup_dir.iterdir()) == []
+    assert manager.list_backups() == []
+
+    restored = manager.create_backup(reason="manual")
+    assert restored is not None
+    assert (restored / "manifest.json").exists()

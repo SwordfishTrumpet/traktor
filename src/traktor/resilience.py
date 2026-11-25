@@ -386,7 +386,7 @@ class BackupManager:
             ("cache", CACHE_DIR),
         ]
 
-    def create_backup(self, reason: str = "manual") -> Path:
+    def create_backup(self, reason: str = "manual") -> Optional[Path]:
         """Create a backup of all traktor state.
 
         The directory is created exclusively (``exist_ok=False``) and its name
@@ -398,7 +398,9 @@ class BackupManager:
             reason: Reason for backup (manual, scheduled, pre_sync, etc.)
 
         Returns:
-            Path to created backup
+            Path to the created backup, or None when it could not be completed.
+            A snapshot without a manifest cannot be restored, so it is removed
+            rather than reported as a usable backup (issue #126).
         """
         final_path = self._create_backup_dir(reason)
         # Fill a hidden staging directory first, so another run's retention
@@ -444,7 +446,11 @@ class BackupManager:
         manifest_path = backup_path / "manifest.json"
         if not write_json_atomic(manifest_path, manifest, mode=0o600):
             logger.error(f"Failed to write backup manifest: {manifest_path}")
-            return backup_path
+            # An incompletely written snapshot cannot be restored, so it must
+            # not survive as something a retention sweep counts or an operator
+            # restores (issue #126).
+            shutil.rmtree(backup_path, ignore_errors=True)
+            return None
 
         # Publish the finished snapshot under its retention-visible name. A
         # snapshot only becomes visible once it can be restored (issue #107).
@@ -453,7 +459,8 @@ class BackupManager:
                 working_path.rename(final_path)
             except OSError as e:
                 logger.error(f"Could not publish backup {final_path.name}: {e}")
-                return working_path
+                shutil.rmtree(working_path, ignore_errors=True)
+                return None
             backup_path = final_path
 
         # Cleanup old backups

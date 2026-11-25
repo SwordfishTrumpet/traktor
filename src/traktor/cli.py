@@ -360,6 +360,12 @@ def _run_backup(args):
     """Create a backup."""
     print("Creating backup...")
     backup_path = backup_manager.create_backup(reason="manual")
+    if backup_path is None:
+        # A snapshot that could not be completed cannot be restored, so saying
+        # it was created would send the operator into a recovery with nothing
+        # to recover from (issue #126).
+        print("❌ Backup failed: the snapshot could not be completed")
+        return 1
     print(f"✅ Backup created: {backup_path}")
     return 0
 

@@ -644,3 +644,15 @@ def test_health_check_calls_a_non_utf8_config_unhealthy(tmp_path, monkeypatch):
     results = cli.health_checker.check_all()
 
     assert results["components"]["config"] != "healthy"
+
+
+def test_run_backup_reports_a_failed_snapshot(monkeypatch, capsys):
+    """A backup that cannot be restored is reported as a failure (issue #126)."""
+    monkeypatch.setattr(cli.backup_manager, "create_backup", lambda reason="manual": None)
+
+    exit_code = cli._run_backup(_make_args(monkeypatch))
+
+    printed = capsys.readouterr().out
+    assert exit_code == 1
+    assert "Backup failed" in printed
+    assert "Backup created" not in printed
