@@ -178,7 +178,15 @@ PLEX_URL=http://your-plex-host:32400
 PLEX_TOKEN=your-plex-token
 ```
 
-The first command that needs Trakt asks you to authorize once. Paste the code, or the whole callback URL, into the terminal; if your redirect URI is a localhost URL, a listener picks up the browser redirect instead. The tokens are then written back to the same `.env` file, with the file's permissions restricted to your user. When a refresh happens, traktor prints the new tokens and asks you to update that file.
+The first command that needs Trakt asks you to authorize once. Paste the whole callback URL or the
+bare code into the terminal; if your redirect URI is a localhost URL, a listener picks up the
+browser redirect instead.
+
+Only a callback URL carries the login's `state`, and that is what proves the code came from the
+login you just started. The default out-of-band redirect URI (`urn:ietf:wg:oauth:2.0:oob`) shows
+only a code, so it cannot be checked: a code someone else obtained can be pasted there and will
+be accepted. Register a loopback redirect such as `http://127.0.0.1:8080/callback` on your Trakt
+app and set `TRAKT_REDIRECT_URI` to the same value when you want that check (issue #10). The tokens are then written back to the same `.env` file, with the file's permissions restricted to your user. When a refresh happens, traktor prints the new tokens and asks you to update that file.
 
 ## 8. Check the install
 
