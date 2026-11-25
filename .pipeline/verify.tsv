@@ -100,3 +100,6 @@
 129	uv run pytest -q tests/test_config.py tests/test_clients.py -k "managed_list or non_string_entry or valid_config_is_returned or OrphanCleanupRefusesAWrongContainer"	0	security
 130	uv run pytest -q tests/test_official_lists.py -k PeriodSpellingIsCanonical	0	correctness
 131	uv run pytest -q tests/test_official_lists.py tests/test_log.py -k "CacheFreshnessIsAbsolute or JSONTimestampIsAnInstant"	0	correctness
+10	uv run pytest -q tests/test_sync.py -k PastedCallbackState	0	security
+18	uv run pytest -q tests/test_packaging.py -k "pinned or actionlint or tool_versions"	0	supply-chain
+40	uv run pytest -q tests/test_packaging.py -k codeql	0	observability

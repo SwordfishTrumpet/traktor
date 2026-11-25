@@ -2374,3 +2374,45 @@ def test_the_run_record_names_the_show_a_failed_watch_sync_lost(monkeypatch, tmp
     recorded = run_status.read_run_status(progress_file)
     assert recorded["status"] == "failed"
     assert "Broken Show" in recorded["error"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #10: a pasted callback must carry the state this login issued
+# ---------------------------------------------------------------------------
+
+
+class TestPastedCallbackState:
+    """The paste path is the second door into the login (#10)."""
+
+    def test_a_blank_state_is_extracted_as_blank_not_as_absent(self):
+        assert sync._extract_auth_state("code=abc&state=") == ""
+        assert sync._extract_auth_state("http://127.0.0.1:8080/cb?code=abc&state=") == ""
+
+    def test_a_missing_state_parameter_is_absent(self):
+        assert sync._extract_auth_state("code=abc") is None
+        assert sync._extract_auth_state("http://127.0.0.1:8080/cb?code=abc") is None
+
+    def test_a_bare_code_is_still_accepted(self):
+        """The headless flow shows only the code, so a bare code stays valid."""
+        assert sync._pasted_input_is_acceptable("abc123", "st-issued") is True
+
+    def test_a_callback_with_the_issued_state_is_accepted(self):
+        pasted = "http://127.0.0.1:8080/cb?code=abc123&state=st-issued"
+
+        assert sync._pasted_input_is_acceptable(pasted, "st-issued") is True
+
+    def test_a_callback_with_another_state_is_refused(self):
+        pasted = "http://127.0.0.1:8080/cb?code=abc123&state=st-someone-else"
+
+        assert sync._pasted_input_is_acceptable(pasted, "st-issued") is False
+
+    def test_a_callback_with_a_blank_state_is_refused(self):
+        """parse_qs dropped a blank value, so this looked like a bare code (#10)."""
+        pasted = "http://127.0.0.1:8080/cb?code=abc123&state="
+
+        assert sync._pasted_input_is_acceptable(pasted, "st-issued") is False
+
+    def test_a_callback_without_a_state_is_refused(self):
+        pasted = "http://127.0.0.1:8080/cb?code=abc123"
+
+        assert sync._pasted_input_is_acceptable(pasted, "st-issued") is False
