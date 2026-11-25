@@ -265,7 +265,13 @@ class WatchSyncEngine:
                 # Prune before this save too: _apply_changes() may not have run
                 # (a dry run) and the run still persists state (issue #69).
                 self.history.prune_synced_items()
-                self.history.update_last_sync_timestamp()
+                if not self.history.update_last_sync_timestamp():
+                    # The delta window did not move, so the next run re-reads the
+                    # same events instead of skipping them (issue #127).
+                    logger.error(
+                        "Could not save the last sync timestamp; the next run will "
+                        "re-read this window"
+                    )
 
             # Log final summary
             summary = progress.get_summary()
@@ -1167,7 +1173,11 @@ class WatchSyncEngine:
             # changed (issue #69): a settled library - the state a converged sync
             # reaches - is exactly when expired entries used to survive for ever.
             self.history.prune_synced_items()
-            self.history.save_state()
+            if not self.history.save_state():
+                logger.error(
+                    "Could not save watch sync state; the changes applied this run are "
+                    "not recorded"
+                )
 
         # Apply Trakt changes in batches
         movies_to_add = []

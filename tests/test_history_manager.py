@@ -669,3 +669,50 @@ class TestUnkeyedRows:
             "episode",
             "movie",
         ]
+
+
+# ---------------------------------------------------------------------------
+# Issue #127: a failed write is reported, not reported as success
+# ---------------------------------------------------------------------------
+
+
+class TestFailedWritesAreReported:
+    """A mutator must not claim a change the file does not hold (issue #127)."""
+
+    def test_save_state_reports_success(self, mock_history_manager):
+        assert mock_history_manager.save_state() is True
+
+    def test_remove_reports_a_failed_write(self, mock_history_manager, monkeypatch):
+        mock_history_manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt1", plex_rating_key=1
+        )
+        assert mock_history_manager.save_state() is True
+        monkeypatch.setattr(history_manager, "write_json_atomic", lambda *a, **k: False)
+
+        assert mock_history_manager.remove_synced_item(plex_rating_key=1) is False
+
+    def test_timestamp_does_not_advance_after_a_failed_write(
+        self, mock_history_manager, monkeypatch
+    ):
+        monkeypatch.setattr(history_manager, "write_json_atomic", lambda *a, **k: False)
+
+        assert mock_history_manager.update_last_sync_timestamp() is False
+        assert mock_history_manager.get_last_sync_timestamp() is None
+
+    def test_restore_reports_a_failed_write(self, mock_history_manager, tmp_path, monkeypatch):
+        mock_history_manager.add_or_update_synced_item(
+            media_type="movie", imdb_id="tt2", plex_rating_key=2
+        )
+        assert mock_history_manager.save_state() is True
+        backup = mock_history_manager.backup_state(tmp_path / "state.json.backup")
+        assert backup is not None
+        assert mock_history_manager.clear_all() is True
+
+        monkeypatch.setattr(history_manager, "write_json_atomic", lambda *a, **k: False)
+
+        assert mock_history_manager.restore_from_backup(backup) is False
+
+    def test_clear_reports_a_failed_write(self, mock_history_manager, monkeypatch):
+        monkeypatch.setattr(history_manager, "write_json_atomic", lambda *a, **k: False)
+
+        assert mock_history_manager.clear_all() is False

@@ -93,7 +93,7 @@ class WatchHistoryManager:
         required_keys = ["version", "synced_items"]
         return all(key in state for key in required_keys)
 
-    def save_state(self):
+    def save_state(self) -> bool:
         """Merge this run's state into the file on disk and write it once (issue #65).
 
         Every run used to load the whole state and write it back in full, so a
@@ -103,19 +103,27 @@ class WatchHistoryManager:
         run removed stay removed, and ``last_sync_timestamp`` only moves
         forward. The file is still replaced atomically, so an interrupted save
         leaves the previous file intact (issue #23).
+
+        Returns:
+            True when the file was replaced, False when it could not be read or
+            written. Callers must not report a change that is not on disk
+            (issue #127).
         """
         with file_lock(self.sync_file):
             merged = self._merge_with_disk()
+            if merged is None:
+                return False
             written = write_json_atomic(self.sync_file, merged)
         if not written:
             logger.error(f"Failed to save watch sync state: {self.sync_file}")
-            return
+            return False
         self.state = merged
         self._build_index()
         # The tombstones now live on disk; this run's own list is spent.
         self._removed_keys = {}
         self._replace_on_save = False
         logger.debug(f"Saved watch sync state to {self.sync_file}")
+        return True
 
     def _merge_with_disk(self) -> Dict[str, Any]:
         """Return this run's state merged with what is on disk right now."""
@@ -271,10 +279,19 @@ class WatchHistoryManager:
             return first
         return second if second_at >= first_at else first
 
-    def update_last_sync_timestamp(self):
-        """Update the last sync timestamp to now."""
+    def update_last_sync_timestamp(self) -> bool:
+        """Advance the last sync timestamp, returning whether it was persisted.
+
+        The stamp moves the delta window, so keeping it in memory after a failed
+        write would make the next run skip changes this one never synced
+        (issue #127).
+        """
+        previous = self.state.get("last_sync_timestamp")
         self.state["last_sync_timestamp"] = datetime.now(timezone.utc).isoformat()
-        self.save_state()
+        if not self.save_state():
+            self.state["last_sync_timestamp"] = previous
+            return False
+        return True
 
     def get_last_sync_timestamp(self):
         """Get the last sync timestamp as datetime or None."""
@@ -468,7 +485,7 @@ class WatchHistoryManager:
             plex_rating_key: Plex rating key to search for
 
         Returns:
-            True if item was removed, False if not found
+            True if item was removed and the removal was saved, False otherwise
         """
         for i, item in enumerate(self.state["synced_items"]):
             match = False
@@ -485,8 +502,10 @@ class WatchHistoryManager:
                 self.state["synced_items"].pop(i)
                 self._forget(item)
                 logger.debug(f"Removed synced item: {item.get('imdb_id') or item.get('tmdb_id')}")
-                self.save_state()
-                return True
+                # Report the write, not the intent: the caller must not tell the
+                # user an item was dropped while the file still holds it
+                # (issue #127).
+                return self.save_state()
 
         return False
 
@@ -513,16 +532,22 @@ class WatchHistoryManager:
             ),
         }
 
-    def clear_all(self):
-        """Clear all synced items and reset state."""
+    def clear_all(self) -> bool:
+        """Clear all synced items and reset state.
+
+        Returns:
+            True when the emptied state was written, False otherwise
+        """
         self.state = self._create_empty_state()
         self._build_index()
         self._removed_keys.clear()
         # An explicit clear replaces the file: merging would resurrect every
         # entry it just dropped.
         self._replace_on_save = True
-        self.save_state()
-        logger.info("Cleared all watch sync state")
+        saved = self.save_state()
+        if saved:
+            logger.info("Cleared all watch sync state")
+        return saved
 
     def backup_state(self, backup_path=None):
         """Create a backup of current state.
@@ -570,7 +595,10 @@ class WatchHistoryManager:
             self._build_index()
             self._removed_keys.clear()
             self._replace_on_save = True
-            self.save_state()
+            if not self.save_state():
+                # The backup was read, but the restore is not on disk, so it did
+                # not happen (issue #127).
+                return False
             logger.info(f"Restored watch sync state from backup: {backup_path}")
             return True
 
