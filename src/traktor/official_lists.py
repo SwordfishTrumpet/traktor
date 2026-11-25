@@ -374,6 +374,10 @@ class OfficialListsService:
                     logger.debug(f"Fetched {len(items)} items from {endpoint_name}")
                 except (requests.exceptions.RequestException, ValueError, KeyError, TypeError) as e:
                     logger.error(f"Failed to fetch {endpoint_name}: {e}")
+                    # An endpoint that raised here is as unavailable as one
+                    # whose own handler gave up, so its existing playlist must
+                    # not be treated as removed (issue #105).
+                    self.failed_endpoints.add(endpoint_name)
                     results[endpoint_name] = []
 
         return results

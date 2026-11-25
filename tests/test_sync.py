@@ -1691,6 +1691,78 @@ class TestSyncListsFeatureSections:
         assert sync.sync_lists(args) == 1
         env["plex_client"].cleanup_orphaned_playlists.assert_not_called()
 
+    def test_a_failed_endpoint_leaves_the_merged_playlist_untouched(self, monkeypatch, tmp_path):
+        """Merged mode must not write partial content over a live playlist (#105)."""
+        env = self._setup(monkeypatch, tmp_path)
+        args = self._args(
+            monkeypatch,
+            ["--list-source", "official", "--official-playlist-mode", "merged"],
+        )
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.played"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        official_service = MagicMock()
+        # The aggregation still returns the playlists built from the endpoints
+        # that answered; writing them would drop the failed endpoint's items.
+        official_service.get_playlists_from_endpoints.return_value = [
+            {"name": "Trakt Official - Movies", "items": [{"title": "Heat"}]}
+        ]
+        official_service.failed_endpoints = {"movies.played"}
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+
+        processed = []
+        monkeypatch.setattr(
+            sync, "process_official_list_parallel", lambda *a, **k: processed.append(a[0])
+        )
+
+        assert sync.sync_lists(args) == 1
+        assert processed == []
+        env["plex_client"].create_or_update_playlist.assert_not_called()
+        env["plex_client"].cleanup_orphaned_playlists.assert_not_called()
+
+    def test_an_official_section_failure_still_keeps_the_playlists(self, monkeypatch, tmp_path):
+        """A section that raises cannot tell which playlists are live (#105)."""
+        env = self._setup(monkeypatch, tmp_path)
+        args = self._args(monkeypatch, ["--list-source", "official"])
+
+        monkeypatch.setattr(sync, "_needs_oauth_auth", lambda *a: False)
+        monkeypatch.setattr(sync, "_should_sync_official_lists", lambda *a: True)
+        monkeypatch.setattr(sync, "_get_official_endpoints", lambda *a: ["movies.played"])
+        monkeypatch.setattr(sync, "_get_official_periods", lambda *a: ["weekly"])
+
+        official_service = MagicMock()
+        official_service.get_playlists_from_endpoints.side_effect = ValueError("bad payload")
+        official_service.failed_endpoints = set()
+        monkeypatch.setattr(sync, "OfficialListsService", lambda *a, **k: official_service)
+
+        assert sync.sync_lists(args) == 1
+        env["plex_client"].cleanup_orphaned_playlists.assert_not_called()
+
+    def test_a_collection_failure_keeps_the_official_playlist_active(self, monkeypatch):
+        """The name is active before items are collected, like the personal path (#105)."""
+        updated: set = set()
+        stats = {"items_total": 0, "items_not_found": 0, "lists_failed": 0}
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("the collector died")
+
+        monkeypatch.setattr(sync, "_collect_plex_items", explode)
+
+        result = sync.process_official_list_parallel(
+            {"name": "Trakt Official - Movies", "items": [{"title": "Heat"}]},
+            MagicMock(),
+            2,
+            stats,
+            updated,
+            [],
+        )
+
+        assert result["success"] is False
+        assert "Trakt Official - Movies" in updated
+
     def test_merged_official_mode_asks_for_every_period_at_once(self, monkeypatch, tmp_path):
         """Merged mode must aggregate the periods, not write one playlist each (#82)."""
         self._setup(monkeypatch, tmp_path)

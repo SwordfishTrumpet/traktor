@@ -790,6 +790,20 @@ class TestFailedEndpointTracking:
         assert service.fetch_endpoint("movies.trending", "weekly") == [{"type": "movie"}]
         assert service.failed_endpoints == set()
 
+    def test_a_raising_endpoint_is_recorded_as_failed(self, tmp_path):
+        """An endpoint that raises in the pool is as unavailable as one that gave up (#105)."""
+        service = OfficialListsService(cache_dir=tmp_path)
+
+        def explode(*args, **kwargs):
+            raise ValueError("bad payload")
+
+        service.fetch_endpoint = explode
+
+        results = service.fetch_multiple_endpoints(["movies.trending"], max_workers=1)
+
+        assert results == {"movies.trending": []}
+        assert service.failed_endpoints == {"movies.trending"}
+
 
 class TestPeriodSpellingIsCanonical:
     """The cache key and the API request must agree on the period (issue #130)."""

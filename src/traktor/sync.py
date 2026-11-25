@@ -771,13 +771,17 @@ def process_official_list_parallel(
 
     logger.info(f"Processing official list: '{list_name}' ({len(items)} items)")
 
+    # The title is active from the start, like the personal-list path: a
+    # failure while collecting items must not make the existing playlist look
+    # orphaned, because cleanup would delete it (issue #105).
+    updated_playlists.add(list_name)
+
     # Build description with "Updated at" timestamp like liked lists
     filtered_description = _build_playlist_description(description)
 
     list_start_time = time.time()
     try:
         if not items:
-            updated_playlists.add(list_name)
             plex.create_or_update_playlist(list_name, [], description=filtered_description)
             return {"list_name": list_name, "success": True, "matched": 0, "not_found": 0}
 
@@ -786,7 +790,6 @@ def process_official_list_parallel(
         items_not_found_before = stats.get("items_not_found", 0)
         plex_items = _collect_plex_items(items, plex, workers, list_name, stats, missing_items)
 
-        updated_playlists.add(list_name)
         plex.create_or_update_playlist(list_name, plex_items, description=filtered_description)
 
         # Calculate items not found for this list
@@ -1599,6 +1602,10 @@ def _sync_lists(
 
     # Official lists sync (always enabled by default - no auth required)
     official_service: Optional[Any] = None
+    # A failed official fetch is not an empty official list: the endpoint's
+    # playlist still exists, so nothing may be pruned on this run, and the run
+    # is a failure (issues #105, #108).
+    official_fetch_failed = False
     if args and _should_sync_official_lists(args):
         print("\n" + "=" * 60)
         print("Official Lists Sync")
@@ -1638,6 +1645,25 @@ def _sync_lists(
 
             if all_official_playlists:
                 stats["official_playlists_found"] = len(all_official_playlists)
+
+            # Check the fetch before writing anything: in merged mode the
+            # aggregation still produced playlists from the endpoints that
+            # answered, and updating them would drop the failed endpoint's
+            # items from the real playlist (issue #105).
+            failed = sorted(official_service.failed_endpoints)
+            if failed:
+                official_fetch_failed = True
+                stats["lists_failed"] += len(failed)
+                logger.error(
+                    "Official list fetch failed for %s; keeping the existing playlists "
+                    "and recording this run as failed",
+                    ", ".join(failed),
+                )
+                print(
+                    f"\nOfficial list fetch failed for: {', '.join(failed)}. "
+                    "Keeping the existing playlists."
+                )
+            elif all_official_playlists:
                 print(f"\nProcessing {len(all_official_playlists)} official playlist(s)...")
                 for playlist in all_official_playlists:
                     playlist_name = playlist.get("name", "Unknown")
@@ -1667,31 +1693,14 @@ def _sync_lists(
         except Exception as e:
             # A failure in this section means the official playlists were not
             # updated, so the run failed even though it carries on to the rest
-            # of the sync (issue #108).
+            # of the sync (issue #108). It also means this run cannot tell which
+            # official playlists are live, so cleanup must not prune any (#105).
+            official_fetch_failed = True
             logger.error(f"Official lists sync failed: {e}", exc_info=True)
             print(f"\nOfficial lists sync failed: {e}")
             stats["lists_failed"] += 1
 
         _check_memory(resource_manager)
-
-    # A failed official fetch is not an empty official list: the endpoint's
-    # playlist still exists, so nothing may be pruned on this run, and the run
-    # is a failure (issue #105).
-    official_fetch_failed = False
-    if official_service is not None:
-        failed = sorted(official_service.failed_endpoints)
-        if failed:
-            official_fetch_failed = True
-            stats["lists_failed"] += len(failed)
-            logger.error(
-                "Official list fetch failed for %s; keeping the existing playlists "
-                "and recording this run as failed",
-                ", ".join(failed),
-            )
-            print(
-                f"\nOfficial list fetch failed for: {', '.join(failed)}. "
-                "Keeping the existing playlists."
-            )
 
     # Save undo snapshot before any destructive operations
     if args and (args.interactive or args.undo):
