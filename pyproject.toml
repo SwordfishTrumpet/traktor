@@ -14,7 +14,7 @@ dependencies = [
     "requests>=2.34.2",
     "python-dotenv>=1.0.0",
     # Security floor: 2026.10.19 fixes PYSEC-2026-4320.
-    "certifi>=2026.10.19",
+    "certifi>=2026.11.20",
 ]
 
 [project.urls]
